@@ -1,8 +1,8 @@
 use parking_lot::Mutex;
 use snaplight_domain::*;
 use snaplight_platform::{
-    atomic_write, capture_dir, data_dir, load_config, load_window_state, save_config,
-    save_window_state, write_pixels, CaptureService,
+    atomic_write, capture_dir, data_dir, load_config, load_window_state, native::PointHole,
+    save_config, save_window_state, write_pixels, CaptureService,
 };
 use snaplight_render_win::*;
 use snaplight_ui::{ComponentHandle, ModelRc, OptionsPanel, PhysicalPosition, Toolbar, VecModel};
@@ -10,7 +10,7 @@ use std::{
     io::Write,
     path::PathBuf,
     sync::{Arc, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use windows::{
     core::*,
@@ -23,6 +23,18 @@ use windows::{
 };
 
 const COMMAND: u32 = WM_APP + 42;
+/// Posted to the overlay window when a hover query should run.
+const HOVER_PROBE: u32 = WM_APP + 43;
+/// A cursor movement of at least this many physical pixels, together with
+/// `HOVER_INTERVAL`, bounds how often UI Automation is queried.
+const HOVER_MOVE_PX: i32 = 3;
+const HOVER_INTERVAL: Duration = Duration::from_millis(33);
+/// Documented value (0x02A3); the Windows bindings only expose the non-client
+/// variant `WM_NCMOUSELEAVE`.
+const WM_MOUSELEAVE: u32 = 0x02a3;
+/// Movement, in logical pixels, below which a press is a click rather than a
+/// drag and therefore adopts the detected region.
+const CLICK_SLOP: f32 = 4.0;
 /// Frames rendered by the `--stress` 4K annotation loop.
 const STRESS_FRAMES: usize = 240;
 #[derive(Clone)]
@@ -40,6 +52,54 @@ enum UiCommand {
 struct SelectionHandle {
     col: u8,
     row: u8,
+}
+/// Hover detection state of one overlay canvas.
+#[derive(Default)]
+struct HoverProbe {
+    /// UI Automation client, created on first use on the thread that owns the
+    /// overlay window. Queries run on that thread: UI Automation needs the
+    /// apartment that owns the overlay to keep pumping, so waiting for another
+    /// thread while blocking this one only serializes the query behind the wait.
+    probe: Option<snaplight_platform::native::ElementProbe>,
+    /// Screen point and time of the last query, used to bound the query rate.
+    last: Option<(ScreenPoint, Instant)>,
+    /// Cursor position waiting to be probed, in image pixels.
+    pending: Option<ImagePoint>,
+}
+/// True when the pointer moved far enough, and enough time passed since the
+/// previous query, to justify another one. A pointer that stands still never
+/// re-queries, and a fast pointer cannot outrun the query rate.
+fn probe_due(last: Option<(ScreenPoint, Instant)>, point: ScreenPoint, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some((previous, at)) => {
+            (previous.x - point.x)
+                .abs()
+                .max((previous.y - point.y).abs())
+                >= HOVER_MOVE_PX
+                && now.duration_since(at) >= HOVER_INTERVAL
+        }
+    }
+}
+/// Maps a detected screen rectangle into image pixels, clipped to the overlay.
+/// A region that lies entirely on another monitor yields nothing.
+fn hover_region(screen: RECT, image: &ImageDescriptor, rect: ScreenRect) -> Option<ImageRect> {
+    let overlay = ScreenRect {
+        x: screen.left,
+        y: screen.top,
+        width: screen.right - screen.left,
+        height: screen.bottom - screen.top,
+    };
+    let visible = rect.intersect(overlay)?;
+    Some(
+        ImageRect {
+            x: (visible.x - screen.left) as f32,
+            y: (visible.y - screen.top) as f32,
+            width: visible.width as f32,
+            height: visible.height as f32,
+        }
+        .clamp(image.width, image.height),
+    )
 }
 fn selection_handle(rect: ImageRect, point: ImagePoint, dpi: u32) -> Option<SelectionHandle> {
     let radius = 8.0 * (dpi as f32 / 96.0).clamp(1.0, 4.0);
@@ -109,6 +169,9 @@ struct Canvas {
     capture_dir: PathBuf,
     ui_slots: Arc<UiSlots>,
     dpi: u32,
+    /// Configured detection mode; `Off` never queries UI Automation.
+    detect: WindowDetect,
+    hover_probe: HoverProbe,
 }
 impl Canvas {
     fn draw(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -142,6 +205,82 @@ impl Canvas {
 impl Canvas {
     unsafe fn invalidate(&self) {
         let _ = InvalidateRect(self.hwnd, None, false);
+    }
+    /// True while a detected region may be shown: the select tool, nothing
+    /// committed yet, and no drag in progress.
+    fn hover_eligible(&self) -> bool {
+        self.detect == WindowDetect::Ui
+            && self.tool == Tool::Select
+            && self.doc.selection.is_none()
+            && self.interaction.selection_draft.is_none()
+            && self.start.is_none()
+            && !self.interaction.dragging
+    }
+    fn screen_point(&self, p: ImagePoint) -> ScreenPoint {
+        ScreenPoint {
+            x: self.screen.left + p.x.round() as i32,
+            y: self.screen.top + p.y.round() as i32,
+        }
+    }
+    /// Replaces the preview, repainting only when it actually changed.
+    fn set_hover(&mut self, region: Option<ImageRect>) {
+        if self.interaction.hover != region {
+            self.interaction.hover = region;
+            unsafe { self.invalidate() };
+        }
+    }
+    /// Queues a detection query for a cursor position. Movement and time
+    /// thresholds keep a moving pointer from querying on every mouse message.
+    unsafe fn request_hover(&mut self, p: ImagePoint) {
+        if !self.hover_eligible() {
+            return;
+        }
+        if self.hover_probe.pending.is_some() {
+            // A query is already queued. Move it to the newest position instead
+            // of dropping it, so the preview follows the pointer.
+            self.hover_probe.pending = Some(p);
+            return;
+        }
+        let point = self.screen_point(p);
+        if !probe_due(self.hover_probe.last, point, Instant::now()) {
+            return;
+        }
+        self.hover_probe.pending = Some(p);
+        let _ = PostMessageW(self.hwnd, HOVER_PROBE, WPARAM(0), LPARAM(0));
+    }
+    /// Runs the queued query: a one-pixel hole in the overlay's window region
+    /// lets UI Automation see the window below it, and the hole is closed as
+    /// soon as the answer is in.
+    unsafe fn run_hover(&mut self) {
+        let Some(p) = self.hover_probe.pending.take() else {
+            return;
+        };
+        if !self.hover_eligible() {
+            return;
+        }
+        let point = self.screen_point(p);
+        self.hover_probe.last = Some((point, Instant::now()));
+        if self.hover_probe.probe.is_none() {
+            // Created on first use: a session that never hovers loads no client.
+            match snaplight_platform::native::ElementProbe::new() {
+                Ok(probe) => self.hover_probe.probe = Some(probe),
+                Err(error) => {
+                    eprintln!("window detection unavailable: {error}");
+                    return;
+                }
+            }
+        }
+        let Some(probe) = &self.hover_probe.probe else {
+            return;
+        };
+        let hole = match PointHole::punch(self.hwnd, point) {
+            Ok(hole) => hole,
+            Err(_) => return,
+        };
+        let bounds = probe.bounds_at(point);
+        drop(hole);
+        let region = bounds.and_then(|rect| hover_region(self.screen, &self.doc.image, rect));
+        self.set_hover(region);
     }
     fn position(&self, l: LPARAM) -> ImagePoint {
         ImagePoint {
@@ -212,14 +351,18 @@ impl Canvas {
                     Tool::Mosaic,
                     Tool::Text,
                 ][id as usize];
+                // Only the select tool adopts a detected region.
+                self.set_hover(None);
             }
             10 => {
                 self.history.undo(&mut self.doc);
                 self.renderer.invalidate_annotations();
+                self.set_hover(None);
             }
             11 => {
                 self.history.redo(&mut self.doc);
                 self.renderer.invalidate_annotations();
+                self.set_hover(None);
             }
             12..=14 => {
                 let (image, bytes) = self.renderer.export(&self.doc)?;
@@ -381,13 +524,51 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 let p = state.position(l);
                 state.interaction.cursor = Some(p);
                 state.update_drag(p);
+                state.request_hover(p);
+                // The preview must not outlive the pointer leaving this monitor.
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut track);
                 state.invalidate();
                 return LRESULT(0);
             }
+            WM_MOUSELEAVE => {
+                state.hover_probe.pending = None;
+                state.hover_probe.last = None;
+                state.set_hover(None);
+                return LRESULT(0);
+            }
+            HOVER_PROBE => {
+                state.run_hover();
+                return LRESULT(0);
+            }
             WM_LBUTTONUP => {
-                if state.start.is_some() {
-                    state.update_drag(state.position(l));
-                    if let Some(r) = state.interaction.selection_draft.take() {
+                if let Some(start) = state.start {
+                    let up = state.position(l);
+                    state.update_drag(up);
+                    let slop = CLICK_SLOP * (state.dpi as f32 / 96.0);
+                    let clicked = state.resize.is_none()
+                        && (up.x - start.x).abs().max((up.y - start.y).abs()) <= slop;
+                    if state.tool == Tool::Select && clicked && state.detect == WindowDetect::Ui {
+                        // A click adopts the detected region; without one nothing is
+                        // committed, so a stray click cannot leave a one-pixel
+                        // selection. With detection off the previous behaviour
+                        // (a tiny hand-drawn region) is kept.
+                        if let Some(region) = state.interaction.hover {
+                            state.interaction.selection_draft = None;
+                            if state.doc.selection != Some(region) {
+                                state
+                                    .history
+                                    .execute(&mut state.doc, Edit::Selection(Some(region)));
+                            }
+                        } else {
+                            state.interaction.selection_draft = None;
+                        }
+                    } else if let Some(r) = state.interaction.selection_draft.take() {
                         if r.width >= 1.0 && r.height >= 1.0 && state.doc.selection != Some(r) {
                             state
                                 .history
@@ -401,6 +582,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 state.start = None;
                 state.resize = None;
                 state.interaction.dragging = false;
+                // The preview belongs to the pointer, not to a finished gesture.
+                state.hover_probe.pending = None;
+                state.interaction.hover = None;
                 let _ = ReleaseCapture();
                 publish_history(state);
                 state.invalidate();
@@ -413,6 +597,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 state.interaction.draft = None;
                 state.interaction.selection_draft = None;
                 state.interaction.dragging = false;
+                state.interaction.hover = None;
+                state.hover_probe.pending = None;
                 if interrupted {
                     publish_history(state);
                 }
@@ -675,6 +861,8 @@ fn canvas_thread(
                     capture_dir: capture_dir(&config),
                     ui_slots: ui_slots.clone(),
                     dpi: window_dpi.max(96),
+                    detect: config.window_detect,
+                    hover_probe: HoverProbe::default(),
                 });
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *canvas as *mut Canvas) as isize);
                 if *active.lock() == 0 {
@@ -825,6 +1013,78 @@ fn canvas_thread(
                                 }
                             }
                         }
+                        // The preview for a detected region is an outline without
+                        // handles, so a click is distinguishable from a committed
+                        // selection. It is checked on its own frame, with no
+                        // selection in the document: everything outside the
+                        // preview is dimmed, and its corner stays blue instead of
+                        // carrying a handle.
+                        let hover = ImageRect {
+                            x: 60.0,
+                            y: 300.0,
+                            width: 140.0,
+                            height: 80.0,
+                        };
+                        let selection = canvas.doc.selection.take();
+                        canvas.renderer.record_composed(true);
+                        canvas.renderer.render(
+                            &canvas.doc,
+                            Viewport {
+                                width: frame.descriptor.width,
+                                height: frame.descriptor.height,
+                                dpi: canvas.dpi as f32,
+                                origin: ScreenPoint {
+                                    x: canvas.screen.left,
+                                    y: canvas.screen.top,
+                                },
+                            },
+                            &Interaction {
+                                hover: Some(hover),
+                                ..Default::default()
+                            },
+                        )?;
+                        let preview = canvas
+                            .renderer
+                            .composed()
+                            .ok_or("the overlay did not record the preview frame")?;
+                        let preview_pixel = |x: usize, y: usize| -> [u8; 4] {
+                            let n = y * preview.width as usize * 4 + x * 4;
+                            [
+                                preview.pixels[n],
+                                preview.pixels[n + 1],
+                                preview.pixels[n + 2],
+                                preview.pixels[n + 3],
+                            ]
+                        };
+                        let corner = preview_pixel(60, 300);
+                        if !within(corner, [255, 136, 51, 255], 24) {
+                            return Err(format!(
+                                "preview corner is {corner:?}, expected the outline colour without a handle"
+                            )
+                            .into());
+                        }
+                        let inside = preview_pixel(120, 340);
+                        let wanted = captured(120, 340);
+                        if !within(inside, wanted, 6) {
+                            return Err(format!(
+                                "previewed pixel is {inside:?}, expected the undimmed capture {wanted:?}"
+                            )
+                            .into());
+                        }
+                        let outside = preview_pixel(400, 340);
+                        let reference = captured(400, 340);
+                        if reference[..3].iter().copied().max().unwrap_or(0) > 40 {
+                            for i in 0..3 {
+                                let want = reference[i] as f32 * 0.55;
+                                if (outside[i] as f32 - want).abs() > 8.0 {
+                                    return Err(format!(
+                                        "pixel outside the preview is {outside:?}, expected about 55% of {reference:?}"
+                                    )
+                                    .into());
+                                }
+                            }
+                        }
+                        canvas.doc.selection = selection;
                         canvas.renderer.record_composed(false);
                     }
                     let (image, bytes) = canvas.renderer.export(&canvas.doc)?;
@@ -902,6 +1162,15 @@ fn canvas_thread(
                 } else {
                     let _ = ShowWindow(hwnd, SW_SHOW);
                     canvas.invalidate();
+                    // Show the region under the pointer right away instead of
+                    // waiting for the first mouse move.
+                    let mut cursor = POINT::default();
+                    if canvas.detect == WindowDetect::Ui && GetCursorPos(&mut cursor).is_ok() {
+                        canvas.request_hover(ImagePoint {
+                            x: (cursor.x - s.left) as f32,
+                            y: (cursor.y - s.top) as f32,
+                        });
+                    }
                 }
                 canvases.push(canvas);
             }
@@ -1556,6 +1825,7 @@ fn settings(config: Config) -> std::result::Result<(), Box<dyn std::error::Error
             accent: ui.get_accent_value().into(),
         };
         snaplight_ui::apply_tool_order(&mut c, &ui.get_tools());
+        c.window_detect = snaplight_ui::window_detect_from_index(ui.get_detect_mode());
         // Normalize and validate the shortcuts before anything is written.
         let hotkeys = (|| -> std::result::Result<(), &'static str> {
             let capture = parse_hotkey(ui.get_capture_hotkey_value().trim())
@@ -1914,6 +2184,136 @@ mod tests {
             right,
             bottom,
         }
+    }
+    #[test]
+    fn hover_queries_need_movement_and_time() {
+        let start = Instant::now();
+        let point = ScreenPoint { x: 100, y: 100 };
+        assert!(probe_due(None, point, start));
+        let last = Some((point, start));
+        // Standing still never re-queries, however long the pointer waits.
+        assert!(!probe_due(last, point, start + Duration::from_secs(5)));
+        // A one-pixel jitter is not worth a query either.
+        assert!(!probe_due(
+            last,
+            ScreenPoint { x: 102, y: 100 },
+            start + Duration::from_secs(1)
+        ));
+        // Movement inside the interval is throttled.
+        assert!(!probe_due(
+            last,
+            ScreenPoint { x: 140, y: 100 },
+            start + Duration::from_millis(1)
+        ));
+        // Enough movement after enough time queries again.
+        assert!(probe_due(
+            last,
+            ScreenPoint { x: 103, y: 100 },
+            start + HOVER_INTERVAL
+        ));
+        assert!(probe_due(
+            last,
+            ScreenPoint { x: 100, y: 97 },
+            start + Duration::from_secs(1)
+        ));
+    }
+    #[test]
+    fn detected_regions_map_to_the_overlay_image() {
+        let image = ImageDescriptor {
+            id: ImageId(1),
+            width: 2560,
+            height: 1440,
+            stride: 2560 * 4,
+            format: PixelFormat::Bgra8,
+            alpha: AlphaMode::Opaque,
+            color_space: ColorSpace::Srgb,
+        };
+        let screen = rect(0, 0, 2560, 1440);
+        // A region on this monitor keeps its offset and size.
+        assert_eq!(
+            hover_region(
+                screen,
+                &image,
+                ScreenRect {
+                    x: 100,
+                    y: 200,
+                    width: 800,
+                    height: 600
+                }
+            ),
+            Some(ImageRect {
+                x: 100.0,
+                y: 200.0,
+                width: 800.0,
+                height: 600.0
+            })
+        );
+        // A second monitor to the left reports negative screen coordinates.
+        let left_screen = rect(-1920, 0, 0, 1080);
+        assert_eq!(
+            hover_region(
+                left_screen,
+                &image,
+                ScreenRect {
+                    x: -1900,
+                    y: 40,
+                    width: 600,
+                    height: 400
+                }
+            ),
+            Some(ImageRect {
+                x: 20.0,
+                y: 40.0,
+                width: 600.0,
+                height: 400.0
+            })
+        );
+        // A region that reaches past the overlay's edge is clipped to it.
+        assert_eq!(
+            hover_region(
+                left_screen,
+                &image,
+                ScreenRect {
+                    x: -100,
+                    y: 0,
+                    width: 300,
+                    height: 200
+                }
+            ),
+            Some(ImageRect {
+                x: 1820.0,
+                y: 0.0,
+                width: 100.0,
+                height: 200.0
+            })
+        );
+        // A region entirely on another monitor has nothing to show here.
+        assert_eq!(
+            hover_region(
+                screen,
+                &image,
+                ScreenRect {
+                    x: -500,
+                    y: 100,
+                    width: 400,
+                    height: 300
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            hover_region(
+                screen,
+                &image,
+                ScreenRect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0
+                }
+            ),
+            None
+        );
     }
     #[test]
     fn tool_windows_reject_frame_bits_without_losing_visibility() {

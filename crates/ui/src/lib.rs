@@ -1,7 +1,7 @@
 slint::include_modules!();
 use slint::Model;
 pub use slint::{ComponentHandle, ModelRc, PhysicalPosition, SharedString, VecModel, Window};
-use snaplight_domain::{Config, Tool};
+use snaplight_domain::{Config, Tool, WindowDetect};
 /// Stable command id for each tool. The toolbar sends these ids, so the visual
 /// order can change without changing the editor's tool mapping.
 fn tool_id(tool: Tool) -> i32 {
@@ -81,7 +81,26 @@ pub fn settings(config: &Config) -> Result<Settings, slint::PlatformError> {
     ui.set_accent_value(config.theme.accent.clone().into());
     ui.set_capture_hotkey_value(config.capture_hotkey.clone().into());
     ui.set_restore_hotkey_value(config.restore_hotkey.clone().into());
+    ui.set_detect_mode(window_detect_index(config.window_detect));
     Ok(ui)
+}
+/// Detection modes in combo-box order; keep in sync with the model in
+/// `toolbar.slint`. A pixel-based mode would be appended here.
+const WINDOW_DETECT_MODES: [WindowDetect; 2] = [WindowDetect::Off, WindowDetect::Ui];
+/// Combo-box index of a detection mode.
+pub fn window_detect_index(mode: WindowDetect) -> i32 {
+    WINDOW_DETECT_MODES
+        .iter()
+        .position(|candidate| *candidate == mode)
+        .unwrap_or(WINDOW_DETECT_MODES.len() - 1) as i32
+}
+/// Detection mode for a combo-box index. An unknown index falls back to the
+/// default instead of silently disabling detection.
+pub fn window_detect_from_index(index: i32) -> WindowDetect {
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| WINDOW_DETECT_MODES.get(index).copied())
+        .unwrap_or_default()
 }
 /// Moves one entry of the tool order, clamped to the ends.
 pub fn move_tool(items: &ModelRc<ToolItem>, index: i32, delta: i32) -> Option<Vec<ToolItem>> {
@@ -265,6 +284,16 @@ mod tests {
         );
         // Rounded to the nearest physical pixel.
         assert_eq!(scale_to_physical((1, 1), 144), (2, 2));
+    }
+    #[test]
+    fn detection_mode_index_round_trips() {
+        for mode in [WindowDetect::Off, WindowDetect::Ui] {
+            assert_eq!(window_detect_from_index(window_detect_index(mode)), mode);
+        }
+        assert_eq!(window_detect_index(WindowDetect::Off), 0);
+        // An out-of-range index keeps detection on rather than turning it off.
+        assert_eq!(window_detect_from_index(-1), WindowDetect::Ui);
+        assert_eq!(window_detect_from_index(7), WindowDetect::Ui);
     }
     #[test]
     fn applying_the_order_keeps_a_usable_tool_list() {

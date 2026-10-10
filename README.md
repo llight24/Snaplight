@@ -59,6 +59,18 @@ Right-click the tray for settings and exit.
 Standalone editor pin commands write IPC to stdout and need the core to show
 the resulting pin.
 
+With "Window detection" set to "UI element under cursor", the select tool also
+detects automatically: while nothing is selected, the UI Automation element under
+the pointer is outlined and left bright while the rest of the screen is dimmed,
+and a left click adopts exactly that region. A drag still draws the region by
+hand, and a click that finds no element selects nothing. The preview is an
+outline without handles or the size chip, so it is never mistaken for a finished
+selection. Hovering the desktop, the taskbar, or a window whose application
+exposes no UI Automation provider reports no element at all. Detection is
+suspended once a selection exists, and `Ctrl+Z` (undo) brings it back. The
+setting is read when a capture session starts, so a change applies to the next
+capture.
+
 Drag a pin to move it. A new pin opens exactly where its region was captured,
 so pinning does not shift the image; only a region wider than the primary
 display is scaled down. Mouse wheel scales; Ctrl+wheel changes opacity.
@@ -71,9 +83,11 @@ reset scale to 100% when entering click-through mode.
 Configuration and saved captures live in `%LOCALAPPDATA%\Snaplight`; set
 `SNAPLIGHT_DATA_DIR` to override. Each saved capture includes original
 `*.source.bgra` pixels and a versioned `*.document.json`, plus a PNG or flattened
-pin image. Theme colors, stroke width, mosaic size, and tool order are stored in
-`config.json`; the settings window edits colors, drawing defaults, the pin
-backend, the tool order (Up/Down per tool), the capture folder (typed or
+pin image. Theme colors, stroke width, mosaic size, tool order, the window
+detection mode, and the pin backend are stored in `config.json`; the settings
+window edits colors, drawing defaults, the pin
+backend, the tool order (Up/Down per tool), the window detection mode (`off` or
+`ui`), the capture folder (typed or
 chosen with the shell folder picker), and the two global shortcuts (capture and
 pin restore, written in `Ctrl+Shift+A` form). It also lists the saved captures
 in that folder (local time, PNG or BGRA, total size) with Open, Open folder, and
@@ -119,7 +133,10 @@ monitor DPI (`toolbar-window.json`), a check that a pin opens at the screen
 position it was given (and keeps it while scaling), and a comparison of the real
 captured frame against an independent GDI capture of the same screen
 (`capture_agreement` in `smoke-1.json`), which catches an empty capture that the
-synthetic-frame pixel checks cannot see. The settings
+synthetic-frame pixel checks cannot see. A second composed frame checks the
+detected-region preview: its outline colour at the corner (where a committed
+selection would draw a handle), the undimmed region inside it, and the dimmed
+mask outside it. The settings
 snapshot also
 shows the saved-capture list built from two synthetic captures, and one of them
 is deleted through the recycle-bin path to prove deletion removes the files.
@@ -158,7 +175,17 @@ event, locked sessions and capture-access loss are not yet hardware-verified),
 and capture failures retry a bounded number of times before exiting with an
 error; pin textures are released on hide but not by compositor occlusion; actual
 OCR, long capture and recording engines and alternate platform backends remain
-future work. The included inspection plugin is a diagnostic, not an OCR
+future work. Window detection is verified against a real child control (its UI
+Automation rectangle compared with its own window rectangle) and end to end
+through the editor: the pointer is moved onto that control, the composed screen is
+sampled for the preview outline, and the region a click adopts is compared with
+the exported image size. Only the UI Automation mode exists; a pixel-based mode
+is not implemented. Detection depends on the target application exposing a UI
+Automation element that is not shell chrome, so windows reported without a window
+ancestor (desktop, taskbar, some custom-drawn surfaces) report nothing, and the
+query runs on the overlay thread, where a provider that stops responding stalls
+the overlay for as long as UI Automation takes to time out. The included
+inspection plugin is a diagnostic, not an OCR
 substitute. The GPU shared-texture transport is implemented and verified across
 processes, but no engine consumes it yet: the editor does not invoke plugins,
 and the example reads the texture back to the CPU only to compute a checksum.

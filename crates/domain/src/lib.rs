@@ -111,6 +111,35 @@ pub struct ScreenPoint {
     pub x: i32,
     pub y: i32,
 }
+/// Rectangle in screen physical pixels, matching `ScreenPoint`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+impl ScreenRect {
+    pub fn right(&self) -> i32 {
+        self.x + self.width
+    }
+    pub fn bottom(&self) -> i32 {
+        self.y + self.height
+    }
+    /// Overlap of two rectangles, or `None` when they do not overlap.
+    pub fn intersect(self, other: Self) -> Option<Self> {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let right = self.right().min(other.right());
+        let bottom = self.bottom().min(other.bottom());
+        (right > x && bottom > y).then_some(Self {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        })
+    }
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LogicalPoint {
     pub x: f32,
@@ -328,6 +357,9 @@ impl History {
 pub struct Interaction {
     pub draft: Option<Annotation>,
     pub selection_draft: Option<ImageRect>,
+    /// Candidate region detected under the cursor before it is committed.
+    /// Renderers show it as a preview; it never changes the document.
+    pub hover: Option<ImageRect>,
     pub cursor: Option<ImagePoint>,
     pub dragging: bool,
 }
@@ -355,6 +387,19 @@ pub struct Theme {
     pub foreground: String,
     pub accent: String,
 }
+/// How the editor picks a region automatically while the cursor moves.
+///
+/// Only UI Automation detection exists today; the enum keeps room for a
+/// pixel-based mode without changing the stored configuration shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WindowDetect {
+    /// Never detect; regions are always drawn by hand.
+    Off,
+    /// Highlight the UI Automation element under the cursor.
+    #[default]
+    Ui,
+}
 impl Default for Theme {
     fn default() -> Self {
         Self {
@@ -380,6 +425,8 @@ pub struct Config {
     pub capture_hotkey: String,
     /// Global shortcut that restores interaction for click-through pins.
     pub restore_hotkey: String,
+    /// Automatic region detection under the cursor.
+    pub window_detect: WindowDetect,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -402,6 +449,7 @@ impl Default for Config {
             capture_dir: None,
             capture_hotkey: DEFAULT_CAPTURE_HOTKEY.into(),
             restore_hotkey: DEFAULT_RESTORE_HOTKEY.into(),
+            window_detect: WindowDetect::default(),
         }
     }
 }
@@ -698,6 +746,62 @@ mod tests {
         );
         config.capture_dir = Some("D:\\Snaplight\\shots".into());
         assert!(config.validate().is_ok());
+    }
+    #[test]
+    fn window_detect_defaults_to_ui_and_stays_compatible() {
+        assert_eq!(Config::default().window_detect, WindowDetect::Ui);
+        // A configuration written before the option existed keeps the default.
+        let config: Config = serde_json::from_str("{\"version\":1}").unwrap();
+        assert_eq!(config.window_detect, WindowDetect::Ui);
+        let config: Config = serde_json::from_str("{\"window_detect\":\"off\"}").unwrap();
+        assert_eq!(config.window_detect, WindowDetect::Off);
+        assert_eq!(serde_json::to_string(&WindowDetect::Ui).unwrap(), "\"ui\"");
+        // An unknown mode is rejected instead of silently detecting anyway.
+        assert!(serde_json::from_str::<Config>("{\"window_detect\":\"pixel\"}").is_err());
+    }
+    #[test]
+    fn screen_rects_intersect_or_report_no_overlap() {
+        let a = ScreenRect {
+            x: -1920,
+            y: -100,
+            width: 1920,
+            height: 1080,
+        };
+        assert_eq!(a.right(), 0);
+        assert_eq!(a.bottom(), 980);
+        assert_eq!(
+            a.intersect(ScreenRect {
+                x: -100,
+                y: 0,
+                width: 200,
+                height: 200,
+            }),
+            Some(ScreenRect {
+                x: -100,
+                y: 0,
+                width: 100,
+                height: 200,
+            })
+        );
+        assert_eq!(
+            a.intersect(ScreenRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            }),
+            None
+        );
+        // Touching edges are not an overlap.
+        assert_eq!(
+            a.intersect(ScreenRect {
+                x: 0,
+                y: -100,
+                width: 10,
+                height: 10,
+            }),
+            None
+        );
     }
     #[test]
     fn window_state_defaults_to_unset_positions() {

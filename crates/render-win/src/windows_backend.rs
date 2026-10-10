@@ -1014,6 +1014,24 @@ impl OverlayRenderer {
         );
         Ok(())
     }
+    /// Preview chrome for the region detected under the cursor: the committed
+    /// selection's outline without handles or the size chip, so a preview is
+    /// distinguishable from a selection that a click will keep.
+    unsafe fn draw_hover_chrome(&mut self, r: ImageRect, dpi: f32) -> Result<()> {
+        let scale = (dpi / 96.0).clamp(1.0, 4.0);
+        let blue = self.dc.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 0.2,
+                g: 0.533,
+                b: 1.0,
+                a: 1.0,
+            },
+            None,
+        )?;
+        self.dc
+            .DrawRectangle(&rect(r), &blue, CHROME_BORDER * scale, None);
+        Ok(())
+    }
     /// Text format for the size chip, recreated when the DPI-scaled size changes.
     unsafe fn chip_text_format(&mut self, size: f32) -> Result<IDWriteTextFormat> {
         if self.chip_format.is_none() || (self.chip_font - size).abs() > 0.01 {
@@ -1425,7 +1443,16 @@ impl CanvasRenderer for OverlayRenderer {
                 None,
             )?;
             let selection = interaction.selection_draft.or(doc.selection);
-            if let Some(r) = selection {
+            // The detected region is only a preview: it is shown while nothing is
+            // committed and the user is not drawing, and it never reaches the
+            // document until a click adopts it.
+            let hover = if selection.is_none() && !interaction.dragging {
+                interaction.hover
+            } else {
+                None
+            };
+            let region = selection.or(hover);
+            if let Some(r) = region {
                 for zone in [
                     D2D_RECT_F {
                         left: 0.0,
@@ -1471,6 +1498,8 @@ impl CanvasRenderer for OverlayRenderer {
             }
             if let Some(r) = selection {
                 self.draw_selection_chrome(r, viewport.dpi, viewport.origin)?;
+            } else if let Some(r) = hover {
+                self.draw_hover_chrome(r, viewport.dpi)?;
             }
             if let Some(p) = interaction.cursor {
                 let sample = ImageRect {
