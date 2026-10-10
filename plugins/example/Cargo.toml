@@ -1,0 +1,13 @@
+[package]
+name = "snaplight-example-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[lib]
+crate-type = ["cdylib"]
+[dependencies]
+snaplight-domain.workspace = true
+snaplight-plugin-api.workspace = true
+serde_json.workspace = true
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "snaplight-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+snaplight-domain.workspace = true
+slint = { version = "=1.18.0", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2", "accessibility"] }
+[build-dependencies]
+slint-build = "=1.18.0"

@@ -1,0 +1,10 @@
+[package]
+name = "snaplight-render-win"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+snaplight-domain.workspace = true
+snaplight-platform.workspace = true
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

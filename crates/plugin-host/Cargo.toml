@@ -1,0 +1,17 @@
+[package]
+name = "snaplight-plugin-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+snaplight-platform.workspace = true
+snaplight-domain.workspace = true
+snaplight-plugin-api.workspace = true
+serde_json.workspace = true
+libloading = "0.8"
+
+[dev-dependencies]
+snaplight-render-win.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows.workspace = true

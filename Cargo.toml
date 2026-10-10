@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/domain", "crates/platform", "crates/render-win", "crates/ui", "crates/core", "crates/editor", "crates/pins", "crates/plugin-api", "crates/plugin-host", "plugins/example"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+snaplight-domain = { path = "crates/domain" }
+snaplight-platform = { path = "crates/platform" }
+snaplight-render-win = { path = "crates/render-win" }
+snaplight-ui = { path = "crates/ui" }
+snaplight-plugin-api = { path = "crates/plugin-api" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Com", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Time", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_DirectComposition", "Foundation_Numerics", "Win32_Security"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
