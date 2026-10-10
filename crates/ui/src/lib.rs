@@ -1,8 +1,6 @@
 slint::include_modules!();
 use slint::Model;
-pub use slint::{
-    Color, ComponentHandle, ModelRc, PhysicalPosition, SharedString, VecModel, Window,
-};
+pub use slint::{ComponentHandle, ModelRc, PhysicalPosition, SharedString, VecModel, Window};
 use snaplight_domain::{Config, Tool};
 /// Stable command id for each tool. The toolbar sends these ids, so the visual
 /// order can change without changing the editor's tool mapping.
@@ -56,18 +54,20 @@ pub fn tool_from_id(id: i32) -> Option<Tool> {
     .get(usize::try_from(id).ok()?)
     .copied()
 }
-fn color(s: &str) -> Color {
-    let n = u32::from_str_radix(s.trim_start_matches('#'), 16).unwrap_or(0);
-    Color::from_rgb_u8((n >> 16) as u8, (n >> 8) as u8, n as u8)
-}
 pub fn toolbar(config: &Config) -> Result<Toolbar, slint::PlatformError> {
     let ui = Toolbar::new()?;
+    ui.set_actions(ModelRc::new(VecModel::from(toolbar_actions())));
+    ui.set_bar_width(toolbar_logical_size(&config.tools).0 as f32);
     ui.set_tools(ModelRc::new(VecModel::from(tool_items(&config.tools))));
     ui.set_stroke(config.stroke_width as i32);
     ui.set_block(config.mosaic_block as i32);
-    ui.set_surface_color(color(&config.theme.background));
-    ui.set_ink_color(color(&config.theme.foreground));
-    ui.set_accent_color(color(&config.theme.accent));
+    Ok(ui)
+}
+/// Quick-settings window shown when a tool's drop-down arrow is clicked.
+pub fn options_panel(config: &Config) -> Result<OptionsPanel, slint::PlatformError> {
+    let ui = OptionsPanel::new()?;
+    ui.set_stroke(config.stroke_width as i32);
+    ui.set_block(config.mosaic_block as i32);
     Ok(ui)
 }
 pub fn settings(config: &Config) -> Result<Settings, slint::PlatformError> {
@@ -107,8 +107,44 @@ pub fn apply_tool_order(config: &mut Config, items: &ModelRc<ToolItem>) {
         config.tools = tools;
     }
 }
-/// Logical size of the toolbar window; keep in sync with `toolbar.slint`.
-pub const TOOLBAR_LOGICAL_SIZE: (u32, u32) = (740, 176);
+/// Logical size derived from configured tools and the action list.
+// Display order is independent of stable editor command ids.
+const TOOLBAR_ACTIONS: &[(i32, i32, &str)] = &[
+    (16, 2, "Tool options"),
+    (14, 5, "Pin"),
+    (13, 4, "Save"),
+    (15, 6, "Close"),
+    (12, 3, "Copy"),
+];
+fn toolbar_actions() -> Vec<CommandItem> {
+    TOOLBAR_ACTIONS
+        .iter()
+        .map(|&(id, glyph, label)| CommandItem {
+            id,
+            glyph,
+            label: label.into(),
+        })
+        .collect()
+}
+pub fn toolbar_logical_size(tools: &[Tool]) -> (u32, u32) {
+    // Padding + grip + two dividers + seven commands + inter-item gaps.
+    let tools_width: u32 = tools
+        .iter()
+        .map(|tool| if *tool == Tool::Select { 40 } else { 50 })
+        .sum();
+    (
+        144 + 40 * TOOLBAR_ACTIONS.len() as u32
+            + tools_width
+            + 2 * (tools.len() as u32 + TOOLBAR_ACTIONS.len() as u32 + 4),
+        52,
+    )
+}
+/// Logical size of the tool options window; keep in sync with `toolbar.slint`.
+pub const OPTIONS_LOGICAL_SIZE: (u32, u32) = (340, 52);
+/// Window titles, used to find the Slint-created windows again for the native
+/// rounding and taskbar styling; keep in sync with `toolbar.slint`.
+pub const TOOLBAR_TITLE: &str = "Snaplight Tools";
+pub const OPTIONS_TITLE: &str = "Snaplight Tool Options";
 /// Converts a logical size to physical pixels for a monitor DPI. The toolbar is
 /// placed in physical coordinates before its window exists, so the size must be
 /// derived from the monitor DPI rather than read back from Slint.
@@ -118,12 +154,31 @@ pub fn scale_to_physical(logical: (u32, u32), dpi: u32) -> (i32, i32) {
 }
 /// Handle to the toolbar window that other threads may use.
 pub type ToolbarWeak = slint::Weak<Toolbar>;
-/// Moves the toolbar from another thread, when it is still alive.
+/// Handle to the tool options window that other threads may use.
+pub type PanelWeak = slint::Weak<OptionsPanel>;
+/// Hides the tool options from another thread, so quick settings never outlive
+/// the position of the toolbar they belong to.
+pub fn hide_panel(weak: &PanelWeak) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            let _ = ui.hide();
+        }
+    });
+}
+/// Shows and places the toolbar after a completed selection.
 pub fn move_toolbar(weak: &ToolbarWeak, position: PhysicalPosition) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = weak.upgrade() {
+            if !ui.window().is_visible() {
+                let _ = ui.show();
+            }
             ui.window().set_position(position);
+            // Software renderer caches dirty regions. Moving the native window
+            // invalidates its backing pixels, so refresh the entire opaque surface.
+            ui.set_repaint(!ui.get_repaint());
+            ui.window().request_redraw();
         }
     });
 }
@@ -135,6 +190,23 @@ pub fn set_toolbar_status(weak: &ToolbarWeak, status: String) {
             ui.set_status(status.into());
         }
     });
+}
+/// Updates the history availability of the toolbar from another thread, so
+/// undo and redo only look enabled when there is something to undo or redo.
+pub fn set_toolbar_history(weak: &ToolbarWeak, can_undo: bool, can_redo: bool) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_can_undo(can_undo);
+            ui.set_can_redo(can_redo);
+        }
+    });
+}
+/// Runs the event loop until `quit`. The toolbar runs this instead of
+/// `ComponentHandle::run`, which would show the window before the first
+/// selection exists; the window is shown on demand instead.
+pub fn run_event_loop() -> std::result::Result<(), slint::PlatformError> {
+    slint::run_event_loop_until_quit()
 }
 /// Runs the event loop for `duration`, then stops it. Smoke checks use this to
 /// observe the real window geometry without user interaction.
@@ -178,9 +250,19 @@ mod tests {
     }
     #[test]
     fn logical_sizes_scale_to_monitor_dpi() {
-        assert_eq!(scale_to_physical((740, 176), 96), (740, 176));
-        assert_eq!(scale_to_physical((740, 176), 144), (1110, 264));
-        assert_eq!(scale_to_physical((740, 176), 192), (1480, 352));
+        assert_eq!(
+            scale_to_physical(toolbar_logical_size(&Config::default().tools), 96),
+            (716, 52)
+        );
+        assert_eq!(
+            scale_to_physical(toolbar_logical_size(&Config::default().tools), 144),
+            (1074, 78)
+        );
+        assert_eq!(scale_to_physical(OPTIONS_LOGICAL_SIZE, 144), (510, 78));
+        assert_eq!(
+            scale_to_physical(toolbar_logical_size(&Config::default().tools), 192),
+            (1432, 104)
+        );
         // Rounded to the nearest physical pixel.
         assert_eq!(scale_to_physical((1, 1), 144), (2, 2));
     }

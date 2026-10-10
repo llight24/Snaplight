@@ -307,6 +307,14 @@ impl History {
             false
         }
     }
+    /// True when there is an edit to reverse.
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+    /// True when there is a reversed edit to reapply.
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
     pub fn redo(&mut self, doc: &mut Document) -> bool {
         if let Some(e) = self.redo.pop() {
             self.undo.push(Self::apply(doc, e));
@@ -328,6 +336,8 @@ pub struct Viewport {
     pub width: u32,
     pub height: u32,
     pub dpi: f32,
+    /// Screen position of the image origin, so chrome can report screen pixels.
+    pub origin: ScreenPoint,
 }
 pub trait CanvasRenderer {
     type Error;

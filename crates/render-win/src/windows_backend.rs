@@ -19,6 +19,17 @@ use windows::{
     },
 };
 
+/// Selection chrome, in logical pixels at 96 DPI; the overlay draws in image
+/// pixels (the capture's physical pixels), so every size is scaled by the
+/// monitor DPI.
+const CHROME_BORDER: f32 = 2.2;
+const CHROME_HANDLE_OUTER: f32 = 6.5;
+const CHROME_HANDLE_INNER: f32 = 4.6;
+const CHROME_CHIP_HEIGHT: f32 = 28.0;
+const CHROME_CHIP_PADDING: f32 = 13.0;
+const CHROME_CHIP_GAP: f32 = 7.0;
+const CHROME_CHIP_FONT: f32 = 17.0;
+
 fn identity() -> Matrix3x2 {
     Matrix3x2 {
         M11: 1.0,
@@ -604,6 +615,18 @@ pub struct OverlayRenderer {
     pub gpu_us: Vec<f64>,
     profiling: bool,
     queries: std::collections::VecDeque<TimestampQueries>,
+    chip_format: Option<IDWriteTextFormat>,
+    chip_font: f32,
+    record_composed: bool,
+    composed: Option<ComposedFrame>,
+}
+/// Composed overlay frame (base image, dim mask, annotations and selection
+/// chrome) read back from the render target. Automation uses it to check the
+/// chrome pixels without depending on what is visible on the desktop.
+pub struct ComposedFrame {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
 }
 struct TimestampQueries {
     disjoint: ID3D11Query,
@@ -825,6 +848,10 @@ impl OverlayRenderer {
                 gpu_us: vec![],
                 profiling: false,
                 queries: std::collections::VecDeque::new(),
+                chip_format: None,
+                chip_font: 0.0,
+                record_composed: false,
+                composed: None,
             })
         }
     }
@@ -865,6 +892,8 @@ impl OverlayRenderer {
             self.mosaics.clear();
             self.cache_dirty = true;
             self.queries.clear();
+            // The text format belongs to the old DirectWrite factory.
+            self.chip_format = None;
             Ok(())
         }
     }
@@ -877,6 +906,174 @@ impl OverlayRenderer {
     }
     pub fn enable_profiling(&mut self) {
         self.profiling = true;
+    }
+    /// Selection chrome: a blue outline, eight round handles, and a chip that
+    /// reports the origin and size in screen pixels.
+    unsafe fn draw_selection_chrome(
+        &mut self,
+        r: ImageRect,
+        dpi: f32,
+        origin: ScreenPoint,
+    ) -> Result<()> {
+        let scale = (dpi / 96.0).clamp(1.0, 4.0);
+        let center = |p: D2D_POINT_2F, radius: f32| D2D1_ELLIPSE {
+            point: p,
+            radiusX: radius,
+            radiusY: radius,
+        };
+        let blue = self.dc.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 0.2,
+                g: 0.533,
+                b: 1.0,
+                a: 1.0,
+            },
+            None,
+        )?;
+        let white = self.dc.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
+            None,
+        )?;
+        self.dc
+            .DrawRectangle(&rect(r), &blue, CHROME_BORDER * scale, None);
+        let xs = [r.x, r.x + r.width / 2.0, r.x + r.width];
+        let ys = [r.y, r.y + r.height / 2.0, r.y + r.height];
+        for (row, y) in ys.iter().enumerate() {
+            for (col, x) in xs.iter().enumerate() {
+                if row == 1 && col == 1 {
+                    continue;
+                }
+                let p = D2D_POINT_2F { x: *x, y: *y };
+                self.dc
+                    .FillEllipse(&center(p, CHROME_HANDLE_OUTER * scale), &white);
+                self.dc
+                    .FillEllipse(&center(p, CHROME_HANDLE_INNER * scale), &blue);
+            }
+        }
+        let text = format!(
+            "{},{}  {} × {} px",
+            origin.x + r.x.round() as i32,
+            origin.y + r.y.round() as i32,
+            r.width.round().max(0.0) as u32,
+            r.height.round().max(0.0) as u32
+        );
+        let format = self.chip_text_format(CHROME_CHIP_FONT * scale)?;
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        let layout = self.gpu.write.CreateTextLayout(
+            &utf16,
+            &format,
+            self.width as f32,
+            CHROME_CHIP_HEIGHT * scale,
+        )?;
+        let mut metrics = DWRITE_TEXT_METRICS::default();
+        layout.GetMetrics(&mut metrics)?;
+        let width = metrics.widthIncludingTrailingWhitespace + 2.0 * CHROME_CHIP_PADDING * scale;
+        let height = CHROME_CHIP_HEIGHT * scale;
+        let chip = ImageRect {
+            x: r.x.clamp(
+                2.0 * scale,
+                (self.width as f32 - width - 2.0 * scale).max(2.0 * scale),
+            ),
+            y: (r.y - CHROME_CHIP_GAP * scale - height).max(2.0 * scale),
+            width,
+            height,
+        };
+        layout.SetMaxWidth(width)?;
+        layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+        layout.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+        let background = self.dc.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 0.157,
+                g: 0.192,
+                b: 0.22,
+                a: 1.0,
+            },
+            None,
+        )?;
+        self.dc.FillRoundedRectangle(
+            &D2D1_ROUNDED_RECT {
+                rect: rect(chip),
+                radiusX: height / 2.0,
+                radiusY: height / 2.0,
+            },
+            &background,
+        );
+        self.dc.DrawTextLayout(
+            D2D_POINT_2F {
+                x: chip.x,
+                y: chip.y,
+            },
+            &layout,
+            &white,
+            D2D1_DRAW_TEXT_OPTIONS_NONE,
+        );
+        Ok(())
+    }
+    /// Text format for the size chip, recreated when the DPI-scaled size changes.
+    unsafe fn chip_text_format(&mut self, size: f32) -> Result<IDWriteTextFormat> {
+        if self.chip_format.is_none() || (self.chip_font - size).abs() > 0.01 {
+            self.chip_format = Some(self.gpu.write.CreateTextFormat(
+                w!("Segoe UI"),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                size,
+                w!(""),
+            )?);
+            self.chip_font = size;
+        }
+        self.chip_format
+            .clone()
+            .ok_or_else(|| Error::new(E_UNEXPECTED, "chip text format"))
+    }
+    /// Reads the composed frame back after every `render`. Automation uses this
+    /// to check the chrome pixels; it costs one copy per recorded frame.
+    pub fn record_composed(&mut self, on: bool) {
+        self.record_composed = on;
+        self.composed = None;
+    }
+    /// Frame read back by the last `render` call with recording enabled.
+    pub fn composed(&self) -> Option<&ComposedFrame> {
+        self.composed.as_ref()
+    }
+    /// Copies the render target into a CPU-readable buffer. Must run between
+    /// `EndDraw` and `Present`, where the target holds the composed frame.
+    unsafe fn copy_composed(&self) -> Result<ComposedFrame> {
+        let staging = self.dc.CreateBitmap(
+            D2D_SIZE_U {
+                width: self.width,
+                height: self.height,
+            },
+            None,
+            0,
+            &properties(
+                D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1_ALPHA_MODE_PREMULTIPLIED,
+            ),
+        )?;
+        staging.CopyFromBitmap(None, &self.target, None)?;
+        let mapped = staging.Map(D2D1_MAP_OPTIONS_READ)?;
+        let stride = self.width as usize * 4;
+        let mut pixels = vec![0u8; stride * self.height as usize];
+        for y in 0..self.height as usize {
+            let row = std::slice::from_raw_parts(
+                (mapped.bits as *const u8).add(y * mapped.pitch as usize),
+                stride,
+            );
+            pixels[y * stride..(y + 1) * stride].copy_from_slice(row);
+        }
+        let _ = staging.Unmap();
+        Ok(ComposedFrame {
+            width: self.width,
+            height: self.height,
+            pixels,
+        })
     }
     pub fn collect_gpu_samples(&mut self) {
         unsafe {
@@ -1191,7 +1388,7 @@ impl CanvasRenderer for OverlayRenderer {
     fn render(
         &mut self,
         doc: &Document,
-        _viewport: Viewport,
+        viewport: Viewport,
         interaction: &Interaction,
     ) -> Result<()> {
         unsafe {
@@ -1273,16 +1470,7 @@ impl CanvasRenderer for OverlayRenderer {
                 self.draw_annotation(a)?;
             }
             if let Some(r) = selection {
-                let brush = self.dc.CreateSolidColorBrush(
-                    &D2D1_COLOR_F {
-                        r: 0.15,
-                        g: 0.9,
-                        b: 0.65,
-                        a: 1.0,
-                    },
-                    None,
-                )?;
-                self.dc.DrawRectangle(&rect(r), &brush, 1.0, None);
+                self.draw_selection_chrome(r, viewport.dpi, viewport.origin)?;
             }
             if let Some(p) = interaction.cursor {
                 let sample = ImageRect {
@@ -1333,6 +1521,9 @@ impl CanvasRenderer for OverlayRenderer {
                 );
             }
             self.dc.EndDraw(None, None)?;
+            if self.record_composed {
+                self.composed = Some(self.copy_composed()?);
+            }
             if let Some(q) = timing {
                 self.gpu.context.End(&q.end);
                 self.gpu.context.End(&q.disjoint);

@@ -1,14 +1,15 @@
+use parking_lot::Mutex;
 use snaplight_domain::*;
 use snaplight_platform::{
     atomic_write, capture_dir, data_dir, load_config, load_window_state, save_config,
     save_window_state, write_pixels, CaptureService,
 };
 use snaplight_render_win::*;
-use snaplight_ui::{ComponentHandle, ModelRc, PhysicalPosition, Toolbar, VecModel};
+use snaplight_ui::{ComponentHandle, ModelRc, OptionsPanel, PhysicalPosition, Toolbar, VecModel};
 use std::{
     io::Write,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use windows::{
@@ -34,6 +35,58 @@ enum UiCommand {
         swatch: i32,
     },
 }
+/// Grid indices match the eight handles drawn by the renderer (no centre).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SelectionHandle {
+    col: u8,
+    row: u8,
+}
+fn selection_handle(rect: ImageRect, point: ImagePoint, dpi: u32) -> Option<SelectionHandle> {
+    let radius = 8.0 * (dpi as f32 / 96.0).clamp(1.0, 4.0);
+    // Corners take priority when a tiny selection has overlapping hit regions.
+    let handles = [
+        (0, 0),
+        (2, 0),
+        (0, 2),
+        (2, 2),
+        (1, 0),
+        (0, 1),
+        (2, 1),
+        (1, 2),
+    ];
+    handles.into_iter().find_map(|(col, row)| {
+        let x = rect.x + rect.width * col as f32 / 2.0;
+        let y = rect.y + rect.height * row as f32 / 2.0;
+        ((point.x - x).powi(2) + (point.y - y).powi(2) <= radius * radius)
+            .then_some(SelectionHandle { col, row })
+    })
+}
+fn resize_selection(
+    rect: ImageRect,
+    handle: SelectionHandle,
+    point: ImagePoint,
+    width: u32,
+    height: u32,
+) -> ImageRect {
+    let (mut left, mut top, mut right, mut bottom) =
+        (rect.x, rect.y, rect.x + rect.width, rect.y + rect.height);
+    match handle.col {
+        0 => left = point.x.clamp(0.0, right - 1.0),
+        2 => right = point.x.clamp(left + 1.0, width as f32),
+        _ => {}
+    }
+    match handle.row {
+        0 => top = point.y.clamp(0.0, bottom - 1.0),
+        2 => bottom = point.y.clamp(top + 1.0, height as f32),
+        _ => {}
+    }
+    ImageRect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    }
+}
 struct Canvas {
     hwnd: HWND,
     renderer: OverlayRenderer,
@@ -45,6 +98,7 @@ struct Canvas {
     block: u32,
     text: String,
     start: Option<ImagePoint>,
+    resize: Option<(ImageRect, SelectionHandle)>,
     active: Arc<Mutex<usize>>,
     error: Option<String>,
     // Immutable base image pixels (BGRA8, `doc.image.stride`) so GPU resources can
@@ -53,7 +107,7 @@ struct Canvas {
     screen: RECT,
     device_rebuilds: u32,
     capture_dir: PathBuf,
-    toolbar: Arc<ToolbarSlot>,
+    ui_slots: Arc<UiSlots>,
     dpi: u32,
 }
 impl Canvas {
@@ -61,7 +115,11 @@ impl Canvas {
         let viewport = Viewport {
             width: self.doc.image.width,
             height: self.doc.image.height,
-            dpi: 96.0,
+            dpi: self.dpi as f32,
+            origin: ScreenPoint {
+                x: self.screen.left,
+                y: self.screen.top,
+            },
         };
         match self.renderer.render(&self.doc, viewport, &self.interaction) {
             Ok(()) => Ok(()),
@@ -95,6 +153,20 @@ impl Canvas {
         let Some(start) = self.start else {
             return;
         };
+        if let Some((rect, handle)) = self.resize {
+            let adjusted = ImagePoint {
+                x: rect.x + rect.width * handle.col as f32 / 2.0 + p.x - start.x,
+                y: rect.y + rect.height * handle.row as f32 / 2.0 + p.y - start.y,
+            };
+            self.interaction.selection_draft = Some(resize_selection(
+                rect,
+                handle,
+                adjusted,
+                self.doc.image.width,
+                self.doc.image.height,
+            ));
+            return;
+        }
         let r = ImageRect::between(start, p).clamp(self.doc.image.width, self.doc.image.height);
         if self.tool == Tool::Select {
             self.interaction.selection_draft = Some(r);
@@ -230,9 +302,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             }
             WM_ERASEBKGND => return LRESULT(1),
             WM_LBUTTONDOWN => {
-                *state.active.lock().unwrap() = hwnd.0 as usize;
+                *state.active.lock() = hwnd.0 as usize;
                 let p = state.position(l);
                 state.interaction.cursor = Some(p);
+                let handle = state
+                    .doc
+                    .selection
+                    .and_then(|r| selection_handle(r, p, state.dpi).map(|h| (r, h)));
+                if let Some(resize) = handle {
+                    park_toolbar(state);
+                    state.resize = Some(resize);
+                    state.start = Some(p);
+                    state.interaction.dragging = true;
+                    SetCapture(hwnd);
+                    state.update_drag(p);
+                    state.invalidate();
+                    return LRESULT(0);
+                }
                 if state.tool == Tool::Text {
                     if !state.text.is_empty() {
                         state.history.execute(
@@ -250,6 +336,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                         state.invalidate();
                     }
                 } else {
+                    if state.tool == Tool::Select {
+                        park_toolbar(state);
+                    }
                     SetCapture(hwnd);
                     state.start = Some(p);
                     state.interaction.dragging = true;
@@ -257,6 +346,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     state.invalidate();
                 }
                 return LRESULT(0);
+            }
+            WM_SETCURSOR => {
+                if (l.0 as u32 & 0xffff) == HTCLIENT {
+                    let mut point = POINT::default();
+                    if GetCursorPos(&mut point).is_ok()
+                        && ScreenToClient(hwnd, &mut point).as_bool()
+                    {
+                        let p = ImagePoint {
+                            x: point.x as f32,
+                            y: point.y as f32,
+                        };
+                        let handle = state.resize.map(|(_, h)| h).or_else(|| {
+                            state
+                                .doc
+                                .selection
+                                .and_then(|r| selection_handle(r, p, state.dpi))
+                        });
+                        let cursor = match handle {
+                            Some(SelectionHandle { col: 1, .. }) => IDC_SIZENS,
+                            Some(SelectionHandle { row: 1, .. }) => IDC_SIZEWE,
+                            Some(SelectionHandle { col, row }) if col == row => IDC_SIZENWSE,
+                            Some(_) => IDC_SIZENESW,
+                            None => IDC_CROSS,
+                        };
+                        if let Ok(cursor) = LoadCursorW(None, cursor) {
+                            SetCursor(cursor);
+                        }
+                        return LRESULT(1);
+                    }
+                }
             }
             WM_MOUSEMOVE => {
                 let p = state.position(l);
@@ -269,11 +388,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 if state.start.is_some() {
                     state.update_drag(state.position(l));
                     if let Some(r) = state.interaction.selection_draft.take() {
-                        if r.width >= 1.0 && r.height >= 1.0 {
+                        if r.width >= 1.0 && r.height >= 1.0 && state.doc.selection != Some(r) {
                             state
                                 .history
                                 .execute(&mut state.doc, Edit::Selection(Some(r)));
-                            publish_selection(state, r);
                         }
                     } else if let Some(a) = state.interaction.draft.take() {
                         state.history.execute(&mut state.doc, Edit::Add(a));
@@ -281,16 +399,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     }
                 }
                 state.start = None;
+                state.resize = None;
                 state.interaction.dragging = false;
                 let _ = ReleaseCapture();
+                publish_history(state);
                 state.invalidate();
                 return LRESULT(0);
             }
             WM_CAPTURECHANGED => {
+                let interrupted = state.start.is_some();
                 state.start = None;
+                state.resize = None;
                 state.interaction.draft = None;
                 state.interaction.selection_draft = None;
                 state.interaction.dragging = false;
+                if interrupted {
+                    publish_history(state);
+                }
                 state.invalidate();
                 return LRESULT(0);
             }
@@ -415,7 +540,7 @@ fn canvas_thread(
     config: Config,
     queue: Arc<Mutex<Vec<UiCommand>>>,
     ready: std::sync::mpsc::Sender<std::result::Result<CaptureReady, String>>,
-    toolbar: Arc<ToolbarSlot>,
+    ui_slots: Arc<UiSlots>,
     smoke: bool,
     stress: bool,
 ) -> std::result::Result<(), String> {
@@ -541,18 +666,19 @@ fn canvas_thread(
                     block: config.mosaic_block,
                     text: String::new(),
                     start: None,
+                    resize: None,
                     active: active.clone(),
                     error: None,
                     base,
                     screen: s,
                     device_rebuilds: 0,
                     capture_dir: capture_dir(&config),
-                    toolbar: toolbar.clone(),
+                    ui_slots: ui_slots.clone(),
                     dpi: window_dpi.max(96),
                 });
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *canvas as *mut Canvas) as isize);
-                if *active.lock().unwrap() == 0 {
-                    *active.lock().unwrap() = hwnd.0 as usize;
+                if *active.lock() == 0 {
+                    *active.lock() = hwnd.0 as usize;
                 }
                 if smoke {
                     // A captured frame that carries no desktop image (an empty
@@ -616,15 +742,91 @@ fn canvas_thread(
                             },
                         ]
                     };
+                    canvas.renderer.record_composed(!stress);
                     canvas.renderer.render(
                         &canvas.doc,
                         Viewport {
                             width: frame.descriptor.width,
                             height: frame.descriptor.height,
-                            dpi: 96.0,
+                            dpi: canvas.dpi as f32,
+                            origin: ScreenPoint {
+                                x: canvas.screen.left,
+                                y: canvas.screen.top,
+                            },
                         },
                         &Interaction::default(),
                     )?;
+                    if !stress {
+                        // The selection chrome is drawn into the composed frame only, so
+                        // check it before the export strips it back down to the selected
+                        // pixels. The same check runs for the synthetic frame and for a
+                        // real capture.
+                        let composed = canvas
+                            .renderer
+                            .composed()
+                            .ok_or("the overlay did not record a composed frame")?;
+                        let pixel = |x: usize, y: usize| -> [u8; 4] {
+                            let n = y * composed.width as usize * 4 + x * 4;
+                            [
+                                composed.pixels[n],
+                                composed.pixels[n + 1],
+                                composed.pixels[n + 2],
+                                composed.pixels[n + 3],
+                            ]
+                        };
+                        let captured = |x: usize, y: usize| -> [u8; 4] {
+                            let n = y * canvas.doc.image.stride as usize + x * 4;
+                            [
+                                canvas.base[n],
+                                canvas.base[n + 1],
+                                canvas.base[n + 2],
+                                canvas.base[n + 3],
+                            ]
+                        };
+                        let within = |got: [u8; 4], want: [u8; 4], tolerance: i32| {
+                            (0..3).all(|i| (got[i] as i32 - want[i] as i32).abs() <= tolerance)
+                        };
+                        // BGRA8 render target: blue outline, blue handle fill, dark chip.
+                        for (x, y, want, what) in [
+                            (400usize, 20usize, [255u8, 136, 51, 255], "outline"),
+                            (330, 20, [255, 136, 51, 255], "top handle"),
+                            (20, 210, [255, 136, 51, 255], "side handle"),
+                            (26, 20, [56, 49, 40, 255], "size chip"),
+                        ] {
+                            let got = pixel(x, y);
+                            if !within(got, want, 24) {
+                                return Err(format!(
+                                    "selection {what} at {x},{y} is {got:?}, expected {want:?}"
+                                )
+                                .into());
+                            }
+                        }
+                        // Selected pixels keep the captured value.
+                        let inside = pixel(350, 100);
+                        let wanted = captured(350, 100);
+                        if !within(inside, wanted, 6) {
+                            return Err(format!(
+                                "selected pixel is {inside:?}, expected the undimmed capture {wanted:?}"
+                            )
+                            .into());
+                        }
+                        // Everything outside the selection is dimmed by the mask, so a
+                        // bright enough capture pixel must come back at about 55%.
+                        let outside = pixel(500, 12);
+                        let reference = captured(500, 12);
+                        if reference[..3].iter().copied().max().unwrap_or(0) > 40 {
+                            for i in 0..3 {
+                                let want = reference[i] as f32 * 0.55;
+                                if (outside[i] as f32 - want).abs() > 8.0 {
+                                    return Err(format!(
+                                        "pixel outside the selection is {outside:?}, expected about 55% of {reference:?}"
+                                    )
+                                    .into());
+                                }
+                            }
+                        }
+                        canvas.renderer.record_composed(false);
+                    }
                     let (image, bytes) = canvas.renderer.export(&canvas.doc)?;
                     if image.id == ImageId(999) && !stress {
                         if bytes[..4] != [160, 60, 60, 255] {
@@ -678,7 +880,11 @@ fn canvas_thread(
                                 Viewport {
                                     width: frame.descriptor.width,
                                     height: frame.descriptor.height,
-                                    dpi: 96.0,
+                                    dpi: canvas.dpi as f32,
+                                    origin: ScreenPoint {
+                                        x: canvas.screen.left,
+                                        y: canvas.screen.top,
+                                    },
                                 },
                                 &live,
                             )?;
@@ -716,7 +922,7 @@ fn canvas_thread(
                         break;
                     }
                     if msg.message == COMMAND {
-                        let commands = std::mem::take(&mut *queue.lock().unwrap());
+                        let commands = std::mem::take(&mut *queue.lock());
                         for command in commands {
                             match command {
                                 UiCommand::Action(id) => {
@@ -726,7 +932,7 @@ fn canvas_thread(
                                         }
                                     } else if let Some(c) = canvases
                                         .iter_mut()
-                                        .find(|c| c.hwnd.0 as usize == *active.lock().unwrap())
+                                        .find(|c| c.hwnd.0 as usize == *active.lock())
                                     {
                                         if let Err(e) = c.action(id) {
                                             snaplight_platform::native::show_error(&e.to_string());
@@ -753,6 +959,13 @@ fn canvas_thread(
                                     }
                                 }
                             }
+                        }
+                        // Undo and redo availability follows the edit history.
+                        if let Some(c) = canvases
+                            .iter()
+                            .find(|c| c.hwnd.0 as usize == *active.lock())
+                        {
+                            publish_history(c);
                         }
                     } else {
                         let _ = TranslateMessage(&msg);
@@ -833,9 +1046,15 @@ fn clipboard(hwnd: HWND, image: &ImageDescriptor, bytes: &[u8]) -> Result<()> {
         closed
     }
 }
-/// Toolbar handle shared with the canvas thread so it can follow the selection
-/// without touching Slint from the wrong thread.
-type ToolbarSlot = OnceLock<snaplight_ui::ToolbarWeak>;
+/// Toolbar and tool options handles shared with the canvas thread, which moves
+/// the toolbar after a selection and closes options that no longer belong to it.
+#[derive(Default)]
+struct UiSlots {
+    toolbar: OnceLock<snaplight_ui::ToolbarWeak>,
+    panel: OnceLock<snaplight_ui::PanelWeak>,
+    toolbar_size: OnceLock<(u32, u32)>,
+    toolbar_selection: Mutex<Option<ImageRect>>,
+}
 /// Captured desktop bounds, monitor DPI, and the canvas thread id.
 #[derive(Clone, Copy)]
 struct CaptureReady {
@@ -843,8 +1062,216 @@ struct CaptureReady {
     bounds: RECT,
     dpi: u32,
 }
+/// Places the tool options next to the toolbar: above it when the captured
+/// desktop has room, otherwise below, always clamped to the capture.
+fn options_position(
+    screen: RECT,
+    x: i32,
+    toolbar_y: i32,
+    toolbar_height: i32,
+    size: (i32, i32),
+) -> (i32, i32) {
+    const MARGIN: i32 = 8;
+    let x = x.clamp(screen.left, (screen.right - size.0).max(screen.left));
+    let above = toolbar_y - size.1 - MARGIN;
+    let y = if above >= screen.top {
+        above
+    } else {
+        toolbar_y + toolbar_height + MARGIN
+    };
+    (x, y)
+}
+/// Finds a top-level window of this process by title. Slint owns its windows, so
+/// the editor only learns about the handle after the window has been created; the
+/// title is applied with the rest of the window properties, hence the search.
+fn find_process_window(title: &str) -> Option<HWND> {
+    unsafe extern "system" fn visit(hwnd: HWND, param: LPARAM) -> BOOL {
+        // SAFETY: `param` points to the `(title, result)` tuple owned by the
+        // caller below, which outlives the enumeration.
+        let state = unsafe { &mut *(param.0 as *mut (String, Option<HWND>)) };
+        let mut pid = 0u32;
+        let mut text = [0u16; 128];
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid != GetCurrentProcessId() {
+                return BOOL(1);
+            }
+            let length = GetWindowTextW(hwnd, &mut text) as usize;
+            if title_matches(&text[..length], &state.0) {
+                state.1 = Some(hwnd);
+                return BOOL(0);
+            }
+        }
+        BOOL(1)
+    }
+    let mut state: (String, Option<HWND>) = (title.to_string(), None);
+    unsafe {
+        let _ = EnumWindows(
+            Some(visit),
+            LPARAM((&mut state as *mut (String, Option<HWND>)) as isize),
+        );
+    }
+    state.1
+}
+/// Compares a window title (UTF-16, without terminator) with `wanted`.
+fn title_matches(text: &[u16], wanted: &str) -> bool {
+    text.len() == wanted.encode_utf16().count() && text.iter().copied().eq(wanted.encode_utf16())
+}
+/// Rounds off a frameless Slint window and keeps it out of the taskbar, so the
+/// pill floats over the capture instead of looking like a document window. The
+/// window is created asynchronously by Slint, so poll for it in the background.
+fn round_pill_window(title: &'static str, logical_size: (u32, u32)) {
+    let radius = if title == snaplight_ui::TOOLBAR_TITLE {
+        10.0
+    } else {
+        logical_size.1 as f32 / 2.0
+    };
+    std::thread::spawn(move || {
+        for _ in 0..100 {
+            if find_process_window(title).is_some() {
+                snaplight_ui::invoke(move || unsafe {
+                    if let Some(hwnd) = find_process_window(title) {
+                        round_window(hwnd, radius);
+                        raise_window(hwnd);
+                    }
+                });
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
+}
+/// True when `hwnd` already carries a window region, so the pill shape was
+/// applied before.
+unsafe fn has_region(hwnd: HWND) -> bool {
+    let probe = CreateRectRgn(0, 0, 1, 1);
+    let kind = GetWindowRgn(hwnd, probe);
+    let _ = DeleteObject(HGDIOBJ(probe.0));
+    // ERROR (0) means the window has no region at all.
+    kind.0 != 0
+}
+/// Raises `hwnd` to the top of the topmost band. The capture overlay takes the
+/// mouse while a selection is dragged, which also puts it above the pill; a
+/// window left below it would be dimmed by the overlay and receive no clicks.
+unsafe fn raise_window(hwnd: HWND) {
+    let _ = SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+}
+/// Re-applies the pill shape and raises a Slint window that was just shown.
+/// Showing an already composited window brings the system title bar back, so the
+/// frame has to be dropped again after every show, not only at creation.
+fn reshape_and_raise(title: &'static str, logical_size: (u32, u32)) {
+    match find_process_window(title) {
+        Some(hwnd) => unsafe {
+            round_window(
+                hwnd,
+                if title == snaplight_ui::TOOLBAR_TITLE {
+                    10.0
+                } else {
+                    logical_size.1 as f32 / 2.0
+                },
+            );
+            raise_window(hwnd);
+        },
+        None => round_pill_window(title, logical_size),
+    }
+}
+const TOOL_WINDOW_SUBCLASS: usize = 0x534c5442;
+fn tool_window_style(style: isize) -> isize {
+    style
+        & !((WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX).0 as isize)
+}
+/// Winit may apply window attributes again during activation and UI updates.
+/// Keep the native frame contract in force instead of repairing it after paint.
+unsafe extern "system" fn tool_window_proc(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+    id: usize,
+    _data: usize,
+) -> LRESULT {
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    match msg {
+        WM_STYLECHANGING if w.0 as i32 == GWL_STYLE.0 => {
+            if l.0 != 0 {
+                let style = &mut *(l.0 as *mut STYLESTRUCT);
+                style.styleNew = tool_window_style(style.styleNew as isize) as u32;
+            }
+        }
+        WM_NCCALCSIZE => return LRESULT(0),
+        WM_NCPAINT => return LRESULT(0),
+        WM_NCACTIVATE => return LRESULT(1),
+        WM_NCDESTROY => {
+            let _ = RemoveWindowSubclass(hwnd, Some(tool_window_proc), id);
+        }
+        _ => {}
+    }
+    DefSubclassProc(hwnd, msg, w, l)
+}
+/// Clips `hwnd` to a stadium shaped region and drops it from the taskbar.
+unsafe fn round_window(hwnd: HWND, radius: f32) {
+    let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96);
+    let mut rect = RECT::default();
+    // The region survives a hide/show cycle, so it only has to be built once;
+    // the frame change below has to run again after every show.
+    if GetWindowRect(hwnd, &mut rect).is_ok() && !has_region(hwnd) {
+        let diameter = ((radius * dpi as f32 / 96.0).round() as i32 * 2).max(2);
+        let region = CreateRoundRectRgn(
+            0,
+            0,
+            rect.right - rect.left + 1,
+            rect.bottom - rect.top + 1,
+            diameter,
+            diameter,
+        );
+        // A successful SetWindowRgn hands the region over to the system.
+        if SetWindowRgn(hwnd, region, true) == 0 {
+            let _ = DeleteObject(HGDIOBJ(region.0));
+        }
+    }
+    // Subclass installation and style changes run on the Slint window thread.
+    let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+        hwnd,
+        Some(tool_window_proc),
+        TOOL_WINDOW_SUBCLASS,
+        0,
+    );
+    let frame = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    let wanted_frame = tool_window_style(frame);
+    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    let wanted_style = (style | WS_EX_TOOLWINDOW.0 as isize) & !(WS_EX_APPWINDOW.0 as isize);
+    if frame != wanted_frame || style != wanted_style {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, wanted_frame);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wanted_style);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
 /// Places the toolbar inside the captured region when the user has never moved
 /// it: bottom-left, so it stays visible on a full-screen capture.
+/// Off-screen home of the pill windows: they are shown from the start (Slint
+/// keeps rendering them, and showing a window again reinstates the system title
+/// bar) but stay parked outside the virtual screen until a selection places them.
+fn parked_position(size: (i32, i32)) -> (i32, i32) {
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    (left - size.0 - 16, top - size.1 - 16)
+}
 fn initial_toolbar_position(bounds: RECT, size: (i32, i32)) -> (i32, i32) {
     const MARGIN: i32 = 16;
     let x = bounds.left + MARGIN;
@@ -865,9 +1292,48 @@ fn follow_position(screen: RECT, anchor: RECT, size: (i32, i32)) -> (i32, i32) {
     };
     (x, y)
 }
+/// Reflects the active document's history in the toolbar, so undo and redo only
+/// look available when there is something to reverse.
+fn publish_history(canvas: &Canvas) {
+    let Some(weak) = canvas.ui_slots.toolbar.get() else {
+        return;
+    };
+    snaplight_ui::set_toolbar_history(weak, canvas.history.can_undo(), canvas.history.can_redo());
+    // The toolbar acts on the selection, so it only exists while there is one:
+    // undoing the selection brings the capture back to the empty state.
+    if let Some(selection) = canvas.doc.selection {
+        publish_selection(canvas, selection);
+    } else {
+        park_toolbar(canvas);
+    }
+}
+fn park_toolbar(canvas: &Canvas) {
+    *canvas.ui_slots.toolbar_selection.lock() = None;
+    if let Some(weak) = canvas.ui_slots.toolbar.get() {
+        let size = snaplight_ui::scale_to_physical(
+            *canvas.ui_slots.toolbar_size.get().unwrap(),
+            canvas.dpi,
+        );
+        let (x, y) = parked_position(size);
+        snaplight_ui::move_toolbar(weak, PhysicalPosition::new(x, y));
+    }
+    if let Some(panel) = canvas.ui_slots.panel.get() {
+        snaplight_ui::hide_panel(panel);
+    }
+}
 /// Moves the toolbar under the completed selection and reports its pixel size.
 fn publish_selection(canvas: &Canvas, selection: ImageRect) {
-    let Some(weak) = canvas.toolbar.get() else {
+    let mut displayed = canvas.ui_slots.toolbar_selection.lock();
+    if *displayed == Some(selection) {
+        return;
+    }
+    *displayed = Some(selection);
+    drop(displayed);
+    // Quick settings belong to the previous toolbar position.
+    if let Some(panel) = canvas.ui_slots.panel.get() {
+        snaplight_ui::hide_panel(panel);
+    }
+    let Some(weak) = canvas.ui_slots.toolbar.get() else {
         return;
     };
     let anchor = RECT {
@@ -876,9 +1342,9 @@ fn publish_selection(canvas: &Canvas, selection: ImageRect) {
         right: canvas.screen.left + (selection.x + selection.width) as i32,
         bottom: canvas.screen.top + (selection.y + selection.height) as i32,
     };
-    let size = snaplight_ui::scale_to_physical(snaplight_ui::TOOLBAR_LOGICAL_SIZE, canvas.dpi);
+    let size =
+        snaplight_ui::scale_to_physical(*canvas.ui_slots.toolbar_size.get().unwrap(), canvas.dpi);
     let (x, y) = follow_position(canvas.screen, anchor, size);
-    snaplight_ui::move_toolbar(weak, PhysicalPosition::new(x, y));
     snaplight_ui::set_toolbar_status(
         weak,
         format!(
@@ -887,6 +1353,12 @@ fn publish_selection(canvas: &Canvas, selection: ImageRect) {
             selection.height.round() as u32
         ),
     );
+    // The bar belongs to a finished selection: place it next to the selection and
+    // put it back above the overlay, which took the mouse - and with it the top of
+    // the topmost band - while the selection was dragged.
+    snaplight_ui::move_toolbar(weak, PhysicalPosition::new(x, y));
+    let logical_size = *canvas.ui_slots.toolbar_size.get().unwrap();
+    snaplight_ui::invoke(move || reshape_and_raise(snaplight_ui::TOOLBAR_TITLE, logical_size));
 }
 /// Directory the settings page acts on: the typed folder, or the default one
 /// when the field is empty.
@@ -1142,15 +1614,15 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let smoke = std::env::args().any(|a| a == "--smoke") || stress;
     let queue = Arc::new(Mutex::new(vec![]));
     let thread_queue = queue.clone();
-    let toolbar_state = Arc::new(OnceLock::<snaplight_ui::ToolbarWeak>::new());
-    let thread_toolbar = toolbar_state.clone();
+    let ui_slots = Arc::new(UiSlots::default());
+    let thread_slots = ui_slots.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let thread = std::thread::spawn(move || {
         let result = canvas_thread(
             config,
             thread_queue,
             tx.clone(),
-            thread_toolbar,
+            thread_slots,
             smoke,
             stress,
         );
@@ -1167,25 +1639,33 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     if !smoke {
         let config = load_config()?;
         let ui: Toolbar = snaplight_ui::toolbar(&config)?;
-        let _ = toolbar_state.set(ui.as_weak());
-        let size = snaplight_ui::scale_to_physical(snaplight_ui::TOOLBAR_LOGICAL_SIZE, ready.dpi);
-        let remembered = load_window_state().toolbar;
-        if let Some(p) = remembered {
-            ui.window().set_position(PhysicalPosition::new(p.x, p.y));
-        } else {
-            let (x, y) = initial_toolbar_position(ready.bounds, size);
-            ui.window().set_position(PhysicalPosition::new(x, y));
-        }
+        let _ = ui_slots.toolbar.set(ui.as_weak());
+        let _ = ui_slots
+            .toolbar_size
+            .set(snaplight_ui::toolbar_logical_size(&config.tools));
+        let size = snaplight_ui::scale_to_physical(
+            snaplight_ui::toolbar_logical_size(&config.tools),
+            ready.dpi,
+        );
+        let parked = parked_position(size);
+        ui.window()
+            .set_position(PhysicalPosition::new(parked.0, parked.1));
+        ui.show()?;
+        // The window has its final size once it is shown, so the pill shape and
+        // the tool window style are applied now and never again.
+        reshape_and_raise(
+            snaplight_ui::TOOLBAR_TITLE,
+            snaplight_ui::toolbar_logical_size(&config.tools),
+        );
+        let panel: OptionsPanel = snaplight_ui::options_panel(&config)?;
+        let _ = ui_slots.panel.set(panel.as_weak());
+        round_pill_window(
+            snaplight_ui::OPTIONS_TITLE,
+            snaplight_ui::OPTIONS_LOGICAL_SIZE,
+        );
         let q = queue.clone();
-        ui.on_command(move |action| {
-            q.lock().unwrap().push(UiCommand::Action(action));
-            unsafe {
-                let _ = PostThreadMessageW(id, COMMAND, WPARAM(0), LPARAM(0));
-            }
-        });
-        let q = queue.clone();
-        ui.on_properties_changed(move |width, block, text, swatch| {
-            q.lock().unwrap().push(UiCommand::Properties {
+        panel.on_properties_changed(move |width, block, text, swatch| {
+            q.lock().push(UiCommand::Properties {
                 width,
                 block,
                 text: text.into(),
@@ -1195,9 +1675,78 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 let _ = PostThreadMessageW(id, COMMAND, WPARAM(0), LPARAM(0));
             }
         });
-        let result = ui.run();
-        remember_position(false, ui.window());
-        queue.lock().unwrap().push(UiCommand::Action(15));
+        let dismissed = panel.as_weak();
+        panel.on_dismissed(move || {
+            if let Some(panel) = dismissed.upgrade() {
+                let _ = panel.hide();
+            }
+        });
+        let toolbar_ui = ui.as_weak();
+        let panel_ui = panel.as_weak();
+        let panel_dpi = ready.dpi;
+        let bounds = ready.bounds;
+        ui.on_options_toggled(move |tool| {
+            let (Some(toolbar), Some(panel)) = (toolbar_ui.upgrade(), panel_ui.upgrade()) else {
+                return;
+            };
+            // The select tool has nothing to configure.
+            if !(1..=6).contains(&tool) {
+                return;
+            }
+            let open = panel.window().is_visible() && panel.get_tool() == tool;
+            if open {
+                let _ = panel.hide();
+                return;
+            }
+            panel.set_tool(tool);
+            panel.set_stroke(toolbar.get_stroke());
+            panel.set_block(toolbar.get_block());
+            panel.set_text_value(toolbar.get_text_value());
+            panel.set_swatch(toolbar.get_swatch());
+            let panel_size =
+                snaplight_ui::scale_to_physical(snaplight_ui::OPTIONS_LOGICAL_SIZE, panel_dpi);
+            let bar_size = snaplight_ui::scale_to_physical(
+                snaplight_ui::toolbar_logical_size(&config.tools),
+                panel_dpi,
+            );
+            let position = toolbar.window().position();
+            let (x, y) = options_position(bounds, position.x, position.y, bar_size.1, panel_size);
+            panel.window().set_position(PhysicalPosition::new(x, y));
+            let _ = panel.show();
+            reshape_and_raise(
+                snaplight_ui::OPTIONS_TITLE,
+                snaplight_ui::OPTIONS_LOGICAL_SIZE,
+            );
+        });
+        let q = queue.clone();
+        ui.on_command(move |action| {
+            q.lock().push(UiCommand::Action(action));
+            unsafe {
+                let _ = PostThreadMessageW(id, COMMAND, WPARAM(0), LPARAM(0));
+            }
+        });
+        let q = queue.clone();
+        ui.on_properties_changed(move |width, block, text, swatch| {
+            q.lock().push(UiCommand::Properties {
+                width,
+                block,
+                text: text.into(),
+                swatch,
+            });
+            unsafe {
+                let _ = PostThreadMessageW(id, COMMAND, WPARAM(0), LPARAM(0));
+            }
+        });
+        // The panel is created hidden and only shown when a tool asks for it.
+        snaplight_ui::hide_panel(&panel.as_weak());
+        let result = snaplight_ui::run_event_loop();
+        // A parked toolbar was never placed by a selection, so its position is not
+        // worth remembering.
+        let position = ui.window().position();
+        if (position.x, position.y) != parked {
+            remember_position(false, ui.window());
+        }
+        queue.lock().push(UiCommand::Action(15));
         unsafe {
             let _ = PostThreadMessageW(id, COMMAND, WPARAM(0), LPARAM(0));
         }
@@ -1208,6 +1757,10 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let config = load_config()?;
         let ui = snaplight_ui::toolbar(&config)?;
         ui.show()?;
+        reshape_and_raise(
+            snaplight_ui::TOOLBAR_TITLE,
+            snaplight_ui::toolbar_logical_size(&config.tools),
+        );
         // Without a remembered position the toolbar must be placed inside the
         // captured desktop, so it stays reachable on a full-screen capture.
         let size = ui.window().size();
@@ -1219,14 +1772,41 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let physical = (physical.width as i32, physical.height as i32);
         // The placement math uses the toolbar's logical size scaled by the
         // monitor DPI; the real window must match it.
-        let expected =
-            snaplight_ui::scale_to_physical(snaplight_ui::TOOLBAR_LOGICAL_SIZE, ready.dpi);
+        let expected = snaplight_ui::scale_to_physical(
+            snaplight_ui::toolbar_logical_size(&config.tools),
+            ready.dpi,
+        );
         if physical != expected {
             return Err(format!(
                 "toolbar physical size {physical:?} does not match dpi-scaled {expected:?} at {} dpi",
                 ready.dpi
             )
             .into());
+        }
+        // Permanent regression: attribute updates must never restore a system
+        // frame, even after the toolbar has been shown and rendered.
+        let hwnd = find_process_window(snaplight_ui::TOOLBAR_TITLE)
+            .ok_or("toolbar native window missing")?;
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            SetWindowLongPtrW(
+                hwnd,
+                GWL_STYLE,
+                style | (WS_CAPTION | WS_THICKFRAME | WS_SYSMENU).0 as isize,
+            );
+            let applied = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            if applied != tool_window_style(applied) {
+                return Err("toolbar allowed system window decorations to return".into());
+            }
+            let mut outer = RECT::default();
+            let mut client = RECT::default();
+            GetWindowRect(hwnd, &mut outer)?;
+            GetClientRect(hwnd, &mut client)?;
+            if outer.right - outer.left != client.right - client.left
+                || outer.bottom - outer.top != client.bottom - client.top
+            {
+                return Err("toolbar has an unexpected nonclient frame".into());
+            }
         }
         atomic_write(
             &data_dir().join("toolbar-window.json"),
@@ -1334,6 +1914,135 @@ mod tests {
             right,
             bottom,
         }
+    }
+    #[test]
+    fn tool_windows_reject_frame_bits_without_losing_visibility() {
+        let original = (WS_VISIBLE
+            | WS_POPUP
+            | WS_CAPTION
+            | WS_THICKFRAME
+            | WS_SYSMENU
+            | WS_MINIMIZEBOX
+            | WS_MAXIMIZEBOX)
+            .0 as isize;
+        let clean = tool_window_style(original);
+        assert_eq!(clean, (WS_VISIBLE | WS_POPUP).0 as isize);
+        assert_eq!(tool_window_style(clean), clean);
+    }
+    #[test]
+    fn selection_handles_hit_all_eight_at_scaled_dpi() {
+        let r = ImageRect {
+            x: 100.0,
+            y: 100.0,
+            width: 200.0,
+            height: 100.0,
+        };
+        for row in 0..3 {
+            for col in 0..3 {
+                let p = ImagePoint {
+                    x: 100.0 + 100.0 * col as f32,
+                    y: 100.0 + 50.0 * row as f32,
+                };
+                let expected = (col != 1 || row != 1).then_some(SelectionHandle { col, row });
+                assert_eq!(selection_handle(r, p, 144), expected);
+            }
+        }
+        assert_eq!(
+            selection_handle(r, ImagePoint { x: 89.0, y: 100.0 }, 144),
+            Some(SelectionHandle { col: 0, row: 0 })
+        );
+        assert_eq!(
+            selection_handle(r, ImagePoint { x: 89.0, y: 100.0 }, 96),
+            None
+        );
+    }
+    #[test]
+    fn resizing_preserves_opposite_edges_and_clamps_to_image() {
+        let r = ImageRect {
+            x: 100.0,
+            y: 100.0,
+            width: 200.0,
+            height: 100.0,
+        };
+        for row in 0..3 {
+            for col in 0..3 {
+                if col == 1 && row == 1 {
+                    continue;
+                }
+                let resized = resize_selection(
+                    r,
+                    SelectionHandle { col, row },
+                    ImagePoint { x: 150.0, y: 150.0 },
+                    500,
+                    400,
+                );
+                assert_eq!(resized.x, if col == 0 { 150.0 } else { 100.0 });
+                assert_eq!(resized.y, if row == 0 { 150.0 } else { 100.0 });
+                assert_eq!(
+                    resized.x + resized.width,
+                    if col == 2 { 150.0 } else { 300.0 }
+                );
+                assert_eq!(
+                    resized.y + resized.height,
+                    if row == 2 { 150.0 } else { 200.0 }
+                );
+            }
+        }
+        let h = SelectionHandle { col: 0, row: 0 };
+        assert_eq!(
+            resize_selection(r, h, ImagePoint { x: -50.0, y: -50.0 }, 500, 400),
+            ImageRect {
+                x: 0.0,
+                y: 0.0,
+                width: 300.0,
+                height: 200.0
+            }
+        );
+        assert_eq!(
+            resize_selection(r, h, ImagePoint { x: 450.0, y: 350.0 }, 500, 400),
+            ImageRect {
+                x: 299.0,
+                y: 199.0,
+                width: 1.0,
+                height: 1.0
+            }
+        );
+        let enlarged = resize_selection(
+            r,
+            SelectionHandle { col: 2, row: 2 },
+            ImagePoint { x: 900.0, y: 900.0 },
+            500,
+            400,
+        );
+        assert_eq!(
+            enlarged,
+            ImageRect {
+                x: 100.0,
+                y: 100.0,
+                width: 400.0,
+                height: 300.0
+            }
+        );
+        let mut doc = Document {
+            version: 1,
+            image: ImageDescriptor {
+                id: ImageId(1),
+                width: 500,
+                height: 400,
+                stride: 2000,
+                format: PixelFormat::Bgra8,
+                alpha: AlphaMode::Opaque,
+                color_space: ColorSpace::Srgb,
+            },
+            selection: Some(r),
+            annotations: vec![],
+        };
+        let mut history = History::default();
+        history.execute(&mut doc, Edit::Selection(Some(enlarged)));
+        history.undo(&mut doc);
+        assert_eq!(doc.selection, Some(r));
+        history.redo(&mut doc);
+        assert_eq!(doc.selection, Some(enlarged));
     }
     #[test]
     fn toolbar_placement_stays_inside_the_capture() {

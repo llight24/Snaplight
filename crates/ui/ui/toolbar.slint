@@ -1,51 +1,315 @@
 import { Button, HorizontalBox, VerticalBox, SpinBox, LineEdit, CheckBox, ScrollView } from "std-widgets.slint";
+
 export struct ToolItem { id:int, label:string }
+export struct CommandItem { id:int, glyph:int, label:string }
 export struct CaptureItem { id:string, label:string }
+
+// Icons are paths so the toolbar ships no image assets; the ink colour comes
+// from the button that owns them.
+component IconChevron inherits Path {
+    in property <color> ink: #6b7280;
+    width: 9px; height: 6px;
+    viewbox-x: 0; viewbox-y: 0; viewbox-width: 9; viewbox-height: 6;
+    commands: "M0.9 0.9 L4.5 4.5 L8.1 0.9";
+    fill: transparent; stroke: root.ink; stroke-width: 1.5px;
+    stroke-line-cap: round; stroke-line-join: round;
+}
+component IconGrip inherits Rectangle {
+    in property <color> ink: #c3c8d0;
+    width: 10px; height: 16px;
+    background: transparent;
+    for dot in [{x: 0px, y: 0px}, {x: 6px, y: 0px}, {x: 0px, y: 6px}, {x: 6px, y: 6px}, {x: 0px, y: 12px}, {x: 6px, y: 12px}]: Rectangle {
+        x: dot.x; y: dot.y; width: 4px; height: 4px; border-radius: 2px; background: root.ink;
+    }
+}
+// Shared vector grid: 24 units, 22px box, 1.75px stroke, round ends.
+// All functional icons use outlines; colour is inherited from button state.
+component ToolbarIcon inherits Path {
+    in property <color> ink: #252a31;
+    width: 22px; height: 22px;
+    viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+    fill: transparent;
+    stroke: root.ink; stroke-width: 1.75px;
+    stroke-line-cap: round; stroke-line-join: round;
+}
+component IconSelect inherits ToolbarIcon {
+    commands: "M5 3 L5 20 L9.5 15.5 L13 22 L16 20.5 L12.5 14 L19 14 Z";
+}
+component IconRectangle inherits ToolbarIcon {
+    commands: "M5 5 H19 Q20 5 20 6 V18 Q20 19 19 19 H5 Q4 19 4 18 V6 Q4 5 5 5 Z";
+}
+component IconEllipse inherits ToolbarIcon {
+    commands: "M20 12 A8 7 0 1 1 4 12 A8 7 0 1 1 20 12 Z";
+}
+component IconArrow inherits ToolbarIcon {
+    commands: "M5 19 L19 5 M8 5 H19 V16";
+}
+component IconPen inherits ToolbarIcon {
+    commands: "M15 4 L20 9 L9 20 L3 21 L4 15 Z M12 7 L17 12 M4 15 L9 20";
+}
+component IconMosaic inherits ToolbarIcon {
+    commands: "M4 4 H10 V10 H4 Z M14 4 H20 V10 H14 Z M4 14 H10 V20 H4 Z M14 14 H20 V20 H14 Z";
+}
+component IconText inherits ToolbarIcon {
+    commands: "M4 6 V4 H20 V6 M12 4 V20 M8 20 H16";
+}
+component IconUndo inherits ToolbarIcon {
+    commands: "M9 4 L4 9 L9 14 M4 9 H14 C18 9 20 11 20 15 C20 18 18 20 15 20 H11";
+}
+component IconRedo inherits ToolbarIcon {
+    commands: "M15 4 L20 9 L15 14 M20 9 H10 C6 9 4 11 4 15 C4 18 6 20 9 20 H13";
+}
+component IconSliders inherits ToolbarIcon {
+    commands: "M4 7 H8 M12 7 H20 M4 17 H12 M16 17 H20 M8 4 H12 V10 H8 Z M12 14 H16 V20 H12 Z";
+}
+component IconCopy inherits ToolbarIcon {
+    commands: "M9 8 H19 Q20 8 20 9 V19 Q20 20 19 20 H9 Q8 20 8 19 V9 Q8 8 9 8 Z M15 8 V5 Q15 4 14 4 H5 Q4 4 4 5 V14 Q4 15 5 15 H8";
+}
+component IconSave inherits ToolbarIcon {
+    commands: "M12 3 V15 M7 10 L12 15 L17 10 M4 16 V20 H20 V16";
+}
+component IconPin inherits ToolbarIcon {
+    commands: "M14 3 L21 10 L18 10 L14 14 L14 18 L6 10 L10 10 L14 6 Z M10 14 L4 20";
+}
+component IconClose inherits ToolbarIcon {
+    commands: "M6 6 L18 18 M18 6 L6 18";
+}
+component ToolGlyph inherits Rectangle {
+    in property <int> tool-id: 0;
+    in property <color> ink: #252a31;
+    width: 22px; height: 22px;
+    background: transparent;
+    IconSelect { visible: root.tool-id == 0; ink: root.ink; }
+    IconRectangle { visible: root.tool-id == 1; ink: root.ink; }
+    IconEllipse { visible: root.tool-id == 2; ink: root.ink; }
+    IconArrow { visible: root.tool-id == 3; ink: root.ink; }
+    IconPen { visible: root.tool-id == 4; ink: root.ink; }
+    IconMosaic { visible: root.tool-id == 5; ink: root.ink; }
+    IconText { visible: root.tool-id == 6; ink: root.ink; }
+}
+// Icon button with an optional drop-down arrow for the tool's own options.
+component ToolButton inherits Rectangle {
+    in property <int> tool-id: 0;
+    in property <bool> selected: false;
+    in property <bool> has-options: false;
+    in property <string> label: "";
+    callback activated();
+    callback options-activated();
+    width: root.has-options ? 50px : 40px;
+    height: 40px;
+    border-radius: 8px;
+    background: root.selected ? #e8f0fe : (main-hit.has-hover || arrow-hit.has-hover ? #f2f4f7 : transparent);
+    ToolGlyph {
+        tool-id: root.tool-id;
+        ink: root.selected ? #1668dc : #252a31;
+        x: root.has-options ? 7px : 9px;
+        y: 9px;
+    }
+    IconChevron {
+        visible: root.has-options;
+        x: root.width - 16px;
+        y: 17px;
+    }
+    main-hit := TouchArea {
+        width: root.has-options ? root.width - 19px : root.width;
+        height: root.height;
+        accessible-role: button;
+        accessible-label: root.label;
+        clicked => { root.activated(); }
+    }
+    arrow-hit := TouchArea {
+        x: root.has-options ? root.width - 19px : root.width;
+        width: root.has-options ? 19px : 0px;
+        height: root.height;
+        accessible-role: button;
+        accessible-label: root.label + " options";
+        clicked => { root.options-activated(); }
+    }
+}
+// History and command icons, selected by number.
+component CommandGlyph inherits Rectangle {
+    in property <int> glyph: 0;
+    in property <color> ink: #252a31;
+    width: 22px; height: 22px;
+    background: transparent;
+    IconUndo { visible: root.glyph == 0; ink: root.ink; }
+    IconRedo { visible: root.glyph == 1; ink: root.ink; }
+    IconSliders { visible: root.glyph == 2; ink: root.ink; }
+    IconCopy { visible: root.glyph == 3; ink: root.ink; }
+    IconSave { visible: root.glyph == 4; ink: root.ink; }
+    IconPin { visible: root.glyph == 5; ink: root.ink; }
+    IconClose { visible: root.glyph == 6; ink: root.ink; }
+}
+// Plain icon button used for history and the command group.
+component BarButton inherits Rectangle {
+    in property <int> glyph: 0;
+    in property <bool> enabled: true;
+    in property <bool> highlighted: false;
+    in property <string> label: "";
+    callback activated();
+    width: 40px; height: 40px;
+    border-radius: 8px;
+    background: !root.enabled ? transparent : (root.highlighted ? #e8f0fe : (hit.has-hover ? #f2f4f7 : transparent));
+    CommandGlyph {
+        glyph: root.glyph;
+        ink: root.enabled ? #252a31 : #c9ced5;
+        x: 9px; y: 9px;
+    }
+    hit := TouchArea {
+        enabled: root.enabled;
+        accessible-role: button;
+        accessible-label: root.label;
+        clicked => { root.activated(); }
+    }
+}
+component Divider inherits Rectangle {
+    width: 13px; height: 40px;
+    background: transparent;
+    Rectangle { x: 6px; y: 8px; width: 1px; height: 24px; background: #e4e7ec; }
+}
+component Swatch inherits Rectangle {
+    in property <color> dot: #ffffff;
+    in property <bool> selected: false;
+    in property <string> label: "Colour";
+    callback picked();
+    width: 24px; height: 24px;
+    border-radius: 12px;
+    background: root.dot;
+    border-width: root.selected ? 2px : 1px;
+    border-color: root.selected ? #3388ff : #d3d7dd;
+    TouchArea {
+        accessible-role: button;
+        accessible-label: root.label;
+        clicked => { root.picked(); }
+    }
+}
+
 export component Toolbar inherits Window {
     title: "Snaplight Tools";
-    width: 740px;
-    height: 176px;
+    no-frame: true;
     always-on-top: true;
+    in property <length> bar-width: 716px;
+    width: root.bar-width;
+    height: 52px;
+    in-out property <bool> repaint: false;
+    background: root.repaint ? #ffffff : #fefefe;
+    default-font-family: "Segoe UI";
     in property <[ToolItem]> tools;
-    in-out property <color> surface-color: #202124;
-    in-out property <color> ink-color: #f4f5f6;
-    in-out property <color> accent-color: #36c9a0;
+    in property <[CommandItem]> actions;
+    in-out property <int> active: 0;
     in-out property <int> stroke: 3;
     in-out property <int> block: 12;
     in-out property <string> text-value: "";
-    in-out property <int> active: 0;
     in-out property <int> swatch: 0;
     in-out property <string> status: "";
-    background: surface-color;
+    in-out property <bool> can-undo: false;
+    in-out property <bool> can-redo: false;
     callback command(int);
     callback properties-changed(int,int,string,int);
-    VerticalBox {
-        padding: 8px; spacing: 4px;
-        HorizontalBox {
-            for tool in root.tools: Button { text: tool.label; checked: root.active==tool.id; clicked=>{root.active=tool.id;root.command(tool.id);} }
-            Button {text: "Undo";clicked=>{root.command(10);}}
-            Button {text: "Redo";clicked=>{root.command(11);}}
-        }
-        HorizontalBox {
-            Text {text: "Width";color:root.ink-color;vertical-alignment:center;}
-            SpinBox {minimum:1;maximum:64;value<=>root.stroke;edited=>{root.properties-changed(root.stroke,root.block,root.text-value,root.swatch);}}
-            Text {text: "Mosaic";color:root.ink-color;vertical-alignment:center;}
-            SpinBox {minimum:2;maximum:128;value<=>root.block;edited=>{root.properties-changed(root.stroke,root.block,root.text-value,root.swatch);}}
-            for color[index] in [#f23340,#35c9a0,#ffc94a,#ffffff]: Rectangle {
-                width: 24px; height:24px; background:color; border-width:root.swatch==index ? 2px : 0px;border-color:root.accent-color;
-                TouchArea {clicked=>{root.swatch=index;root.properties-changed(root.stroke,root.block,root.text-value,root.swatch);}}
+    callback options-toggled(int);
+    Rectangle {
+        width: 100%; height: 100%;
+        background: root.background;
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: #e8eaee;
+        clip: true;
+        HorizontalLayout {
+            padding-left: 10px; padding-right: 10px; padding-top: 6px; padding-bottom: 6px; spacing: 2px;
+            WindowMoveArea {
+                width: 18px; height: 40px;
+                IconGrip { x: 4px; y: 12px; }
             }
-            LineEdit {text<=>root.text-value;placeholder-text:"Text";edited=>{root.properties-changed(root.stroke,root.block,root.text-value,root.swatch);}}
-        }
-        HorizontalBox {
-            Text {text:root.status;color:root.ink-color;overflow:elide;horizontal-stretch:1;vertical-alignment:center;}
-            Button {text: "Copy";clicked=>{root.command(12);}}
-            Button {text: "Save";clicked=>{root.command(13);}}
-            Button {text: "Pin";clicked=>{root.command(14);}}
-            Button {text: "Close";clicked=>{root.command(15);}}
+            for tool in root.tools: ToolButton {
+                tool-id: tool.id;
+                label: tool.label;
+                selected: root.active == tool.id;
+                has-options: tool.id != 0;
+                activated => { root.active = tool.id; root.command(tool.id); }
+                options-activated => { root.options-toggled(tool.id); }
+            }
+            Divider { }
+            BarButton {
+                glyph: 0; label: "Undo"; enabled: root.can-undo;
+                activated => { root.command(10); }
+            }
+            BarButton {
+                glyph: 1; label: "Redo"; enabled: root.can-redo;
+                activated => { root.command(11); }
+            }
+            Divider { }
+            for action in root.actions: BarButton {
+                glyph: action.glyph; label: action.label;
+                activated => {
+                    if action.id == 16 { root.options-toggled(root.active); }
+                    else { root.command(action.id); }
+                }
+            }
         }
     }
 }
+
+// Quick settings for the tool whose drop-down was clicked; the same values are
+// editable in the settings window.
+export component OptionsPanel inherits Window {
+    title: "Snaplight Tool Options";
+    no-frame: true;
+    always-on-top: true;
+    width: 340px;
+    height: 52px;
+    background: #ffffff;
+    default-font-family: "Segoe UI";
+    in property <int> tool: 1;
+    in-out property <int> stroke: 3;
+    in-out property <int> block: 12;
+    in-out property <string> text-value: "";
+    in-out property <int> swatch: 0;
+    callback properties-changed(int,int,string,int);
+    callback dismissed();
+    Rectangle {
+        width: 100%; height: 100%;
+        background: #ffffff;
+        border-radius: self.height / 2;
+        border-width: 1px;
+        border-color: #e8eaee;
+        clip: true;
+        HorizontalLayout {
+            padding-left: 14px; padding-right: 8px; spacing: 10px;
+            Text { text: "Width"; visible: root.tool != 5 && root.tool != 6; color: #4b5563; font-size: 13px; vertical-alignment: center; }
+            SpinBox {
+                visible: root.tool != 5 && root.tool != 6;
+                accessible-label: "Stroke width";
+                minimum: 1; maximum: 64; value <=> root.stroke;
+                edited => { root.properties-changed(root.stroke, root.block, root.text-value, root.swatch); }
+            }
+            Text { text: "Block"; visible: root.tool == 5; color: #4b5563; font-size: 13px; vertical-alignment: center; }
+            SpinBox {
+                visible: root.tool == 5;
+                accessible-label: "Mosaic block";
+                minimum: 2; maximum: 128; value <=> root.block;
+                edited => { root.properties-changed(root.stroke, root.block, root.text-value, root.swatch); }
+            }
+            Swatch { dot: #f23340; selected: root.swatch == 0; label: "Red"; picked => { root.swatch = 0; root.properties-changed(root.stroke, root.block, root.text-value, 0); } }
+            Swatch { dot: #35c9a0; selected: root.swatch == 1; label: "Green"; picked => { root.swatch = 1; root.properties-changed(root.stroke, root.block, root.text-value, 1); } }
+            Swatch { dot: #ffc94a; selected: root.swatch == 2; label: "Yellow"; picked => { root.swatch = 2; root.properties-changed(root.stroke, root.block, root.text-value, 2); } }
+            Swatch { dot: #ffffff; selected: root.swatch == 3; label: "White"; picked => { root.swatch = 3; root.properties-changed(root.stroke, root.block, root.text-value, 3); } }
+            LineEdit {
+                visible: root.tool == 6;
+                accessible-label: "Annotation text";
+                text <=> root.text-value;
+                placeholder-text: "Text";
+                horizontal-stretch: 1;
+                edited => { root.properties-changed(root.stroke, root.block, root.text-value, root.swatch); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            BarButton {
+                glyph: 6; label: "Close options";
+                activated => { root.dismissed(); }
+            }
+        }
+    }
+}
+
 export component Settings inherits Window {
     title: "Snaplight Settings";
     width: 780px;

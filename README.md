@@ -45,11 +45,17 @@ Ship the four executables together: core, editor, pins, and plugin-host.
 
 Click the tray icon or press Ctrl+Shift+A to capture. Drag a selection, choose
 a tool, and draw. Enter pins the selected area; Escape cancels. Ctrl+Z/Y undo
-and redo, Ctrl+C copies a DIB, and Ctrl+S saves PNG. Type text in the toolbar,
-then click the canvas to place it. The toolbar opens inside the captured desktop
-(bottom-left) unless it has a remembered position, moves next to the selection
-when one is completed, and shows the selection size in pixels. Right-click the
-tray for settings and exit.
+and redo, Ctrl+C copies a DIB, and Ctrl+S saves PNG. Type text in the tool options,
+then click the canvas to place it. Drag any of the eight selection handles to resize the crop: corners adjust both
+axes, edge midpoints adjust one edge. The opposite edges stay fixed; Ctrl+Z/Y
+undoes/redoes a completed resize. The toolbar hides during resizing.
+The selection outline carries round handles
+and a chip with the origin and size in screen pixels. The white rounded toolbar
+appears beside a completed selection and hides while drawing a new selection.
+Its width follows the configured tools; drag its grip to move it. Each drawing tool has a
+drop-down arrow that opens its quick settings (stroke width, colour, mosaic
+block, text); undo and redo are greyed out while there is nothing to reverse.
+Right-click the tray for settings and exit.
 Standalone editor pin commands write IPC to stdout and need the core to show
 the resulting pin.
 
@@ -156,3 +162,5 @@ future work. The included inspection plugin is a diagnostic, not an OCR
 substitute. The GPU shared-texture transport is implemented and verified across
 processes, but no engine consumes it yet: the editor does not invoke plugins,
 and the example reads the texture back to the CPU only to compute a checksum.
+
+工具条布局：绘图工具顺序由配置 `tools` 控制；右侧操作顺序由 `crates/ui/src/lib.rs` 的 `TOOLBAR_ACTIONS` 控制。命令 ID 与显示位置独立，宽度按列表计算，增删或调换按钮无需修改编辑器命令映射。
