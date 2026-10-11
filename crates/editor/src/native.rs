@@ -773,11 +773,16 @@ fn canvas_thread(
             }
             let instance = GetModuleHandleW(None)?;
             let class = w!("Snaplight.Overlay");
+            // The window-class icon covers the frames this process draws, which
+            // is what Alt-Tab peeks at. `WNDCLASSW` has no separate small icon;
+            // the system derives it from this one.
+            let class_icon = snaplight_platform::native::app_icon(false).unwrap_or_default();
             let wc = WNDCLASSW {
                 hInstance: instance.into(),
                 lpszClassName: class,
                 lpfnWndProc: Some(wndproc),
                 hCursor: LoadCursorW(None, IDC_CROSS)?,
+                hIcon: class_icon,
                 ..Default::default()
             };
             if RegisterClassW(&wc) == 0 {
@@ -1275,6 +1280,20 @@ fn write_png(
     writer.write_image_data(&rgba)?;
     Ok(())
 }
+/// Writes a Slint window snapshot, which is already RGBA8.
+fn write_rgba_png(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    bytes: &[u8],
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let file = std::fs::File::create(path)?;
+    let mut encoder = png::Encoder::new(file, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header()?.write_image_data(bytes)?;
+    Ok(())
+}
 fn clipboard(hwnd: HWND, image: &ImageDescriptor, bytes: &[u8]) -> Result<()> {
     unsafe {
         OpenClipboard(hwnd)?;
@@ -1385,6 +1404,49 @@ fn find_process_window(title: &str) -> Option<HWND> {
 /// Compares a window title (UTF-16, without terminator) with `wanted`.
 fn title_matches(text: &[u16], wanted: &str) -> bool {
     text.len() == wanted.encode_utf16().count() && text.iter().copied().eq(wanted.encode_utf16())
+}
+/// Gives `hwnd` the application icon embedded in this executable. Windows takes
+/// the title-bar and taskbar icon from `WM_SETICON`, not from the executable
+/// resource, and the window owns the handles afterwards, so this runs once per
+/// window.
+unsafe fn apply_window_icon(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{ICON_BIG, ICON_SMALL};
+    // An icon was set before (or the class provides one): leave it alone.
+    let existing =
+        unsafe { SendMessageW(hwnd, WM_GETICON, WPARAM(ICON_SMALL as usize), LPARAM(0)) };
+    if existing.0 != 0 {
+        return;
+    }
+    for (flag, small) in [(ICON_SMALL, true), (ICON_BIG, false)] {
+        if let Ok(icon) = snaplight_platform::native::app_icon(small) {
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    WPARAM(flag as usize),
+                    LPARAM(icon.0 as isize),
+                )
+            };
+        }
+    }
+}
+/// Applies the app icon to a Slint window once it exists. Slint creates its
+/// windows on the event-loop thread, so poll from a helper thread and only touch
+/// the window from the event loop.
+fn apply_icon_when_ready(title: &'static str) {
+    std::thread::spawn(move || {
+        for _ in 0..100 {
+            if find_process_window(title).is_some() {
+                snaplight_ui::invoke(move || unsafe {
+                    if let Some(hwnd) = find_process_window(title) {
+                        apply_window_icon(hwnd);
+                    }
+                });
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
 }
 /// Rounds off a frameless Slint window and keeps it out of the taskbar, so the
 /// pill floats over the capture instead of looking like a document window. The
@@ -1739,9 +1801,33 @@ fn settings(config: Config) -> std::result::Result<(), Box<dyn std::error::Error
     let ui = snaplight_ui::settings(&config)?;
     restore_position(ui.window(), load_window_state().settings);
     ui.set_capture_dir_value(capture_dir(&config).to_string_lossy().into_owned().into());
+    ui.set_config_path(
+        snaplight_platform::data_dir()
+            .join("config.json")
+            .to_string_lossy()
+            .into_owned()
+            .into(),
+    );
+    ui.set_data_dir(
+        snaplight_platform::data_dir()
+            .to_string_lossy()
+            .into_owned()
+            .into(),
+    );
     ui.set_captures(ModelRc::new(VecModel::from(capture_items(
         &capture_dir_from_field(&ui.get_capture_dir_value()),
     ))));
+    let weak = ui.as_weak();
+    ui.on_open_data_dir(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let folder = snaplight_platform::data_dir();
+        let _ = std::fs::create_dir_all(&folder);
+        if let Err(e) = shell_open(&folder) {
+            ui.set_status(e.to_string().into());
+        }
+    });
     let weak = ui.as_weak();
     ui.on_open_capture_folder(move || {
         let Some(ui) = weak.upgrade() else {
@@ -1777,7 +1863,7 @@ fn settings(config: Config) -> std::result::Result<(), Box<dyn std::error::Error
         // Deleting needs a second click, so a stray click cannot remove a capture.
         if ui.get_pending_delete().as_str() != id.as_str() {
             ui.set_pending_delete(id.clone());
-            ui.set_status(format!("Press Confirm to move {id} to the recycle bin").into());
+            ui.set_status(format!("再次点击「确认删除」可把 {id} 移入回收站").into());
             return;
         }
         ui.set_pending_delete(Default::default());
@@ -1787,7 +1873,7 @@ fn settings(config: Config) -> std::result::Result<(), Box<dyn std::error::Error
         match snaplight_platform::native::delete_to_recycle_bin(&files) {
             Ok(()) => {
                 ui.set_captures(ModelRc::new(VecModel::from(capture_items(&folder))));
-                ui.set_status(format!("Moved {removed} files to the recycle bin").into());
+                ui.set_status(format!("已把 {removed} 个文件移入回收站").into());
             }
             Err(e) => ui.set_status(e.to_string().into()),
         }
@@ -1829,10 +1915,10 @@ fn settings(config: Config) -> std::result::Result<(), Box<dyn std::error::Error
         // Normalize and validate the shortcuts before anything is written.
         let hotkeys = (|| -> std::result::Result<(), &'static str> {
             let capture = parse_hotkey(ui.get_capture_hotkey_value().trim())
-                .map_err(|_| "invalid capture hotkey")?
+                .map_err(|_| "截图快捷键格式无效")?
                 .canonical();
             let restore = parse_hotkey(ui.get_restore_hotkey_value().trim())
-                .map_err(|_| "invalid restore hotkey")?
+                .map_err(|_| "恢复贴图快捷键格式无效")?
                 .canonical();
             ui.set_capture_hotkey_value(capture.clone().into());
             ui.set_restore_hotkey_value(restore.clone().into());
@@ -1841,7 +1927,7 @@ fn settings(config: Config) -> std::result::Result<(), Box<dyn std::error::Error
             Ok(())
         })();
         if let Err(message) = hotkeys {
-            ui.set_status(format!("{message}; nothing saved").into());
+            ui.set_status(format!("{message}，未保存任何更改").into());
             return;
         }
         let folder = ui.get_capture_dir_value().trim().to_string();
@@ -1860,11 +1946,13 @@ fn settings(config: Config) -> std::result::Result<(), Box<dyn std::error::Error
                 ui.set_captures(ModelRc::new(VecModel::from(capture_items(
                     &capture_dir_from_field(&ui.get_capture_dir_value()),
                 ))));
-                ui.set_status("Saved".into())
+                ui.set_status("已保存".into())
             }
             Err(e) => ui.set_status(e.to_string().into()),
         }
     });
+    // The settings window keeps its system frame, so it needs the icon itself.
+    apply_icon_when_ready(snaplight_ui::SETTINGS_TITLE);
     ui.run()?;
     remember_position(true, ui.window());
     Ok(())
@@ -2105,13 +2193,12 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .into());
         }
         let snapshot = ui.window().take_snapshot()?;
-        let file = std::fs::File::create(data_dir().join("toolbar-smoke.png"))?;
-        let mut encoder = png::Encoder::new(file, snapshot.width(), snapshot.height());
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder
-            .write_header()?
-            .write_image_data(snapshot.as_bytes())?;
+        write_rgba_png(
+            &data_dir().join("toolbar-smoke.png"),
+            snapshot.width(),
+            snapshot.height(),
+            snapshot.as_bytes(),
+        )?;
         ui.hide()?;
         // Window position memory must survive a real save/load round trip.
         remember_position(false, ui.window());
@@ -2144,21 +2231,48 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         if doomed.exists() {
             return Err("deleting a capture did not remove its files".into());
         }
-        // The settings page is part of the UI surface check as well.
+        // The settings page is part of the UI surface check as well: the window
+        // is a navigation pane plus one options page, so every page has to
+        // render without clipping. `settings-smoke.png` keeps showing the page
+        // with the capture list.
         let ui = snaplight_ui::settings(&config)?;
         ui.set_capture_dir_value(capture_dir(&config).to_string_lossy().into_owned().into());
+        ui.set_config_path(
+            snaplight_platform::data_dir()
+                .join("config.json")
+                .to_string_lossy()
+                .into_owned()
+                .into(),
+        );
+        ui.set_data_dir(
+            snaplight_platform::data_dir()
+                .to_string_lossy()
+                .into_owned()
+                .into(),
+        );
         ui.set_captures(ModelRc::new(VecModel::from(capture_items(
             &capture_dir_from_field(&ui.get_capture_dir_value()),
         ))));
         ui.show()?;
-        let snapshot = ui.window().take_snapshot()?;
-        let file = std::fs::File::create(data_dir().join("settings-smoke.png"))?;
-        let mut encoder = png::Encoder::new(file, snapshot.width(), snapshot.height());
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder
-            .write_header()?
-            .write_image_data(snapshot.as_bytes())?;
+        for (page, slug) in snaplight_ui::SETTINGS_PAGES.iter().enumerate() {
+            ui.set_page(page as i32);
+            let snapshot = ui.window().take_snapshot()?;
+            let bytes = snapshot.as_bytes();
+            write_rgba_png(
+                &data_dir().join(format!("settings-smoke-{slug}.png")),
+                snapshot.width(),
+                snapshot.height(),
+                bytes,
+            )?;
+            if *slug == "capture" {
+                write_rgba_png(
+                    &data_dir().join("settings-smoke.png"),
+                    snapshot.width(),
+                    snapshot.height(),
+                    bytes,
+                )?;
+            }
+        }
         ui.hide()?;
         remember_position(true, ui.window());
         let position = ui.window().position();
@@ -2170,6 +2284,30 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         {
             return Err("settings position did not round-trip through ui-state.json".into());
         }
+        // The quick tool options share the settings wording, so snapshot each
+        // variant: pen (stroke width), mosaic (block size) and text.
+        let panel = snaplight_ui::options_panel(&config)?;
+        for (tool, slug) in [(4, "pen"), (5, "mosaic"), (6, "text")] {
+            panel.set_tool(tool);
+            panel.show()?;
+            let snapshot = panel.window().take_snapshot()?;
+            let bytes = snapshot.as_bytes();
+            write_rgba_png(
+                &data_dir().join(format!("options-smoke-{slug}.png")),
+                snapshot.width(),
+                snapshot.height(),
+                bytes,
+            )?;
+            if tool == 4 {
+                write_rgba_png(
+                    &data_dir().join("options-smoke.png"),
+                    snapshot.width(),
+                    snapshot.height(),
+                    bytes,
+                )?;
+            }
+        }
+        panel.hide()?;
     }
     Ok(())
 }

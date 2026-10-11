@@ -170,7 +170,7 @@ component Divider inherits Rectangle {
 component Swatch inherits Rectangle {
     in property <color> dot: #ffffff;
     in property <bool> selected: false;
-    in property <string> label: "Colour";
+    in property <string> label: "颜色";
     callback picked();
     width: 24px; height: 24px;
     border-radius: 12px;
@@ -230,11 +230,11 @@ export component Toolbar inherits Window {
             }
             Divider { }
             BarButton {
-                glyph: 0; label: "Undo"; enabled: root.can-undo;
+                glyph: 0; label: "撤销"; enabled: root.can-undo;
                 activated => { root.command(10); }
             }
             BarButton {
-                glyph: 1; label: "Redo"; enabled: root.can-redo;
+                glyph: 1; label: "重做"; enabled: root.can-redo;
                 activated => { root.command(11); }
             }
             Divider { }
@@ -255,7 +255,9 @@ export component OptionsPanel inherits Window {
     title: "Snaplight Tool Options";
     no-frame: true;
     always-on-top: true;
-    width: 340px;
+    // Wide enough for the longest label ("马赛克块"), a value, four swatches and
+    // the close button; OPTIONS_LOGICAL_SIZE in lib.rs must match.
+    width: 400px;
     height: 52px;
     background: #ffffff;
     default-font-family: "Segoe UI";
@@ -274,46 +276,89 @@ export component OptionsPanel inherits Window {
         border-color: #e8eaee;
         clip: true;
         HorizontalLayout {
+            // Conditional elements rather than `visible: false`: a hidden
+            // element still occupies its slot in a layout, which pushed the
+            // swatches and the close button out of the panel.
             padding-left: 14px; padding-right: 8px; spacing: 10px;
-            Text { text: "Width"; visible: root.tool != 5 && root.tool != 6; color: #4b5563; font-size: 13px; vertical-alignment: center; }
-            SpinBox {
-                visible: root.tool != 5 && root.tool != 6;
-                accessible-label: "Stroke width";
+            if root.tool != 5 && root.tool != 6: Text { text: "线宽"; color: #4b5563; font-size: 13px; vertical-alignment: center; }
+            if root.tool != 5 && root.tool != 6: SpinBox {
+                accessible-label: "线宽";
+                width: 96px;
                 minimum: 1; maximum: 64; value <=> root.stroke;
                 edited => { root.properties-changed(root.stroke, root.block, root.text-value, root.swatch); }
             }
-            Text { text: "Block"; visible: root.tool == 5; color: #4b5563; font-size: 13px; vertical-alignment: center; }
-            SpinBox {
-                visible: root.tool == 5;
-                accessible-label: "Mosaic block";
+            if root.tool == 5: Text { text: "马赛克块"; color: #4b5563; font-size: 13px; vertical-alignment: center; }
+            if root.tool == 5: SpinBox {
+                accessible-label: "马赛克块";
+                width: 96px;
                 minimum: 2; maximum: 128; value <=> root.block;
                 edited => { root.properties-changed(root.stroke, root.block, root.text-value, root.swatch); }
             }
-            Swatch { dot: #f23340; selected: root.swatch == 0; label: "Red"; picked => { root.swatch = 0; root.properties-changed(root.stroke, root.block, root.text-value, 0); } }
-            Swatch { dot: #35c9a0; selected: root.swatch == 1; label: "Green"; picked => { root.swatch = 1; root.properties-changed(root.stroke, root.block, root.text-value, 1); } }
-            Swatch { dot: #ffc94a; selected: root.swatch == 2; label: "Yellow"; picked => { root.swatch = 2; root.properties-changed(root.stroke, root.block, root.text-value, 2); } }
-            Swatch { dot: #ffffff; selected: root.swatch == 3; label: "White"; picked => { root.swatch = 3; root.properties-changed(root.stroke, root.block, root.text-value, 3); } }
-            LineEdit {
-                visible: root.tool == 6;
-                accessible-label: "Annotation text";
+            Swatch { dot: #f23340; selected: root.swatch == 0; label: "红色"; picked => { root.swatch = 0; root.properties-changed(root.stroke, root.block, root.text-value, 0); } }
+            Swatch { dot: #35c9a0; selected: root.swatch == 1; label: "绿色"; picked => { root.swatch = 1; root.properties-changed(root.stroke, root.block, root.text-value, 1); } }
+            Swatch { dot: #ffc94a; selected: root.swatch == 2; label: "黄色"; picked => { root.swatch = 2; root.properties-changed(root.stroke, root.block, root.text-value, 2); } }
+            Swatch { dot: #ffffff; selected: root.swatch == 3; label: "白色"; picked => { root.swatch = 3; root.properties-changed(root.stroke, root.block, root.text-value, 3); } }
+            if root.tool == 6: LineEdit {
+                accessible-label: "标注文字";
                 text <=> root.text-value;
-                placeholder-text: "Text";
+                placeholder-text: "文字";
                 horizontal-stretch: 1;
                 edited => { root.properties-changed(root.stroke, root.block, root.text-value, root.swatch); }
             }
             Rectangle { horizontal-stretch: 1; }
             BarButton {
-                glyph: 6; label: "Close options";
+                glyph: 6; label: "关闭选项";
                 activated => { root.dismissed(); }
             }
         }
     }
 }
 
+// Settings navigation entry; the pane on the right follows the selection.
+component NavButton inherits Rectangle {
+    in property <string> label: "";
+    in property <bool> selected: false;
+    callback activated();
+    height: 38px;
+    border-radius: 6px;
+    background: root.selected ? #e8f0fe : (hit.has-hover ? #eceff3 : transparent);
+    Rectangle {
+        visible: root.selected;
+        x: 0px; y: 9px; width: 3px; height: root.height - 18px;
+        border-radius: 1.5px;
+        background: #1668dc;
+    }
+    Text {
+        x: 14px; y: 0px; width: root.width - 22px; height: 100%;
+        text: root.label;
+        color: root.selected ? #1668dc : #252a31;
+        font-weight: root.selected ? 600 : 400;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    hit := TouchArea {
+        accessible-role: button;
+        accessible-label: root.label;
+        clicked => { root.activated(); }
+    }
+}
+component SectionTitle inherits Text {
+    color: #111827; font-weight: 600; font-size: 13px;
+}
+component Hint inherits Text {
+    color: #6b7280; font-size: 12px; wrap: word-wrap;
+}
+component Rule inherits Rectangle {
+    height: 1px; background: #eef0f3;
+}
+
 export component Settings inherits Window {
-    title: "Snaplight Settings";
-    width: 780px;
+    // Keep in sync with SETTINGS_TITLE in lib.rs, which the editor uses to find
+    // this window for the app icon.
+    title: "Snaplight 设置";
+    width: 900px;
     height: 640px;
+    default-font-family: "Segoe UI";
     in-out property <[ToolItem]> tools;
     in-out property <[CaptureItem]> captures;
     in-out property <string> pending-delete:"";
@@ -328,58 +373,133 @@ export component Settings inherits Window {
     in-out property <string> restore-hotkey-value:"Ctrl+Shift+P";
     in-out property <int> detect-mode:1;
     in-out property <string> status:"";
+    in property <string> app-version:"";
+    in property <string> config-path:"";
+    in property <string> data-dir:"";
+    // Navigation index: 0 General, 1 Appearance, 2 Hotkeys, 3 Capture,
+    // 4 Translation, 5 Screen recording, 6 Settings. The navigation model and
+    // the page conditions below must stay in the same order.
+    in-out property <int> page: 0;
+    out property <int> page-index: root.page < 0 ? 0 : (root.page > 6 ? 6 : root.page);
+    out property <string> page-title: ["常规","外观","快捷键","截图","翻译","屏幕录制","设置"][root.page-index];
     callback save();
     callback move-tool(int,int);
     callback browse-capture-dir();
     callback open-capture-folder();
     callback open-capture(string);
     callback delete-capture(string);
-    VerticalBox {padding:12px; spacing:6px;
-        ScrollView {vertical-stretch:1;
-            HorizontalBox {spacing:16px;
-                VerticalBox {spacing:4px;
-                    Text {text:"Drawing";font-weight:600;}
-                    HorizontalBox {Text {text:"Stroke width";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"Stroke width";minimum:1;maximum:64;value<=>root.stroke;}}
-                    HorizontalBox {Text {text:"Mosaic block";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"Mosaic block";minimum:2;maximum:128;value<=>root.block;}}
-                    Text {text:"Theme";font-weight:600;}
-                    HorizontalBox {Text {text:"Background";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"Theme background color";text<=>root.background-value;}}
-                    HorizontalBox {Text {text:"Foreground";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"Theme foreground color";text<=>root.foreground-value;}}
-                    HorizontalBox {Text {text:"Accent";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"Theme accent color";text<=>root.accent-value;}}
-                    CheckBox {text:"GPU pins";checked<=>root.gpu-pins;}
-                    Text {text:"Capture";font-weight:600;}
-                    HorizontalBox {Text {text:"Window detection";vertical-alignment:center;horizontal-stretch:1;} ComboBox {accessible-label:"Window detection mode";model:["Off","UI element under cursor"];current-index<=>root.detect-mode;}}
-                    Text {text:"Hotkeys";font-weight:600;}
-                    HorizontalBox {Text {text:"Capture";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"Capture hotkey";text<=>root.capture-hotkey-value;horizontal-stretch:1;placeholder-text:"Ctrl+Shift+A";}}
-                    HorizontalBox {Text {text:"Restore pins";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"Restore pins hotkey";text<=>root.restore-hotkey-value;horizontal-stretch:1;placeholder-text:"Ctrl+Shift+P";}}
+    callback open-data-dir();
+    VerticalBox {padding:0px; spacing:0px;
+        HorizontalBox {vertical-stretch:1; spacing:0px;
+            // Function navigation.
+            Rectangle {
+                width:208px; vertical-stretch:1;
+                background:#f7f8fa;
+                VerticalLayout {padding:12px; spacing:4px;
+                    Text {text:"Snaplight";font-size:15px;font-weight:600;color:#111827;}
+                    Text {text:"设置";font-size:12px;color:#6b7280;}
+                    Rectangle {height:10px;}
+                    NavButton {label:"常规";selected:root.page-index==0;activated=>{root.page=0;}}
+                    NavButton {label:"外观";selected:root.page-index==1;activated=>{root.page=1;}}
+                    NavButton {label:"快捷键";selected:root.page-index==2;activated=>{root.page=2;}}
+                    NavButton {label:"截图";selected:root.page-index==3;activated=>{root.page=3;}}
+                    NavButton {label:"翻译";selected:root.page-index==4;activated=>{root.page=4;}}
+                    NavButton {label:"屏幕录制";selected:root.page-index==5;activated=>{root.page=5;}}
+                    NavButton {label:"设置";selected:root.page-index==6;activated=>{root.page=6;}}
+                    Rectangle {vertical-stretch:1;}
                 }
-                VerticalBox {spacing:4px;horizontal-stretch:1;
-                    Text {text:"Tool order";font-weight:600;}
-                    for tool[index] in root.tools: HorizontalBox {
-                        Text {text:tool.label;vertical-alignment:center;horizontal-stretch:1;}
-                        Button {text:"Up";accessible-label:tool.label + " up";clicked=>{root.move-tool(index,-1);}}
-                        Button {text:"Down";accessible-label:tool.label + " down";clicked=>{root.move-tool(index,1);}}
-                    }
-                    Text {text:"Capture folder";font-weight:600;}
-                    HorizontalBox {
-                        LineEdit {accessible-label:"Capture folder";text<=>root.capture-dir-value;horizontal-stretch:1;placeholder-text:"default: Snaplight\\captures";}
-                        Button {text:"Browse";clicked=>{root.browse-capture-dir();}}
-                    }
-                    HorizontalBox {
-                        Text {text:"Saved captures";font-weight:600;vertical-alignment:center;horizontal-stretch:1;}
-                        Button {text:"Open folder";clicked=>{root.open-capture-folder();}}
-                    }
-                    VerticalBox {spacing:2px;
-                        for capture[index] in root.captures: HorizontalBox {
-                            Text {text:capture.label;vertical-alignment:center;horizontal-stretch:1;overflow:elide;}
-                            Button {text:"Open";accessible-label:"Open capture " + capture.id;clicked=>{root.open-capture(capture.id);}}
-                            Button {text: root.pending-delete==capture.id ? "Confirm" : "Delete";accessible-label:"Delete capture " + capture.id;clicked=>{root.delete-capture(capture.id);}}
+            }
+            Rectangle {width:1px;vertical-stretch:1;background:#e4e7ec;}
+            // Options for the selected navigation entry.
+            Rectangle {
+                horizontal-stretch:1; vertical-stretch:1;
+                background:#ffffff;
+                VerticalLayout {padding:16px; spacing:10px;
+                    Text {text:root.page-title;font-size:16px;font-weight:600;color:#111827;}
+                    ScrollView {vertical-stretch:1;
+                        VerticalLayout {alignment:start; spacing:10px;
+                            if root.page-index == 0: VerticalLayout {alignment:start; spacing:8px;
+                                SectionTitle {text:"贴图";}
+                                CheckBox {text:"GPU 贴图";checked<=>root.gpu-pins;}
+                                Hint {text:"用常驻 DirectComposition 表面渲染贴图，仅对新贴图生效；默认的 layered 后端私有内存更低。";}
+                                Rule {}
+                                SectionTitle {text:"工具栏";}
+                                Hint {text:"标注工具，按悬浮条上显示的顺序排列。";}
+                                for tool[index] in root.tools: HorizontalBox {
+                                    Text {text:tool.label;vertical-alignment:center;horizontal-stretch:1;}
+                                    Button {text:"上移";accessible-label:tool.label + " 上移";clicked=>{root.move-tool(index,-1);}}
+                                    Button {text:"下移";accessible-label:tool.label + " 下移";clicked=>{root.move-tool(index,1);}}
+                                }
+                            }
+                            if root.page-index == 1: VerticalLayout {alignment:start; spacing:8px;
+                                HorizontalBox {Text {text:"背景色";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"主题背景色";text<=>root.background-value;}}
+                                HorizontalBox {Text {text:"前景色";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"主题前景色";text<=>root.foreground-value;}}
+                                HorizontalBox {Text {text:"强调色";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"主题强调色";text<=>root.accent-value;}}
+                                Hint {text:"截图界面的选区、工具栏与贴图的配色；输入的十六进制颜色在保存后生效。";}
+                            }
+                            if root.page-index == 2: VerticalLayout {alignment:start; spacing:8px;
+                                SectionTitle {text:"全局快捷键";}
+                                HorizontalBox {Text {text:"截图";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"截图快捷键";text<=>root.capture-hotkey-value;horizontal-stretch:1;placeholder-text:"Ctrl+Shift+A";}}
+                                HorizontalBox {Text {text:"恢复贴图";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"恢复贴图快捷键";text<=>root.restore-hotkey-value;horizontal-stretch:1;placeholder-text:"Ctrl+Shift+P";}}
+                                Hint {text:"格式为修饰键加一个按键，例如 Ctrl+Shift+A。修改后需重启常驻核心或贴图进程才生效；若快捷键已被占用，则回退到默认值。";}
+                            }
+                            if root.page-index == 3: VerticalLayout {alignment:start; spacing:8px;
+                                SectionTitle {text:"绘制默认值";}
+                                HorizontalBox {Text {text:"线宽";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"线宽";minimum:1;maximum:64;value<=>root.stroke;}}
+                                HorizontalBox {Text {text:"马赛克块";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"马赛克块";minimum:2;maximum:128;value<=>root.block;}}
+                                Rule {}
+                                SectionTitle {text:"窗口识别";}
+                                HorizontalBox {Text {text:"模式";vertical-alignment:center;horizontal-stretch:1;} ComboBox {accessible-label:"窗口识别模式";model:["关闭","光标下的界面元素"];current-index<=>root.detect-mode;}}
+                                Hint {text:"高亮光标下的界面元素，单击即截取该元素，不必再拖动框选。";}
+                                Rule {}
+                                SectionTitle {text:"保存位置";}
+                                HorizontalBox {
+                                    LineEdit {accessible-label:"截图文件夹";text<=>root.capture-dir-value;horizontal-stretch:1;placeholder-text:"默认：Snaplight\\captures";}
+                                    Button {text:"浏览";accessible-label:"选择截图文件夹";clicked=>{root.browse-capture-dir();}}
+                                }
+                                HorizontalBox {
+                                    Text {text:"已保存截图";font-weight:600;vertical-alignment:center;horizontal-stretch:1;}
+                                    Button {text:"打开文件夹";accessible-label:"打开截图文件夹";clicked=>{root.open-capture-folder();}}
+                                }
+                                VerticalLayout {alignment:start; spacing:2px;
+                                    for capture[index] in root.captures: HorizontalBox {
+                                        Text {text:capture.label;vertical-alignment:center;horizontal-stretch:1;overflow:elide;}
+                                        Button {text:"打开";accessible-label:"打开截图 " + capture.id;clicked=>{root.open-capture(capture.id);}}
+                                        Button {text: root.pending-delete==capture.id ? "确认删除" : "删除";accessible-label:"删除截图 " + capture.id;clicked=>{root.delete-capture(capture.id);}}
+                                    }
+                                }
+                                Text {text: root.captures.length == 0 ? "暂无已保存的截图" : "";}
+                            }
+                            if root.page-index == 4: VerticalLayout {alignment:start; spacing:8px;
+                                SectionTitle {text:"尚未实现";}
+                                Hint {text:"翻译计划以插件方式实现：识别选区内的文字（OCR），并把译文返回在截图旁。插件契约与独立宿主已经就绪，但尚未接入 OCR 或翻译引擎，因此这里暂无选项。";}
+                            }
+                            if root.page-index == 5: VerticalLayout {alignment:start; spacing:8px;
+                                SectionTitle {text:"尚未实现";}
+                                Hint {text:"屏幕录制计划以插件方式实现：捕获一个区域或整块显示器，带背压地持续编码并输出视频文件。目前只有能力位和进程边界，因此这里暂无选项。";}
+                            }
+                            if root.page-index == 6: VerticalLayout {alignment:start; spacing:8px;
+                                SectionTitle {text:"应用";}
+                                HorizontalBox {Text {text:"版本";vertical-alignment:center;horizontal-stretch:1;} Text {text:root.app-version;vertical-alignment:center;color:#4b5563;}}
+                                Rule {}
+                                SectionTitle {text:"配置文件";}
+                                HorizontalBox {
+                                    LineEdit {accessible-label:"配置文件路径";text:root.config-path;read-only:true;horizontal-stretch:1;}
+                                    Button {text:"打开目录";accessible-label:"打开配置目录";clicked=>{root.open-data-dir();}}
+                                }
+                                SectionTitle {text:"数据目录";}
+                                LineEdit {accessible-label:"数据目录";text:root.data-dir;read-only:true;horizontal-stretch:1;}
+                                Hint {text:"配置、窗口状态和已保存的截图都存放在这里，除非用 SNAPLIGHT_DATA_DIR 指向别处。截图文件夹的修改通过下方按钮保存。";}
+                            }
                         }
                     }
-                    Text {text: root.captures.length == 0 ? "No saved captures" : "";}
                 }
             }
         }
-        Text {text:root.status;overflow:elide;}
-        Button {text:"Save";clicked=>{root.save();}}
+        Rule {}
+        HorizontalBox {padding:12px;spacing:8px;
+            Text {text:root.status;vertical-alignment:center;horizontal-stretch:1;overflow:elide;}
+            Button {text:"保存";accessible-label:"保存设置";clicked=>{root.save();}}
+        }
     }
 }

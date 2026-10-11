@@ -482,6 +482,7 @@ pub mod native {
                     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
                     COINIT_MULTITHREADED,
                 },
+                LibraryLoader::GetModuleHandleW,
                 Memory::*,
                 Threading::*,
             },
@@ -496,6 +497,32 @@ pub mod native {
             },
         },
     };
+    /// Resource id of the icon group every Snaplight executable embeds through
+    /// `scripts/build/app_icon.rs`; keep both in sync.
+    const APP_ICON_RESOURCE: u16 = 1;
+    /// Loads the embedded application icon at the size Windows asks for: small
+    /// icons for title bars and the notification area, large ones for the
+    /// taskbar and Alt-Tab. The caller owns the handle; passing it to a window
+    /// through `WM_SETICON` or to a window class transfers that ownership.
+    pub fn app_icon(small: bool) -> Result<HICON> {
+        unsafe {
+            let (cx, cy) = if small {
+                (SM_CXSMICON, SM_CYSMICON)
+            } else {
+                (SM_CXICON, SM_CYICON)
+            };
+            let instance = HINSTANCE(GetModuleHandleW(None)?.0);
+            let image = LoadImageW(
+                instance,
+                PCWSTR(APP_ICON_RESOURCE as *const u16),
+                IMAGE_ICON,
+                GetSystemMetrics(cx),
+                GetSystemMetrics(cy),
+                LR_DEFAULTCOLOR,
+            )?;
+            Ok(HICON(image.0))
+        }
+    }
     /// Translates a parsed hotkey into Win32 registration flags (including
     /// `MOD_NOREPEAT`) and a virtual-key code.
     pub fn hotkey_registration(hotkey: &Hotkey) -> (HOT_KEY_MODIFIERS, u32) {

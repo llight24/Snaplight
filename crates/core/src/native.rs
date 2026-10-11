@@ -169,11 +169,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     WM_LBUTTONUP => launch_editor(hwnd, state, false),
                     WM_RBUTTONUP => {
                         if let Ok(menu) = CreatePopupMenu() {
-                            let _ = AppendMenuW(menu, MF_STRING, 1, w!("Capture"));
-                            let _ = AppendMenuW(menu, MF_STRING, 2, w!("Settings"));
-                            let _ = AppendMenuW(menu, MF_STRING, 3, w!("Close all pins"));
+                            let _ = AppendMenuW(menu, MF_STRING, 1, w!("截图"));
+                            let _ = AppendMenuW(menu, MF_STRING, 2, w!("设置"));
+                            let _ = AppendMenuW(menu, MF_STRING, 3, w!("关闭所有贴图"));
                             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-                            let _ = AppendMenuW(menu, MF_STRING, 4, w!("Exit"));
+                            let _ = AppendMenuW(menu, MF_STRING, 4, w!("退出"));
                             let mut p = POINT::default();
                             let _ = GetCursorPos(&mut p);
                             let _ = SetForegroundWindow(hwnd);
@@ -272,13 +272,17 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             Some((&mut *state as *mut State).cast()),
         )?;
         register_capture_hotkey(hwnd, &config)?;
+        // The tray wants a small icon; loading the 16px entry of the embedded
+        // resource keeps it crisp instead of letting the shell shrink the 32px
+        // default. The handle stays alive for the process lifetime.
+        let tray_icon = snaplight_platform::native::app_icon(true)?;
         let mut icon = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
             uID: 1,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
             uCallbackMessage: TRAY,
-            hIcon: LoadIconW(None, IDI_APPLICATION)?,
+            hIcon: tray_icon,
             ..Default::default()
         };
         let tip: Vec<u16> = "Snaplight - Ctrl+Shift+A".encode_utf16().collect();

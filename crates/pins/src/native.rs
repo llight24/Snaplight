@@ -236,15 +236,10 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 }
                 WM_CONTEXTMENU => {
                     let menu = CreatePopupMenu()?;
-                    AppendMenuW(
-                        menu,
-                        MF_STRING,
-                        1,
-                        w!("Click through (Ctrl+Shift+P to restore)"),
-                    )?;
-                    AppendMenuW(menu, MF_STRING, 2, w!("Original size"))?;
-                    AppendMenuW(menu, MF_STRING, 3, w!("Half size"))?;
-                    AppendMenuW(menu, MF_STRING, 4, w!("Close"))?;
+                    AppendMenuW(menu, MF_STRING, 1, w!("鼠标穿透（Ctrl+Shift+P 恢复）"))?;
+                    AppendMenuW(menu, MF_STRING, 2, w!("原始大小"))?;
+                    AppendMenuW(menu, MF_STRING, 3, w!("缩小一半"))?;
+                    AppendMenuW(menu, MF_STRING, 4, w!("关闭"))?;
                     let mut p = POINT::default();
                     GetCursorPos(&mut p)?;
                     let choice = TrackPopupMenu(
@@ -470,6 +465,10 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             || std::env::args().any(|a| a == "--composition" || a == "--smoke");
         let gpu = if use_gpu { Some(Gpu::new(None)?) } else { None };
         let instance = GetModuleHandleW(None)?;
+        // Pin windows are frameless, but the class icon still shows up in
+        // Alt-Tab previews and any dialog the process opens. `WNDCLASSW` has no
+        // separate small icon; the system derives it from this one.
+        let class_icon = snaplight_platform::native::app_icon(false).unwrap_or_default();
         for (name, proc) in [
             (
                 w!("Snaplight.Pin"),
@@ -483,6 +482,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 lpszClassName: name,
                 lpfnWndProc: Some(proc),
                 hCursor: LoadCursorW(None, IDC_ARROW)?,
+                hIcon: class_icon,
                 ..Default::default()
             };
             if RegisterClassW(&wc) == 0 {

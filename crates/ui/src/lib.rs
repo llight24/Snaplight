@@ -15,15 +15,17 @@ fn tool_id(tool: Tool) -> i32 {
         Tool::Text => 6,
     }
 }
+/// Display name of each tool. Settings and the accessibility tree are the only
+/// places the toolbar shows text, and both are Chinese first.
 fn tool_label(tool: Tool) -> &'static str {
     match tool {
-        Tool::Select => "Select",
-        Tool::Rectangle => "Rect",
-        Tool::Ellipse => "Ellipse",
-        Tool::Arrow => "Arrow",
-        Tool::Pen => "Pen",
-        Tool::Mosaic => "Mosaic",
-        Tool::Text => "Text",
+        Tool::Select => "选择",
+        Tool::Rectangle => "矩形",
+        Tool::Ellipse => "椭圆",
+        Tool::Arrow => "箭头",
+        Tool::Pen => "画笔",
+        Tool::Mosaic => "马赛克",
+        Tool::Text => "文字",
     }
 }
 fn tool_items(tools: &[Tool]) -> Vec<ToolItem> {
@@ -70,8 +72,23 @@ pub fn options_panel(config: &Config) -> Result<OptionsPanel, slint::PlatformErr
     ui.set_block(config.mosaic_block as i32);
     Ok(ui)
 }
+/// File-name slugs of the settings navigation entries, in the order the window
+/// shows them. Keep in sync with the page conditions in `toolbar.slint`.
+pub const SETTINGS_PAGES: [&str; 7] = [
+    "general",
+    "appearance",
+    "hotkeys",
+    "capture",
+    "translation",
+    "recording",
+    "settings",
+];
+/// Page shown when the settings window opens: appearance, pins and toolbar.
+pub const SETTINGS_DEFAULT_PAGE: i32 = 0;
 pub fn settings(config: &Config) -> Result<Settings, slint::PlatformError> {
     let ui = Settings::new()?;
+    ui.set_page(SETTINGS_DEFAULT_PAGE);
+    ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     ui.set_tools(ModelRc::new(VecModel::from(tool_items(&config.tools))));
     ui.set_stroke(config.stroke_width as i32);
     ui.set_block(config.mosaic_block as i32);
@@ -129,11 +146,11 @@ pub fn apply_tool_order(config: &mut Config, items: &ModelRc<ToolItem>) {
 /// Logical size derived from configured tools and the action list.
 // Display order is independent of stable editor command ids.
 const TOOLBAR_ACTIONS: &[(i32, i32, &str)] = &[
-    (16, 2, "Tool options"),
-    (14, 5, "Pin"),
-    (13, 4, "Save"),
-    (15, 6, "Close"),
-    (12, 3, "Copy"),
+    (16, 2, "工具选项"),
+    (14, 5, "贴图"),
+    (13, 4, "保存"),
+    (15, 6, "关闭"),
+    (12, 3, "复制"),
 ];
 fn toolbar_actions() -> Vec<CommandItem> {
     TOOLBAR_ACTIONS
@@ -159,11 +176,14 @@ pub fn toolbar_logical_size(tools: &[Tool]) -> (u32, u32) {
     )
 }
 /// Logical size of the tool options window; keep in sync with `toolbar.slint`.
-pub const OPTIONS_LOGICAL_SIZE: (u32, u32) = (340, 52);
+pub const OPTIONS_LOGICAL_SIZE: (u32, u32) = (400, 52);
 /// Window titles, used to find the Slint-created windows again for the native
-/// rounding and taskbar styling; keep in sync with `toolbar.slint`.
+/// rounding, taskbar styling and app icon; keep in sync with `toolbar.slint`.
 pub const TOOLBAR_TITLE: &str = "Snaplight Tools";
 pub const OPTIONS_TITLE: &str = "Snaplight Tool Options";
+/// The settings window keeps its system frame, so it is the one Slint window
+/// that also needs the application icon applied to it.
+pub const SETTINGS_TITLE: &str = "Snaplight 设置";
 /// Converts a logical size to physical pixels for a monitor DPI. The toolbar is
 /// placed in physical coordinates before its window exists, so the size must be
 /// derived from the monitor DPI rather than read back from Slint.
@@ -277,7 +297,7 @@ mod tests {
             scale_to_physical(toolbar_logical_size(&Config::default().tools), 144),
             (1074, 78)
         );
-        assert_eq!(scale_to_physical(OPTIONS_LOGICAL_SIZE, 144), (510, 78));
+        assert_eq!(scale_to_physical(OPTIONS_LOGICAL_SIZE, 144), (600, 78));
         assert_eq!(
             scale_to_physical(toolbar_logical_size(&Config::default().tools), 192),
             (1432, 104)
