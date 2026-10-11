@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/llight24/Snaplight"><img src="https://img.shields.io/github/stars/llight24/Snaplight?style=flat&amp;label=%E2%98%85&amp;color=08C" alt="GitHub stars" /></a>
-  <img src="https://img.shields.io/badge/license-MIT-08C?style=flat" alt="License: MIT" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-08C?style=flat" alt="License: MIT" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-4493F8?style=flat-square" alt="Platform: Windows 10 / 11" />
   <img src="https://img.shields.io/badge/Rust-2021-000000?style=flat-square&amp;logo=rust&amp;logoColor=white" alt="Rust 2021" />
   <img src="https://img.shields.io/badge/UI-Slint-4A86CF?style=flat-square" alt="UI: Slint" />
@@ -274,4 +274,4 @@ snaplight-core.exe            常驻托盘：阻塞 Win32 消息循环、托盘�
 
 ## 许可
 
-Snaplight 以 **MIT** 许可发布（见 `Cargo.toml` 中的 `license = "MIT"`）。仓库目前还没有放入 `LICENSE` 文件。
+Snaplight 以 **MIT** 许可发布，完整条款见 [LICENSE](LICENSE)；`Cargo.toml` 的 `workspace.package` 与各 crate 也声明了 `license = "MIT"`。

@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/llight24/Snaplight"><img src="https://img.shields.io/github/stars/llight24/Snaplight?style=flat&amp;label=%E2%98%85&amp;color=08C" alt="GitHub stars" /></a>
-  <img src="https://img.shields.io/badge/license-MIT-08C?style=flat" alt="License: MIT" />
+  <a href="../../LICENSE"><img src="https://img.shields.io/badge/license-MIT-08C?style=flat" alt="License: MIT" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-4493F8?style=flat-square" alt="Platform: Windows 10 / 11" />
   <img src="https://img.shields.io/badge/Rust-2021-000000?style=flat-square&amp;logo=rust&amp;logoColor=white" alt="Rust 2021" />
   <img src="https://img.shields.io/badge/UI-Slint-4A86CF?style=flat-square" alt="UI: Slint" />
@@ -274,4 +274,4 @@ Module boundaries:
 
 ## License
 
-Snaplight is released under the **MIT** license (see `license = "MIT"` in `Cargo.toml`). The repository does not contain a `LICENSE` file yet.
+Snaplight is released under the **MIT** license; the full text is in [LICENSE](../../LICENSE), and `Cargo.toml` declares `license = "MIT"` for the workspace and its crates.
