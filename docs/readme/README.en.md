@@ -74,7 +74,7 @@
 - **One process manages them all**: `snaplight-pins.exe` owns every pin window and exits once the last pin is closed, leaving no resident window process behind.
 - **Position and size are preserved**: a new pin opens exactly where its region was captured (the editor sends the screen-physical origin of the region with the command), and only a region wider than the primary display is scaled down.
 - **Interaction**: drag to move; mouse wheel scales (1.1× per notch); `Ctrl+wheel` changes opacity (5% per notch, clamped to 10%–100%); double-click restores 100%.
-- **Context menu**: click-through (`Ctrl+Shift+P` to restore) / original size / half size / close. Click-through mode always keeps a global way back to an interactive pin.
+- **Context menu**: a white rounded card drawn by the same component as the tray menu: click-through (with the restore shortcut as a grey hint on the right, `Ctrl+Shift+P` by default) / original size / half size / divider / destroy (red, closes this one pin). Click-through mode always keeps a global way back to an interactive pin.
 - **No focus stealing**: pin windows answer mouse activation with `MA_NOACTIVATE`, so clicking a pin does not take focus away from the current application.
 - **Two backends**: static pins use layered windows by default (low private memory); enabling "GPU 贴图" in settings switches them to persistent DirectComposition surfaces. GPU pins reset scale to 100% when they enter click-through mode.
 - Textures are released when a pin is hidden, but not yet reclaimed on compositor occlusion (see [Known limitations](#known-limitations-and-roadmap)).
@@ -250,7 +250,7 @@ Module boundaries:
 - **Unimplemented features never pretend to work**: the OCR plugin, long-capture plugin and recording engine have no real engine behind them, and the matching settings pages are explicit placeholders; today there are only capability bits, interfaces and architectural boundaries.
 - **No product path produces GPU shared textures yet**: the cross-process transport is implemented and verified, but the editor does not invoke plugins, and the example plugin reads the texture back only to compute a checksum.
 - **Window detection only implements the UI Automation mode**; a pixel-based mode is not implemented (the configuration enum already reserves room). Detection depends on the target application exposing a UI Automation element, so the desktop, the taskbar and some custom-drawn surfaces report nothing, and the inline query blocks the overlay until UI Automation times out when a provider stops responding.
-- **The tray menu exposes no UI Automation information**: to draw the reference white rounded card, the tray context menu is painted directly by a native layered window, so a screen reader cannot enumerate its entries (the previous system menu could). Mouse and keyboard operation (Esc, ↑/↓, Enter) is unaffected. The pin context menu is still a system menu and has not moved to the same component.
+- **The tray and pin menus expose no UI Automation information**: to draw the reference white rounded card, both context menus are painted directly by a native layered window, so a screen reader cannot enumerate their entries (the previous system menus could). Mouse and keyboard operation (Esc, ↑/↓, Enter) is unaffected.
 
 ---
 

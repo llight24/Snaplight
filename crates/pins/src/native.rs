@@ -1,5 +1,6 @@
 use snaplight_domain::*;
-use snaplight_platform::{read_pixels, Capabilities, WindowService};
+use snaplight_platform::popup_menu::{Entry, Item};
+use snaplight_platform::{popup_menu, read_pixels, Capabilities, WindowService};
 use snaplight_render_win::{Gpu, StaticSurface};
 use std::{
     io::{BufRead, BufReader},
@@ -18,6 +19,26 @@ use windows::{
 
 const INCOMING: u32 = WM_APP + 51;
 const CLOSED: u32 = WM_APP + 52;
+/// Entry indices of the pin context menu, in display order.
+mod pin_item {
+    pub const THROUGH: usize = 0;
+    pub const ACTUAL_SIZE: usize = 1;
+    pub const HALF_SIZE: usize = 2;
+    pub const DESTROY: usize = 4;
+}
+/// Pin context menu content, drawn by the same owner-drawn card as the tray
+/// menu. `restore_hotkey` is the shortcut that brings interaction back after the
+/// pin goes click-through, so it is shown on the right of that entry. Destroying
+/// the pin discards the image the user pinned, so it is drawn in red.
+fn menu_entries(restore_hotkey: &str) -> Vec<Entry> {
+    vec![
+        Entry::Item(Item::new("鼠标穿透").with_shortcut(restore_hotkey)),
+        Entry::Item(Item::new("原始大小")),
+        Entry::Item(Item::new("缩小一半")),
+        Entry::Separator,
+        Entry::Item(Item::new("销毁").danger()),
+    ]
+}
 struct Pin {
     hwnd: HWND,
     control: HWND,
@@ -29,6 +50,8 @@ struct Pin {
     through: bool,
     scale: f32,
     opacity: f32,
+    /// Shortcut hint shown in the context menu, resolved at startup.
+    restore_hotkey: String,
 }
 impl Pin {
     unsafe fn restore(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -203,6 +226,28 @@ impl WindowService for NativeWindows {
         }
     }
 }
+/// Shows the pin context menu at the pointer and applies the chosen command.
+///
+/// The menu runs its own modal message loop, so the pin can also be closed from
+/// another path while it is open (a `CloseAll` command, or the destroy entry of
+/// a second menu); the window is re-checked before it is touched.
+unsafe fn show_pin_menu(pin: &mut Pin) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let entries = menu_entries(&pin.restore_hotkey);
+    let choice = popup_menu::show(&entries, None);
+    if pin.closed || !IsWindow(pin.hwnd).as_bool() {
+        return Ok(());
+    }
+    match choice {
+        Some(pin_item::THROUGH) => pin.toggle()?,
+        Some(pin_item::ACTUAL_SIZE) => pin.zoom(1.0)?,
+        Some(pin_item::HALF_SIZE) => pin.zoom(0.5)?,
+        Some(pin_item::DESTROY) => {
+            PostMessageW(pin.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0))?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
 unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Pin;
     if !ptr.is_null() {
@@ -234,34 +279,14 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                     }
                     return Ok(Some(LRESULT(0)));
                 }
-                WM_CONTEXTMENU => {
-                    let menu = CreatePopupMenu()?;
-                    AppendMenuW(menu, MF_STRING, 1, w!("鼠标穿透（Ctrl+Shift+P 恢复）"))?;
-                    AppendMenuW(menu, MF_STRING, 2, w!("原始大小"))?;
-                    AppendMenuW(menu, MF_STRING, 3, w!("缩小一半"))?;
-                    AppendMenuW(menu, MF_STRING, 4, w!("关闭"))?;
-                    let mut p = POINT::default();
-                    GetCursorPos(&mut p)?;
-                    let choice = TrackPopupMenu(
-                        menu,
-                        TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                        p.x,
-                        p.y,
-                        0,
-                        hwnd,
-                        None,
-                    )
-                    .0;
-                    DestroyMenu(menu)?;
-                    match choice {
-                        1 => pin.toggle()?,
-                        2 => pin.zoom(1.0)?,
-                        3 => pin.zoom(0.5)?,
-                        4 => {
-                            PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0))?;
-                        }
-                        _ => {}
-                    }
+                // Every pixel of the pin hit-tests as the caption so the window
+                // stays draggable, which means a right click arrives as a
+                // non-client message. `DefWindowProc` answers that with the
+                // window's system menu — a popup window has none — and never
+                // sends `WM_CONTEXTMENU`, so the menu has to be opened here.
+                WM_NCRBUTTONDOWN => return Ok(Some(LRESULT(0))),
+                WM_NCRBUTTONUP | WM_CONTEXTMENU => {
+                    show_pin_menu(pin)?;
                     return Ok(Some(LRESULT(0)));
                 }
                 WM_SHOWWINDOW => {
@@ -307,6 +332,8 @@ struct Host {
     #[allow(clippy::vec_box)]
     pins: Vec<Box<Pin>>,
     queue: Arc<Mutex<Vec<PinCommand>>>,
+    /// Shortcut hint shown by every pin's context menu.
+    restore_hotkey: String,
 }
 impl Host {
     unsafe fn open(
@@ -372,6 +399,7 @@ impl Host {
             through: false,
             scale,
             opacity: 1.0,
+            restore_hotkey: self.restore_hotkey.clone(),
         });
         if pin.gpu.is_none() {
             pin.update_layered()?;
@@ -419,8 +447,12 @@ unsafe extern "system" fn control_proc(hwnd: HWND, msg: u32, _w: WPARAM, l: LPAR
                 return LRESULT(0);
             }
             CLOSED => {
-                host.pins.retain(|p| !p.closed);
-                if host.pins.is_empty() {
+                // Closed pins stay allocated. A pin's window procedure can be on
+                // the stack while it closes — the context menu runs a nested
+                // modal loop, and `CloseAll` can arrive during it — so dropping
+                // its state here would leave that frame with a dangling pointer.
+                // The process exits once every pin is closed.
+                if host.pins.iter().all(|pin| pin.closed) {
                     PostQuitMessage(0);
                 }
                 return LRESULT(0);
@@ -439,11 +471,13 @@ unsafe extern "system" fn control_proc(hwnd: HWND, msg: u32, _w: WPARAM, l: LPAR
     DefWindowProcW(hwnd, msg, _w, l)
 }
 /// Registers the configured pin-restore shortcut, falling back to the default
-/// when another application already owns the configured combination.
+/// when another application already owns the configured combination. Returns the
+/// canonical form of the shortcut that was actually registered, which is what the
+/// context menu shows.
 unsafe fn register_restore_hotkey(
     hwnd: HWND,
     config: &Config,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<String, Box<dyn std::error::Error>> {
     let hotkey = parse_hotkey(&config.restore_hotkey)?;
     let (modifiers, key) = snaplight_platform::native::hotkey_registration(&hotkey);
     if let Err(error) = RegisterHotKey(hwnd, 2, modifiers, key) {
@@ -454,15 +488,17 @@ unsafe fn register_restore_hotkey(
             config.restore_hotkey
         );
         RegisterHotKey(hwnd, 2, modifiers, key)?;
+        return Ok(fallback.canonical());
     }
-    Ok(())
+    Ok(hotkey.canonical())
 }
 pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     snaplight_platform::native::dpi_aware();
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
-        let use_gpu = snaplight_platform::load_config()?.gpu_pins
-            || std::env::args().any(|a| a == "--composition" || a == "--smoke");
+        let config = snaplight_platform::load_config()?;
+        let use_gpu =
+            config.gpu_pins || std::env::args().any(|a| a == "--composition" || a == "--smoke");
         let gpu = if use_gpu { Some(Gpu::new(None)?) } else { None };
         let instance = GetModuleHandleW(None)?;
         // Pin windows are frameless, but the class icon still shows up in
@@ -504,13 +540,14 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             None,
         )?;
         let queue = Arc::new(Mutex::new(vec![]));
+        let restore_hotkey = register_restore_hotkey(control, &config)?;
         let mut host = Box::new(Host {
             gpu,
             pins: vec![],
             queue: queue.clone(),
+            restore_hotkey,
         });
         SetWindowLongPtrW(control, GWLP_USERDATA, (&mut *host as *mut Host) as isize);
-        register_restore_hotkey(control, &snaplight_platform::load_config()?)?;
         let address = control.0 as usize;
         if std::env::args().any(|a| a == "--smoke" || a == "--smoke-low-memory") {
             let dir = snaplight_platform::data_dir();
@@ -563,6 +600,26 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             host.pins[0].toggle()?;
             host.pins[0].opacity = 0.8;
             host.pins[0].restore()?;
+            // The pin menu is drawn by the same component as the tray menu, so the
+            // smoke only has to prove that the entries are wired to the commands
+            // the handler maps and that 销毁 renders as the destructive row.
+            let entries = menu_entries(DEFAULT_RESTORE_HOTKEY);
+            let menu = popup_menu::render(&entries, 1.0, None)?;
+            let destroy = menu
+                .layout
+                .rows
+                .iter()
+                .find(|row| row.entry == pin_item::DESTROY)
+                .ok_or("pin menu is missing the destroy row")?;
+            let destructive = (destroy.band.y..destroy.band.bottom()).any(|y| {
+                (destroy.text_left..destroy.text_right).any(|x| {
+                    menu.pixel(x, y)
+                        .is_some_and(|p| p[2] as i32 > 150 && p[2] as i32 > p[0] as i32 + 60)
+                })
+            });
+            if !destructive {
+                return Err("the destroy entry is not drawn as destructive".into());
+            }
             host.close_all();
             snaplight_platform::atomic_write(
                 &dir.join(if use_gpu {
@@ -571,7 +628,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     "pin-smoke-low-memory-result.json"
                 }),
                 &serde_json::to_vec(
-                    &serde_json::json!({"composition":use_gpu,"layered_transition":true,"scale":true,"opacity":true,"position":[placed.left,placed.top],"size":[placed.right-placed.left,placed.bottom-placed.top]}),
+                    &serde_json::json!({"composition":use_gpu,"layered_transition":true,"scale":true,"opacity":true,"menu_destroy":true,"position":[placed.left,placed.top],"size":[placed.right-placed.left,placed.bottom-placed.top]}),
                 )?,
             )?;
         } else {
@@ -601,4 +658,53 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         CoUninitialize();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// The menu indices are what the window procedure matches on, so they must
+    /// keep pointing at the entry that performs that command.
+    #[test]
+    fn pin_menu_entries_match_the_commands_the_handler_maps() {
+        let entries = menu_entries(DEFAULT_RESTORE_HOTKEY);
+        assert_eq!(entries.len(), 5);
+        let divider = entries
+            .iter()
+            .position(|entry| matches!(entry, Entry::Separator))
+            .expect("the pin menu needs a divider");
+        assert_eq!(
+            divider, 3,
+            "the divider separates 销毁 from the view commands"
+        );
+        for index in [
+            pin_item::THROUGH,
+            pin_item::ACTUAL_SIZE,
+            pin_item::HALF_SIZE,
+            pin_item::DESTROY,
+        ] {
+            assert_ne!(index, divider, "commands never point at the divider");
+            assert!(matches!(entries[index], Entry::Item(_)));
+        }
+        assert_eq!(pin_item::DESTROY, entries.len() - 1);
+        let Entry::Item(through) = &entries[pin_item::THROUGH] else {
+            panic!("through entry must be an item");
+        };
+        assert_eq!(through.label, "鼠标穿透");
+        assert_eq!(through.shortcut.as_deref(), Some(DEFAULT_RESTORE_HOTKEY));
+        assert!(!through.danger);
+        let Entry::Item(actual) = &entries[pin_item::ACTUAL_SIZE] else {
+            panic!("actual-size entry must be an item");
+        };
+        assert_eq!(actual.label, "原始大小");
+        let Entry::Item(half) = &entries[pin_item::HALF_SIZE] else {
+            panic!("half-size entry must be an item");
+        };
+        assert_eq!(half.label, "缩小一半");
+        let Entry::Item(destroy) = &entries[pin_item::DESTROY] else {
+            panic!("destroy entry must be an item");
+        };
+        assert_eq!(destroy.label, "销毁");
+        assert!(destroy.danger, "destroy closes the pin and must read red");
+    }
 }
