@@ -3,7 +3,6 @@
 </h1>
 
 <p align="center">
-  <a href="https://github.com/llight24/Snaplight"><img src="https://img.shields.io/github/stars/llight24/Snaplight?style=flat&amp;label=%E2%98%85&amp;color=08C" alt="GitHub stars" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-08C?style=flat" alt="License: MIT" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-4493F8?style=flat-square" alt="Platform: Windows 10 / 11" />
   <img src="https://img.shields.io/badge/Rust-2021-000000?style=flat-square&amp;logo=rust&amp;logoColor=white" alt="Rust 2021" />
