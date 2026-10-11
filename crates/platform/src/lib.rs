@@ -5,6 +5,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Owner-drawn popup menu used by the tray context menu.
+#[cfg(windows)]
+pub mod popup_menu;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Capabilities {
     pub capture: bool,

@@ -8,5 +8,7 @@ snaplight-domain.workspace = true
 snaplight-platform.workspace = true
 snaplight-plugin-api.workspace = true
 serde_json.workspace = true
+# Only the `--smoke` menu artifacts need an encoder.
+png = "0.17"
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

@@ -1,7 +1,8 @@
 use snaplight_domain::{
     parse_hotkey, Config, Envelope, PinCommand, DEFAULT_CAPTURE_HOTKEY, PROTOCOL_VERSION,
 };
-use snaplight_platform::{data_dir, load_config, sibling};
+use snaplight_platform::popup_menu::{Entry, Item};
+use snaplight_platform::{data_dir, load_config, popup_menu, sibling};
 use std::{
     io::{BufRead, BufReader, Write},
     os::windows::io::{AsHandle, AsRawHandle, OwnedHandle},
@@ -22,11 +23,32 @@ use windows::{
 
 const TRAY: u32 = WM_APP + 1;
 const PIN: u32 = WM_APP + 2;
+/// Entry indices of the tray menu, in display order.
+mod tray_item {
+    pub const CAPTURE: usize = 0;
+    pub const SETTINGS: usize = 1;
+    pub const CLOSE_PINS: usize = 2;
+    pub const QUIT: usize = 4;
+}
+/// Tray menu content. The layout follows the reference design: a primary action
+/// with its shortcut on the right, secondary actions, a separator, then the
+/// command that ends the session. Closing every pin destroys content, so it is
+/// drawn in red.
+fn tray_menu_entries(capture_hotkey: &str) -> Vec<Entry> {
+    vec![
+        Entry::Item(Item::new("截图").with_shortcut(capture_hotkey)),
+        Entry::Item(Item::new("设置")),
+        Entry::Item(Item::new("关闭所有贴图").danger()),
+        Entry::Separator,
+        Entry::Item(Item::new("退出")),
+    ]
+}
 struct State {
     pins: Option<Child>,
     queue: Arc<Mutex<Vec<PinCommand>>>,
     editing: Arc<AtomicBool>,
     editor_handle: Arc<Mutex<Option<OwnedHandle>>>,
+    capture_hotkey: String,
 }
 unsafe fn launch_editor(hwnd: HWND, state: &State, settings: bool) {
     if state.editing.swap(true, Ordering::AcqRel) {
@@ -168,38 +190,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 match l.0 as u32 {
                     WM_LBUTTONUP => launch_editor(hwnd, state, false),
                     WM_RBUTTONUP => {
-                        if let Ok(menu) = CreatePopupMenu() {
-                            let _ = AppendMenuW(menu, MF_STRING, 1, w!("截图"));
-                            let _ = AppendMenuW(menu, MF_STRING, 2, w!("设置"));
-                            let _ = AppendMenuW(menu, MF_STRING, 3, w!("关闭所有贴图"));
-                            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-                            let _ = AppendMenuW(menu, MF_STRING, 4, w!("退出"));
-                            let mut p = POINT::default();
-                            let _ = GetCursorPos(&mut p);
-                            let _ = SetForegroundWindow(hwnd);
-                            let choice = TrackPopupMenu(
-                                menu,
-                                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                                p.x,
-                                p.y,
-                                0,
-                                hwnd,
-                                None,
-                            )
-                            .0;
-                            let _ = DestroyMenu(menu);
+                        // The popup owns its drawing, so the tray menu no longer
+                        // depends on the system theme. Claiming the foreground
+                        // window first is what makes clicking elsewhere close it.
+                        let _ = SetForegroundWindow(hwnd);
+                        let entries = tray_menu_entries(&state.capture_hotkey);
+                        if let Some(choice) = popup_menu::show(&entries, None) {
                             match choice {
-                                1 => launch_editor(hwnd, state, false),
-                                2 => launch_editor(hwnd, state, true),
-                                3 => {
+                                tray_item::CAPTURE => launch_editor(hwnd, state, false),
+                                tray_item::SETTINGS => launch_editor(hwnd, state, true),
+                                tray_item::CLOSE_PINS => {
                                     let _ = send_pin(state, PinCommand::CloseAll);
                                 }
-                                4 => {
+                                tray_item::QUIT => {
                                     let _ = DestroyWindow(hwnd);
                                 }
                                 _ => {}
                             }
                         }
+                        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
                     }
                     _ => {}
                 }
@@ -236,6 +245,25 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let config = load_config()?;
     std::fs::create_dir_all(data_dir())?;
     snaplight_platform::native::dpi_aware();
+    let capture_hotkey = parse_hotkey(&config.capture_hotkey)
+        .map(|hotkey| hotkey.canonical())
+        .unwrap_or_else(|_| DEFAULT_CAPTURE_HOTKEY.to_string());
+    // Manual check for the tray menu: it shows the real popup, reports the choice
+    // and never performs the action. `--menu-demo <x> <y>` pins the anchor so the
+    // placement can be checked without racing the pointer.
+    if let Some(index) = std::env::args().position(|a| a == "--menu-demo") {
+        let mut rest = std::env::args().skip(index + 1);
+        let anchor = match (rest.next(), rest.next()) {
+            (Some(x), Some(y)) => x.parse::<i32>().ok().zip(y.parse::<i32>().ok()),
+            _ => None,
+        };
+        let entries = tray_menu_entries(&capture_hotkey);
+        match popup_menu::show(&entries, anchor) {
+            Some(choice) => println!("menu choice: {choice}"),
+            None => println!("menu dismissed"),
+        }
+        return Ok(());
+    }
     let Some(mutex) = snaplight_platform::native::singleton("Local\\Snaplight.Core.v1")? else {
         return Ok(());
     };
@@ -256,6 +284,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             queue: Arc::new(Mutex::new(vec![])),
             editing: Arc::new(AtomicBool::new(false)),
             editor_handle: Arc::new(Mutex::new(None)),
+            capture_hotkey,
         });
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -292,6 +321,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             return Err(Error::from_win32().into());
         }
         if std::env::args().any(|a| a == "--smoke") {
+            tray_menu_smoke()?;
             DestroyWindow(hwnd)?;
         } else {
             snaplight_platform::native::message_loop()?;
@@ -317,6 +347,97 @@ unsafe fn register_capture_hotkey(
         );
         RegisterHotKey(hwnd, 1, modifiers, key)?;
     }
+    Ok(())
+}
+/// Renders the tray menu at the DPI scales this machine is likely to use and
+/// checks the reference styling, so a regression is caught by `--smoke` instead
+/// of by eye. The PNGs stay in the data directory as reviewable artifacts.
+fn tray_menu_smoke() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // The close-all entry is hovered so the highlight rendering is covered too.
+    let entries = tray_menu_entries(DEFAULT_CAPTURE_HOTKEY);
+    for percent in [100u32, 125, 150, 200] {
+        let scale = percent as f32 / 100.0;
+        let menu = popup_menu::render(&entries, scale, Some(tray_item::CLOSE_PINS))?;
+        write_menu_png(&data_dir().join(format!("menu-smoke-{percent}.png")), &menu)?;
+        let layout = menu.layout.clone();
+        let card = layout.card;
+        let corner = menu
+            .pixel(card.x, card.y)
+            .ok_or("menu corner outside bitmap")?;
+        if corner[3] >= 128 {
+            return Err(format!("menu corner is opaque at {percent}%: {corner:?}").into());
+        }
+        let padding_y = ((card.bottom() - layout.rows[3].band.bottom()) / 2).max(1);
+        let inside = menu
+            .pixel(card.x + card.width / 2, card.bottom() - padding_y)
+            .ok_or("menu padding outside bitmap")?;
+        if inside != [255, 255, 255, 255] {
+            return Err(format!("menu card is not white at {percent}%: {inside:?}").into());
+        }
+        let row_named = |index: usize| {
+            layout
+                .rows
+                .iter()
+                .find(|row| row.entry == index)
+                .copied()
+                .ok_or_else(|| format!("menu row {index} missing at {percent}%"))
+        };
+        let close = row_named(tray_item::CLOSE_PINS)?;
+        if !row_has(&menu, &close, |pixel| {
+            pixel[2] as i32 > 150 && pixel[2] as i32 > pixel[0] as i32 + 60
+        }) {
+            return Err(format!("close-all entry is not red at {percent}%").into());
+        }
+        if !row_has(&menu, &close, |pixel| pixel == [0xF2, 0xF2, 0xF2, 255]) {
+            return Err(format!("hovered row is not highlighted at {percent}%").into());
+        }
+        let capture = row_named(tray_item::CAPTURE)?;
+        if !row_has(&menu, &capture, |pixel| {
+            pixel[3] == 255
+                && (60..130).contains(&pixel[0])
+                && pixel[0].abs_diff(pixel[1]) < 12
+                && pixel[1].abs_diff(pixel[2]) < 12
+        }) {
+            return Err(format!("shortcut hint is missing at {percent}%").into());
+        }
+        if !row_has(&menu, &capture, |pixel| {
+            pixel[3] == 255 && pixel[0] < 60 && pixel[1] < 60 && pixel[2] < 60
+        }) {
+            return Err(format!("menu label is missing at {percent}%").into());
+        }
+        let (_, line) = layout.separators[0];
+        let separator = menu
+            .pixel(line.x + line.width / 2, line.y)
+            .ok_or("separator outside bitmap")?;
+        if separator != [0xFD, 0xE3, 0xD3, 255] {
+            return Err(format!("separator colour changed at {percent}%: {separator:?}").into());
+        }
+    }
+    Ok(())
+}
+/// Whether any pixel of a menu row satisfies `predicate`.
+fn row_has(
+    menu: &popup_menu::MenuBitmap,
+    row: &popup_menu::RowLayout,
+    predicate: impl Fn([u8; 4]) -> bool,
+) -> bool {
+    (row.band.y..row.band.bottom())
+        .any(|y| (row.text_left..row.text_right).any(|x| menu.pixel(x, y).is_some_and(&predicate)))
+}
+fn write_menu_png(
+    path: &std::path::Path,
+    menu: &popup_menu::MenuBitmap,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut encoder = png::Encoder::new(
+        std::fs::File::create(path)?,
+        menu.width as u32,
+        menu.height as u32,
+    );
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()?
+        .write_image_data(&menu.straight_rgba())?;
     Ok(())
 }
 fn plugin_check() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -375,4 +496,46 @@ fn plugin_check() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
     snaplight_platform::atomic_write(&data_dir().join("plugin-check.json"), &output.stdout)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn tray_menu_follows_the_reference_layout() {
+        let entries = tray_menu_entries(DEFAULT_CAPTURE_HOTKEY);
+        assert_eq!(entries.len(), 5);
+        let divider = entries
+            .iter()
+            .position(|entry| matches!(entry, Entry::Separator))
+            .expect("the menu needs a divider");
+        assert_eq!(divider, 3, "divider sits between the pin command and quit");
+        for index in [
+            tray_item::CAPTURE,
+            tray_item::SETTINGS,
+            tray_item::CLOSE_PINS,
+            tray_item::QUIT,
+        ] {
+            assert_ne!(index, divider, "actions never point at the divider");
+            assert!(matches!(entries[index], Entry::Item(_)));
+        }
+        let Entry::Item(capture) = &entries[tray_item::CAPTURE] else {
+            panic!("capture entry must be an item");
+        };
+        assert_eq!(capture.label, "截图");
+        assert_eq!(capture.shortcut.as_deref(), Some(DEFAULT_CAPTURE_HOTKEY));
+        assert!(!capture.danger);
+        let Entry::Item(close) = &entries[tray_item::CLOSE_PINS] else {
+            panic!("close-all entry must be an item");
+        };
+        assert_eq!(close.label, "关闭所有贴图");
+        assert!(
+            close.danger,
+            "close-all must be drawn as a destructive entry"
+        );
+        let Entry::Item(quit) = &entries[tray_item::QUIT] else {
+            panic!("quit entry must be an item");
+        };
+        assert_eq!(quit.label, "退出");
+    }
 }
