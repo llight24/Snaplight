@@ -35,6 +35,7 @@
 - Drag to draw a selection; everything outside it is dimmed to 55% so the region is easy to confirm.
 - Selection chrome: blue outline (`#3388ff`, 2.2 logical pixels), eight round handles (white ring, blue core, 13 logical pixels outer / 9.2 inner), and a dark rounded chip showing the origin and size in screen pixels (`x,y  W × H px`). Every size scales with the monitor DPI.
 - **Resize the crop with eight anchors**: corners change both axes, edge midpoints change one axis, the opposite edges stay fixed. The region is clamped to the image, never smaller than 1×1 pixel, and stops at the minimum instead of flipping when dragged past the opposite edge. One completed drag produces exactly one undoable history entry, and hovering shows the matching resize cursor.
+- **Move the selection by dragging inside it**: a drag that starts inside the region moves the whole selection without changing its size, stopping at the image edges instead of being clipped or redrawn in reverse. Dragging outside the region is still what draws a new one, and the cursor inside shows a four-way move arrow.
 - **Magnifier**: a 20×20 source area near the cursor shown at 6× with a white border and crosshair, clamped near the image edges.
 - While a new selection is being drawn, the toolbar and quick options hide themselves; afterwards they are repositioned below the selection, or above it when there is no room, always clamped to the captured area. Undoing the last selection hides the toolbar, and redoing brings it back.
 - Selections are currently limited to a single monitor.
@@ -43,7 +44,7 @@
 
 | Tool | Description |
 | --- | --- |
-| Select | Draw a selection and resize it with the eight anchors |
+| Select | Draw a selection, move it by dragging inside it, and resize it with the eight anchors |
 | Rectangle | Drag to draw a rectangle with adjustable stroke width and colour |
 | Ellipse | Drag to draw an ellipse with adjustable stroke width and colour |
 | Arrow | Draw an arrow from start to end point |
@@ -162,7 +163,7 @@ Measurement environment: Windows, Intel Core i9-14900KF (32 logical CPUs), NVIDI
 Basic flow:
 
 1. Click the tray icon, or press `Ctrl+Shift+A`.
-2. Drag a region — or click a UI element highlighted by detection. Drag the handles to resize the crop.
+2. Drag a region — or click a UI element highlighted by detection. Drag inside the region to move it, or drag the handles to resize the crop.
 3. Pick a tool and draw. Use the drop-down arrow for stroke width, colour, mosaic block or text; type text first, then click the canvas to place it.
 4. `Ctrl+Z` / `Ctrl+Y` undo and redo, `Ctrl+C` copies a DIB, `Ctrl+S` saves a PNG, `Enter` pins the selection, `Esc` cancels.
 5. Drag a pin to move it, wheel to scale, `Ctrl+wheel` for opacity, right-click for its menu, and `Ctrl+Shift+P` to restore interaction for every click-through pin at once. While a pin is click-through, hold `Ctrl` (configurable in settings) to operate it and release to return to click-through.

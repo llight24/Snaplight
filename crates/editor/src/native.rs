@@ -175,6 +175,25 @@ fn resize_selection(
         height: bottom - top,
     }
 }
+/// Translates a selection by a pointer delta, keeping its size: the rectangle
+/// stops at the image edges instead of being clipped, so a drag inside the
+/// selection moves it rather than drawing a new one.
+fn move_selection(rect: ImageRect, dx: f32, dy: f32, width: u32, height: u32) -> ImageRect {
+    ImageRect {
+        x: (rect.x + dx).clamp(0.0, (width as f32 - rect.width).max(0.0)),
+        y: (rect.y + dy).clamp(0.0, (height as f32 - rect.height).max(0.0)),
+        ..rect
+    }
+}
+/// The region a press drags: inside the committed selection of the select tool
+/// the move wins over drawing, so the capture range can be shifted instead of
+/// being drawn again from scratch. Anywhere else the press starts a new region.
+fn move_target(tool: Tool, selection: Option<ImageRect>, point: ImagePoint) -> Option<ImageRect> {
+    if tool != Tool::Select {
+        return None;
+    }
+    selection.filter(|rect| rect.contains(point))
+}
 /// How the document is shown inside the overlay window: zoom plus pan, in view
 /// pixels. A normal capture opens 1:1; a long capture opens shrunk to fit.
 #[derive(Clone, Copy)]
@@ -238,6 +257,9 @@ struct Canvas {
     text: String,
     start: Option<ImagePoint>,
     resize: Option<(ImageRect, SelectionHandle)>,
+    /// The committed selection a press is moving, captured when the gesture
+    /// started so the drag stays a translation from there.
+    moving: Option<ImageRect>,
     active: Arc<Mutex<usize>>,
     error: Option<String>,
     // Immutable base image pixels (BGRA8, `doc.image.stride`) so GPU resources can
@@ -442,6 +464,16 @@ impl Canvas {
             ));
             return;
         }
+        if let Some(rect) = self.moving {
+            self.interaction.selection_draft = Some(move_selection(
+                rect,
+                p.x - start.x,
+                p.y - start.y,
+                self.doc.image.width,
+                self.doc.image.height,
+            ));
+            return;
+        }
         let r = ImageRect::between(start, p).clamp(self.doc.image.width, self.doc.image.height);
         if self.tool == Tool::Select {
             self.interaction.selection_draft = Some(r);
@@ -605,6 +637,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     state.invalidate();
                     return LRESULT(0);
                 }
+                // A press inside the committed region moves it: the select tool
+                // has nothing to draw there, and re-selecting the same area from
+                // the inside is never what the gesture means. A press anywhere
+                // else still draws a new region.
+                if let Some(rect) = move_target(state.tool, state.doc.selection, p) {
+                    park_toolbar(state);
+                    state.moving = Some(rect);
+                    state.start = Some(p);
+                    state.interaction.dragging = true;
+                    SetCapture(hwnd);
+                    state.update_drag(p);
+                    state.invalidate();
+                    return LRESULT(0);
+                }
                 if state.tool == Tool::Text {
                     if !state.text.is_empty() {
                         state.history.execute(
@@ -652,6 +698,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                             Some(SelectionHandle { row: 1, .. }) => IDC_SIZEWE,
                             Some(SelectionHandle { col, row }) if col == row => IDC_SIZENWSE,
                             Some(_) => IDC_SIZENESW,
+                            // Inside the committed region the select tool moves
+                            // it, so the cursor offers that instead of a cross.
+                            None if move_target(state.tool, state.doc.selection, p).is_some() => {
+                                IDC_SIZEALL
+                            }
                             None => IDC_CROSS,
                         };
                         if let Ok(cursor) = LoadCursorW(None, cursor) {
@@ -736,6 +787,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 }
                 state.start = None;
                 state.resize = None;
+                state.moving = None;
                 state.interaction.dragging = false;
                 // The preview belongs to the pointer, not to a finished gesture.
                 state.hover_probe.pending = None;
@@ -749,6 +801,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 let interrupted = state.start.is_some();
                 state.start = None;
                 state.resize = None;
+                state.moving = None;
                 state.interaction.draft = None;
                 state.interaction.selection_draft = None;
                 state.interaction.dragging = false;
@@ -1028,6 +1081,7 @@ fn canvas_thread(
                     text: String::new(),
                     start: None,
                     resize: None,
+                    moving: None,
                     active: active.clone(),
                     error: None,
                     base,
@@ -2716,6 +2770,103 @@ mod tests {
             selection_handle(r, ImagePoint { x: 50.0, y: 100.0 }, 144, 1.0),
             None
         );
+    }
+    #[test]
+    fn a_press_inside_the_committed_region_moves_it() {
+        let r = ImageRect {
+            x: 100.0,
+            y: 100.0,
+            width: 200.0,
+            height: 100.0,
+        };
+        let selection = Some(r);
+        // Inside the region - edges included - the select tool drags the region.
+        for point in [
+            ImagePoint { x: 150.0, y: 150.0 },
+            ImagePoint { x: 100.0, y: 100.0 },
+            ImagePoint { x: 300.0, y: 200.0 },
+        ] {
+            assert_eq!(move_target(Tool::Select, selection, point), selection);
+        }
+        // Outside it the press starts a new region.
+        for point in [
+            ImagePoint { x: 99.0, y: 150.0 },
+            ImagePoint { x: 301.0, y: 150.0 },
+            ImagePoint { x: 150.0, y: 99.0 },
+            ImagePoint { x: 150.0, y: 201.0 },
+        ] {
+            assert_eq!(move_target(Tool::Select, selection, point), None);
+        }
+        // Without a committed region there is nothing to move, and a drawing
+        // tool uses the press to draw.
+        assert_eq!(
+            move_target(Tool::Select, None, ImagePoint { x: 150.0, y: 150.0 }),
+            None
+        );
+        assert_eq!(
+            move_target(
+                Tool::Rectangle,
+                selection,
+                ImagePoint { x: 150.0, y: 150.0 }
+            ),
+            None
+        );
+    }
+    #[test]
+    fn moving_translates_the_selection_and_stops_at_the_image_edges() {
+        let r = ImageRect {
+            x: 100.0,
+            y: 100.0,
+            width: 200.0,
+            height: 100.0,
+        };
+        // A plain drag moves the region without changing its size.
+        assert_eq!(
+            move_selection(r, 60.0, 40.0, 500, 400),
+            ImageRect {
+                x: 160.0,
+                y: 140.0,
+                width: 200.0,
+                height: 100.0
+            }
+        );
+        // At every edge the rectangle stops instead of being clipped: the far
+        // edge can always reach the image border and nothing sticks out.
+        assert_eq!(
+            move_selection(r, -500.0, -500.0, 500, 400),
+            ImageRect {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 100.0
+            }
+        );
+        assert_eq!(
+            move_selection(r, 500.0, 500.0, 500, 400),
+            ImageRect {
+                x: 300.0,
+                y: 300.0,
+                width: 200.0,
+                height: 100.0
+            }
+        );
+        assert_eq!(
+            move_selection(r, 0.0, -500.0, 500, 400),
+            ImageRect {
+                x: 100.0,
+                y: 0.0,
+                width: 200.0,
+                height: 100.0
+            }
+        );
+        // A selection as large as the image cannot move at all.
+        let full = ImageRect {
+            x: 0.0,
+            y: 0.0,
+            width: 500.0,
+            height: 400.0,
+        };
+        assert_eq!(move_selection(full, 60.0, 40.0, 500, 400), full);
     }
     #[test]
     fn resizing_preserves_opposite_edges_and_clamps_to_image() {
