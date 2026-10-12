@@ -378,6 +378,7 @@ export component Settings inherits Window {
     in-out property <string> capture-dir-value:"";
     in-out property <string> capture-hotkey-value:"Ctrl+Shift+A";
     in-out property <string> restore-hotkey-value:"Ctrl+Shift+P";
+    in-out property <string> through-hotkey-value:"Ctrl";
     in-out property <int> detect-mode:1;
     in-out property <string> status:"";
     in property <string> app-version:"";
@@ -449,6 +450,10 @@ export component Settings inherits Window {
                                 HorizontalBox {Text {text:"截图";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"截图快捷键";text<=>root.capture-hotkey-value;horizontal-stretch:1;placeholder-text:"Ctrl+Shift+A";}}
                                 HorizontalBox {Text {text:"恢复贴图";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"恢复贴图快捷键";text<=>root.restore-hotkey-value;horizontal-stretch:1;placeholder-text:"Ctrl+Shift+P";}}
                                 Hint {text:"格式为修饰键加一个按键，例如 Ctrl+Shift+A。修改后需重启常驻核心或贴图进程才生效；若快捷键已被占用，则回退到默认值。";}
+                                Rule {}
+                                SectionTitle {text:"贴图穿透";}
+                                HorizontalBox {Text {text:"临时交互按键";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"穿透临时交互按键";text<=>root.through-hotkey-value;horizontal-stretch:1;placeholder-text:"Ctrl";}}
+                                Hint {text:"按住这个按键时，穿透中的贴图临时恢复鼠标交互，松开后立即恢复穿透。可以只用一个修饰键（如 Ctrl）、修饰键组合或单个按键。它与「恢复贴图」不同：后者按一次切换，不会自动恢复穿透。修改后同样需要重启贴图进程才生效。";}
                             }
                             if root.page-index == 3: VerticalLayout {alignment:start; spacing:8px;
                                 SectionTitle {text:"绘制默认值";}

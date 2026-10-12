@@ -347,6 +347,36 @@ mod tests {
     }
     #[cfg(windows)]
     #[test]
+    fn held_shortcuts_map_to_both_modifier_variants() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        let held = |text: &str| {
+            snaplight_domain::parse_held_shortcut(text)
+                .expect("held shortcut")
+                .expect("enabled")
+        };
+        // A lone modifier is watched through its left and right variants.
+        assert_eq!(
+            native::held_shortcut_keys(&held(DEFAULT_THROUGH_HOTKEY)),
+            vec![VK_LCONTROL, VK_RCONTROL]
+        );
+        assert_eq!(
+            native::held_shortcut_keys(&held("Ctrl+Shift")),
+            vec![VK_LCONTROL, VK_RCONTROL, VK_LSHIFT, VK_RSHIFT]
+        );
+        // A lone key adds no modifier at all.
+        assert_eq!(
+            native::held_shortcut_keys(&held("a")),
+            vec![VIRTUAL_KEY('A' as u16)]
+        );
+        assert_eq!(
+            native::held_shortcut_keys(&held("Win+Alt+F5")),
+            vec![VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN, VIRTUAL_KEY(0x74)]
+        );
+        // Nothing is down in a test process, so the check reports "not held".
+        assert!(!native::held_shortcut_down(&held("Ctrl")));
+    }
+    #[cfg(windows)]
+    #[test]
     fn probe_policy_keeps_controls_inside_their_window() {
         use native::{pick_bounds, ElementBounds};
         let entry =
@@ -470,7 +500,7 @@ mod tests {
 
 #[cfg(windows)]
 pub mod native {
-    use snaplight_domain::{Hotkey, HotkeyKey, ScreenPoint, ScreenRect};
+    use snaplight_domain::{HeldShortcut, Hotkey, HotkeyKey, ScreenPoint, ScreenRect};
     use std::path::PathBuf;
     use std::ptr::NonNull;
     use windows::{
@@ -548,6 +578,66 @@ pub mod native {
             HotkeyKey::Function(n) => 0x70 + u32::from(n) - 1,
         };
         (modifiers, key)
+    }
+    /// Virtual keys to watch for a held shortcut. Modifiers are listed as their
+    /// left and right variants because `GetAsyncKeyState(VK_CONTROL)` does not
+    /// reliably report the generic key, while the individual ones do.
+    pub fn held_shortcut_keys(shortcut: &HeldShortcut) -> Vec<VIRTUAL_KEY> {
+        let mut keys = Vec::new();
+        for (enabled, left, right) in [
+            (shortcut.ctrl, VK_LCONTROL, VK_RCONTROL),
+            (shortcut.shift, VK_LSHIFT, VK_RSHIFT),
+            (shortcut.alt, VK_LMENU, VK_RMENU),
+        ] {
+            if enabled {
+                keys.push(left);
+                keys.push(right);
+            }
+        }
+        if shortcut.win {
+            keys.push(VK_LWIN);
+            keys.push(VK_RWIN);
+        }
+        if let Some(key) = shortcut.key {
+            let code = match key {
+                HotkeyKey::Letter(c) | HotkeyKey::Digit(c) => c as u16,
+                HotkeyKey::Function(n) => 0x70 + u16::from(n) - 1,
+            };
+            keys.push(VIRTUAL_KEY(code));
+        }
+        keys
+    }
+    /// True while every part of a held shortcut is down. A modifier pair counts
+    /// as one part: either side satisfies it.
+    pub fn held_shortcut_down(shortcut: &HeldShortcut) -> bool {
+        let either = |left: VIRTUAL_KEY, right: VIRTUAL_KEY| key_down(left) || key_down(right);
+        let modifiers = [
+            (shortcut.ctrl, VK_LCONTROL, VK_RCONTROL),
+            (shortcut.shift, VK_LSHIFT, VK_RSHIFT),
+            (shortcut.alt, VK_LMENU, VK_RMENU),
+            (shortcut.win, VK_LWIN, VK_RWIN),
+        ];
+        let mut any = false;
+        for (enabled, left, right) in modifiers {
+            if enabled {
+                any = true;
+                if !either(left, right) {
+                    return false;
+                }
+            }
+        }
+        if let Some(key) = shortcut.key {
+            any = true;
+            let code = match key {
+                HotkeyKey::Letter(c) | HotkeyKey::Digit(c) => c as u16,
+                HotkeyKey::Function(n) => 0x70 + u16::from(n) - 1,
+            };
+            if !key_down(VIRTUAL_KEY(code)) {
+                return false;
+            }
+        }
+        // A shortcut without any part is never held.
+        any
     }
     /// Moves files to the recycle bin, so a mistaken deletion in the capture
     /// list can be undone. Returns an error instead of silently deleting when

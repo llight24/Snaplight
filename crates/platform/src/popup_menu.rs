@@ -91,6 +91,12 @@ impl Item {
         self.shortcut = Some(shortcut.into());
         self
     }
+    /// Appends a parenthesised explanation to the label. A row only carries one
+    /// right-aligned shortcut, so extra keys belong in the label text.
+    pub fn with_hint(mut self, hint: impl AsRef<str>) -> Self {
+        self.label = format!("{}（{}）", self.label, hint.as_ref());
+        self
+    }
     pub fn danger(mut self) -> Self {
         self.danger = true;
         self

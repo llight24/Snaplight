@@ -98,6 +98,7 @@ pub fn settings(config: &Config) -> Result<Settings, slint::PlatformError> {
     ui.set_accent_value(config.theme.accent.clone().into());
     ui.set_capture_hotkey_value(config.capture_hotkey.clone().into());
     ui.set_restore_hotkey_value(config.restore_hotkey.clone().into());
+    ui.set_through_hotkey_value(config.through_hotkey.clone().into());
     ui.set_detect_mode(window_detect_index(config.window_detect));
     Ok(ui)
 }

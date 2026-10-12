@@ -143,7 +143,9 @@ Snaplight is running (pid $($core.Id)). Look for the tray icon, then test:
   6. Enter                 flatten and pin the selection to the screen.
   7. Pin window            drag to move, wheel to scale, Ctrl+wheel opacity,
                            right click for the menu, "Click through" makes it
-                           transparent to input; Ctrl+Shift+P restores it.
+                           transparent to input; hold Ctrl while it is
+                           click-through to interact with it temporarily, and
+                           Ctrl+Shift+P restores it for good.
   8. Settings               .\scripts\launch.ps1 -Settings
   9. Resource scenarios     .\scripts\resource-scenarios.ps1 -Profile $profile -Seconds 10
  10. Frame-timing stress    .\target\$profile\snaplight-editor.exe --stress

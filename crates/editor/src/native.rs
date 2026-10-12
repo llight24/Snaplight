@@ -1,5 +1,4 @@
 use parking_lot::Mutex;
-use snaplight_domain::long_capture::{Frame, LongCapture, Step};
 use snaplight_domain::*;
 use snaplight_platform::{
     atomic_write, capture_dir, data_dir, load_config, load_window_state, native::PointHole,
@@ -23,6 +22,12 @@ use windows::{
     },
 };
 
+/// The interactive long capture: a timer samples the selected region while the
+/// user scrolls the content, and the stitched result is trimmed and finished
+/// from a bird's eye panel.
+mod scroll_capture;
+use scroll_capture::{parse_long_capture_demo, LongCaptureSession};
+
 const COMMAND: u32 = WM_APP + 42;
 /// Posted to the overlay window when a hover query should run.
 const HOVER_PROBE: u32 = WM_APP + 43;
@@ -38,6 +43,21 @@ const WM_MOUSELEAVE: u32 = 0x02a3;
 const CLICK_SLOP: f32 = 4.0;
 /// Frames rendered by the `--stress` 4K annotation loop.
 const STRESS_FRAMES: usize = 240;
+/// Zoom limits for the canvas view. The lower bound keeps a very long capture
+/// legible at least as a thumbnail; the upper bound keeps annotation handles
+/// usable.
+const MIN_VIEW_SCALE: f32 = 0.02;
+const MAX_VIEW_SCALE: f32 = 8.0;
+/// One wheel notch is this fraction of the current zoom.
+const ZOOM_STEP: f32 = 1.1;
+/// View pixels panned per wheel notch.
+const PAN_STEP: f32 = 96.0;
+/// Timer that samples the selected region while a long capture runs.
+const LONG_CAPTURE_TIMER: usize = 1;
+/// Posted by the long-capture panel when the user finishes.
+const LONG_CAPTURE_FINISH: u32 = WM_APP + 44;
+/// Posted by the long-capture panel when the user cancels.
+const LONG_CAPTURE_CANCEL: u32 = WM_APP + 45;
 #[derive(Clone)]
 enum UiCommand {
     Action(i32),
@@ -102,8 +122,15 @@ fn hover_region(screen: RECT, image: &ImageDescriptor, rect: ScreenRect) -> Opti
         .clamp(image.width, image.height),
     )
 }
-fn selection_handle(rect: ImageRect, point: ImagePoint, dpi: u32) -> Option<SelectionHandle> {
-    let radius = 8.0 * (dpi as f32 / 96.0).clamp(1.0, 4.0);
+/// Hit-tests the eight selection handles. `view_scale` is the zoom the document
+/// is drawn at, so the grab radius stays a constant number of screen pixels.
+fn selection_handle(
+    rect: ImageRect,
+    point: ImagePoint,
+    dpi: u32,
+    view_scale: f32,
+) -> Option<SelectionHandle> {
+    let radius = 8.0 * (dpi as f32 / 96.0).clamp(1.0, 4.0) / view_scale.max(MIN_VIEW_SCALE);
     // Corners take priority when a tiny selection has overlapping hit regions.
     let handles = [
         (0, 0),
@@ -148,6 +175,57 @@ fn resize_selection(
         height: bottom - top,
     }
 }
+/// How the document is shown inside the overlay window: zoom plus pan, in view
+/// pixels. A normal capture opens 1:1; a long capture opens shrunk to fit.
+#[derive(Clone, Copy)]
+struct ViewTransform {
+    scale: f32,
+    x: f32,
+    y: f32,
+}
+impl ViewTransform {
+    /// 1:1, with the document origin at the window corner.
+    fn plain() -> Self {
+        Self {
+            scale: 1.0,
+            x: 0.0,
+            y: 0.0,
+        }
+    }
+    /// Shrinks `image` to fit `view` (never magnifying) and centers it.
+    fn fit(image: &ImageDescriptor, view: (u32, u32)) -> Self {
+        let mut transform = Self::plain();
+        transform.scale = (view.0 as f32 / image.width.max(1) as f32)
+            .min(view.1 as f32 / image.height.max(1) as f32);
+        transform.clamp(image, view);
+        transform
+    }
+    /// Keeps the document covering the view while it is larger, and centered
+    /// while it is smaller, so panning can never expose empty space.
+    fn clamp(&mut self, image: &ImageDescriptor, view: (u32, u32)) {
+        self.scale = self.scale.clamp(MIN_VIEW_SCALE, MAX_VIEW_SCALE);
+        let width = image.width as f32 * self.scale;
+        let height = image.height as f32 * self.scale;
+        let (view_width, view_height) = (view.0 as f32, view.1 as f32);
+        self.x = if width <= view_width {
+            (view_width - width) / 2.0
+        } else {
+            self.x.clamp(view_width - width, 0.0)
+        };
+        self.y = if height <= view_height {
+            (view_height - height) / 2.0
+        } else {
+            self.y.clamp(view_height - height, 0.0)
+        };
+    }
+    fn to_view(self, p: ImagePoint) -> (f32, f32) {
+        (p.x * self.scale + self.x, p.y * self.scale + self.y)
+    }
+    fn to_image(self, x: f32, y: f32) -> (f32, f32) {
+        let scale = if self.scale > 0.0 { self.scale } else { 1.0 };
+        ((x - self.x) / scale, (y - self.y) / scale)
+    }
+}
 struct Canvas {
     hwnd: HWND,
     renderer: OverlayRenderer,
@@ -166,6 +244,8 @@ struct Canvas {
     // be rebuilt after device loss without changing the captured content.
     base: Vec<u8>,
     screen: RECT,
+    /// Zoom and pan of the document inside this window.
+    view: ViewTransform,
     device_rebuilds: u32,
     capture_dir: PathBuf,
     ui_slots: Arc<UiSlots>,
@@ -173,18 +253,16 @@ struct Canvas {
     /// Configured detection mode; `Off` never queries UI Automation.
     detect: WindowDetect,
     hover_probe: HoverProbe,
+    /// The running long-capture session, if any. While it is set, the window is
+    /// hidden and the ring and panel windows stand in for it.
+    long_capture: Option<LongCaptureSession>,
+    /// Set by `--long-capture-demo`: the session runs against a fixed region and
+    /// reports JSON instead of a notice.
+    demo: bool,
 }
 impl Canvas {
     fn draw(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let viewport = Viewport {
-            width: self.doc.image.width,
-            height: self.doc.image.height,
-            dpi: self.dpi as f32,
-            origin: ScreenPoint {
-                x: self.screen.left,
-                y: self.screen.top,
-            },
-        };
+        let viewport = self.viewport();
         match self.renderer.render(&self.doc, viewport, &self.interaction) {
             Ok(()) => Ok(()),
             Err(error) if is_recoverable_device_error(&error) || self.renderer.device_lost() => {
@@ -196,9 +274,33 @@ impl Canvas {
             Err(error) => Err(error.into()),
         }
     }
+    fn viewport(&self) -> Viewport {
+        Viewport {
+            scale: self.view.scale,
+            offset_x: self.view.x,
+            offset_y: self.view.y,
+            ..Viewport::plain(
+                self.view_size().0,
+                self.view_size().1,
+                self.dpi as f32,
+                ScreenPoint {
+                    x: self.screen.left,
+                    y: self.screen.top,
+                },
+            )
+        }
+    }
+    /// Client area of the overlay window, in physical pixels: the size of the
+    /// view the document is drawn into.
+    fn view_size(&self) -> (u32, u32) {
+        (
+            (self.screen.right - self.screen.left).max(1) as u32,
+            (self.screen.bottom - self.screen.top).max(1) as u32,
+        )
+    }
     fn rebuild_device(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
         self.renderer
-            .rebuild(&self.base, &self.doc.image, self.screen)?;
+            .rebuild(&self.base, &self.doc.image, self.screen, self.view_size())?;
         self.device_rebuilds += 1;
         Ok(())
     }
@@ -218,9 +320,10 @@ impl Canvas {
             && !self.interaction.dragging
     }
     fn screen_point(&self, p: ImagePoint) -> ScreenPoint {
+        let (x, y) = self.view.to_view(p);
         ScreenPoint {
-            x: self.screen.left + p.x.round() as i32,
-            y: self.screen.top + p.y.round() as i32,
+            x: self.screen.left + x.round() as i32,
+            y: self.screen.top + y.round() as i32,
         }
     }
     /// Replaces the preview, repainting only when it actually changed.
@@ -284,10 +387,42 @@ impl Canvas {
         self.set_hover(region);
     }
     fn position(&self, l: LPARAM) -> ImagePoint {
+        let (x, y) = self
+            .view
+            .to_image(l.0 as u16 as i16 as f32, (l.0 >> 16) as u16 as i16 as f32);
         ImagePoint {
-            x: (l.0 as u16 as i16 as f32).clamp(0.0, self.doc.image.width as f32),
-            y: ((l.0 >> 16) as u16 as i16 as f32).clamp(0.0, self.doc.image.height as f32),
+            x: x.clamp(0.0, self.doc.image.width as f32),
+            y: y.clamp(0.0, self.doc.image.height as f32),
         }
+    }
+    /// `Ctrl` zooms around the cursor, otherwise the view pans. `delta` is a
+    /// wheel rotation in `WM_MOUSEWHEEL` units (multiples of 120).
+    fn wheel(&mut self, delta: i32, p: ImagePoint, ctrl: bool, shift: bool) {
+        if delta == 0 {
+            return;
+        }
+        if ctrl {
+            let factor = if delta > 0 {
+                ZOOM_STEP
+            } else {
+                1.0 / ZOOM_STEP
+            };
+            let (x, y) = self.view.to_view(p);
+            self.view.scale *= factor;
+            // Keep the image point under the cursor in place.
+            self.view.x = x - p.x * self.view.scale;
+            self.view.y = y - p.y * self.view.scale;
+        } else {
+            let step = delta as f32 / 120.0 * PAN_STEP;
+            if shift {
+                self.view.x += step;
+            } else {
+                self.view.y += step;
+            }
+        }
+        let view = self.view_size();
+        self.view.clamp(&self.doc.image, view);
+        unsafe { self.invalidate() };
     }
     fn update_drag(&mut self, p: ImagePoint) {
         let Some(start) = self.start else {
@@ -421,14 +556,13 @@ impl Canvas {
             15 => unsafe {
                 PostQuitMessage(0);
             },
-            // Long capture (plan B09): scrolls the selection and stitches the
-            // result into one tall image saved into the capture folder.
+            // Long capture (plan B09): samples the selected region while the user
+            // scrolls, stitches the frames into one tall image and opens that image
+            // as the document so it can be annotated further.
             17 => {
-                match self.long_capture() {
-                    Ok(report) => snaplight_platform::native::show_notice(&report.message()),
-                    Err(error) => snaplight_platform::native::show_error(&error.to_string()),
+                if let Err(error) = self.start_long_capture() {
+                    snaplight_platform::native::show_error(&error.to_string());
                 }
-                return Ok(());
             }
             _ => {}
         }
@@ -437,351 +571,6 @@ impl Canvas {
         }
         Ok(())
     }
-    /// Long capture (plan B09): scrolls the selected region and stitches every new
-    /// row into one tall image.
-    ///
-    /// The session runs inline on this thread with the overlay hidden and the
-    /// toolbar moved out of the region, so no Snaplight window ends up in the
-    /// stitched image. Esc cancels; scrolling stops at the end of the content,
-    /// when two frames jump too far apart to overlap reliably, or when the stitch
-    /// would exceed its memory budget.
-    fn long_capture(
-        &mut self,
-    ) -> std::result::Result<LongCaptureReport, Box<dyn std::error::Error>> {
-        let Some(selection) = self.doc.selection else {
-            return Err("长截图需要先框选区域：滚动与拼接都以该选区为准。".into());
-        };
-        let region = RECT {
-            left: (self.screen.left + selection.x as i32)
-                .clamp(self.screen.left, self.screen.right),
-            top: (self.screen.top + selection.y as i32).clamp(self.screen.top, self.screen.bottom),
-            right: (self.screen.left + (selection.x + selection.width) as i32)
-                .clamp(self.screen.left, self.screen.right),
-            bottom: (self.screen.top + (selection.y + selection.height) as i32)
-                .clamp(self.screen.top, self.screen.bottom),
-        };
-        if region.right - region.left < 8 || region.bottom - region.top < 8 {
-            return Err("长截图区域太小：请至少框选 8 × 8 像素。".into());
-        }
-        let centre = ScreenPoint {
-            x: (region.left + region.right) / 2,
-            y: (region.top + region.bottom) / 2,
-        };
-        let original_cursor = snaplight_platform::native::cursor_position();
-        // The session takes the pointer over and injects wheel input, and the toolbar
-        // shows no live progress text, so the rules are stated before anything moves.
-        snaplight_platform::native::show_notice(
-            "长截图将以当前选区为准：自动把鼠标移到选区中心并向上滚动，逐屏拼接成一张长图。\n\n按 Esc 取消（取消不保存），滚动到内容尽头会自动结束，结果保存到截图文件夹。",
-        );
-        let slots = self.ui_slots.clone();
-        unsafe {
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
-        }
-        park_for_long_capture(&slots, self.dpi, self.screen, region, "长截图：正在捕获…");
-        // The wheel goes to the window under the pointer, so the pointer has to sit
-        // inside the region being scrolled. It is put back once the session ends.
-        snaplight_platform::native::set_cursor_position(centre);
-        let mut source = ScrollSource {
-            region,
-            first: true,
-        };
-        let outcome = long_capture_session(&mut source, &slots);
-        // Whatever happened, the desktop and the overlay go back to normal first.
-        if let Some(point) = original_cursor {
-            snaplight_platform::native::set_cursor_position(point);
-        }
-        unsafe {
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
-        }
-        *slots.toolbar_selection.lock() = None;
-        publish_selection(&*self, selection);
-        unsafe {
-            self.invalidate();
-        }
-        let session = outcome?;
-        let mut report = LongCaptureReport {
-            screens: session.screens,
-            width: 0,
-            height: 0,
-            image: None,
-            note: session.note,
-            cancelled: session.cancelled,
-        };
-        let Some(engine) = session.engine else {
-            return Ok(report);
-        };
-        report.width = engine.width();
-        report.height = engine.height();
-        if report.cancelled {
-            return Ok(report);
-        }
-        // The stitched image is saved the way a normal capture is - source pixels,
-        // document and flattened PNG side by side - so it shows up in the capture
-        // folder and can be reopened from there.
-        let folder = self.capture_dir.clone();
-        std::fs::create_dir_all(&folder)?;
-        let key = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let stem = folder.join(format!("{key}"));
-        let image = engine.descriptor(ImageId(key as u64));
-        write_pixels(&stem.with_extension("source.bgra"), &image, engine.bytes())?;
-        atomic_write(
-            &stem.with_extension("document.json"),
-            &serde_json::to_vec_pretty(&Document {
-                version: 1,
-                image: image.clone(),
-                selection: None,
-                annotations: vec![],
-            })?,
-        )?;
-        let png = stem.with_extension("png");
-        write_png(&png, &image, engine.bytes())?;
-        report.image = Some(png);
-        Ok(report)
-    }
-}
-/// Outcome of one long capture session, phrased for the notice and the demo.
-struct LongCaptureReport {
-    /// Screens appended after the first one.
-    screens: u32,
-    width: u32,
-    height: u32,
-    /// Saved PNG; `None` when the session was cancelled.
-    image: Option<PathBuf>,
-    /// Why scrolling stopped early; `None` when it reached the end of the content.
-    note: Option<String>,
-    cancelled: bool,
-}
-impl LongCaptureReport {
-    fn message(&self) -> String {
-        let mut text = if self.cancelled {
-            format!("长截图已取消：已捕获 {} 屏，未保存。", self.screens + 1)
-        } else {
-            format!(
-                "长截图完成：{} 屏 → {} × {} 像素",
-                self.screens + 1,
-                self.width,
-                self.height
-            )
-        };
-        if let Some(path) = &self.image {
-            text.push_str(&format!("，已保存到 {}", path.display()));
-        }
-        if let Some(note) = &self.note {
-            text.push_str(&format!("（{note}）"));
-        }
-        text
-    }
-}
-/// Raw result of a session, before the stitched image is written to disk.
-struct LongCaptureSession {
-    /// `None` when the very first frame could not start a stitch.
-    engine: Option<LongCapture>,
-    /// Screens appended after the first one.
-    screens: u32,
-    /// Why scrolling stopped early.
-    note: Option<String>,
-    cancelled: bool,
-}
-/// Hands each screen of a session to the stitcher.
-/// One screen of a session: width, height and BGRA rows.
-type ScreenFrame = (u32, u32, Vec<u8>);
-/// The outcome of asking a frame source for the next screen.
-type ScreenFrameResult = std::result::Result<Option<ScreenFrame>, Box<dyn std::error::Error>>;
-trait FrameSource {
-    /// The next screen, or `None` when the session was cancelled first. Reads are
-    /// expected to block until the screen has come to rest.
-    fn next_frame(&mut self) -> ScreenFrameResult;
-}
-/// A real session: reads the region, and scrolls it with the wheel in between.
-struct ScrollSource {
-    region: RECT,
-    /// The first frame is the region as it is before anything is scrolled.
-    first: bool,
-}
-impl ScrollSource {
-    /// Wheel notches sent per scroll step; deep enough to make progress, shallow
-    /// enough that consecutive frames still overlap.
-    const SCROLL_NOTCHES: i32 = 3;
-}
-impl FrameSource for ScrollSource {
-    fn next_frame(&mut self) -> ScreenFrameResult {
-        if self.first {
-            self.first = false;
-        } else {
-            snaplight_platform::native::scroll_wheel(-Self::SCROLL_NOTCHES);
-        }
-        settled_frame(self.region)
-    }
-}
-/// Runs one long capture session: stitched screens are appended until the content
-/// ends, the scroll jumps too far to overlap, the memory budget runs out or the
-/// user presses Esc.
-fn long_capture_session(
-    source: &mut dyn FrameSource,
-    slots: &UiSlots,
-) -> std::result::Result<LongCaptureSession, Box<dyn std::error::Error>> {
-    /// Scrolls without new rows before the end of the content is assumed.
-    const MAX_STALLS: u32 = 2;
-    let mut session = LongCaptureSession {
-        engine: None,
-        screens: 0,
-        note: None,
-        cancelled: false,
-    };
-    // The first frame is the region as it is now, with nothing scrolled yet.
-    let Some((width, height, bytes)) = source.next_frame()? else {
-        session.cancelled = true;
-        return Ok(session);
-    };
-    match LongCapture::new(
-        Frame {
-            width,
-            height,
-            stride: width as usize * 4,
-            bytes: &bytes,
-        },
-        long_capture::MAX_BYTES,
-    ) {
-        Ok(engine) => session.engine = Some(engine),
-        Err(why) => {
-            session.note = Some(why.to_string());
-            return Ok(session);
-        }
-    }
-    let mut stalls = 0;
-    loop {
-        let Some((width, height, bytes)) = source.next_frame()? else {
-            session.cancelled = true;
-            return Ok(session);
-        };
-        let step = session
-            .engine
-            .as_mut()
-            .expect("the engine is created above")
-            .push(&Frame {
-                width,
-                height,
-                stride: width as usize * 4,
-                bytes: &bytes,
-            });
-        match step {
-            Step::Scrolled { .. } => {
-                session.screens += 1;
-                stalls = 0;
-            }
-            Step::Unchanged => {
-                stalls += 1;
-                if stalls >= MAX_STALLS {
-                    // Nothing moved at all: the region is most likely not over
-                    // scrollable content, which is a different problem from
-                    // having scrolled all the way to the end.
-                    session.note = Some(if session.screens == 0 {
-                        "没有检测到滚动：请确认选区覆盖的是可以滚动的内容（例如网页、聊天记录或列表）"
-                            .into()
-                    } else {
-                        "已到内容尽头".into()
-                    });
-                    return Ok(session);
-                }
-            }
-            Step::Jumped => {
-                session.note =
-                    Some("滚动跳变：新一屏与上一屏没有足够重叠，为避免漏行已停止".into());
-                return Ok(session);
-            }
-            Step::Budget(why) => {
-                session.note = Some(why.to_string());
-                return Ok(session);
-            }
-        }
-        if let Some(weak) = slots.toolbar.get() {
-            snaplight_ui::set_toolbar_status(
-                weak,
-                format!("长截图：已捕获 {} 屏 · Esc 取消", session.screens + 1),
-            );
-        }
-    }
-}
-/// Reads a screen region until two consecutive reads agree, which is how the end
-/// of a scroll animation is detected. `None` when Esc was pressed first.
-fn settled_frame(region: RECT) -> ScreenFrameResult {
-    /// How often the region is re-read while a scroll animation runs.
-    const SETTLE_POLL: Duration = Duration::from_millis(120);
-    /// Longest time one scroll is given to come to rest. Nothing may keep the
-    /// session waiting forever: a page with a blinking cursor never settles, so
-    /// the read in progress is used instead.
-    const SETTLE_LIMIT: Duration = Duration::from_millis(2400);
-    let started = Instant::now();
-    let mut previous: Option<Vec<u8>> = None;
-    loop {
-        if snaplight_platform::native::key_down(VK_ESCAPE) {
-            return Ok(None);
-        }
-        let (width, height, bytes) = screen_pixels(region)?;
-        if previous.as_deref() == Some(bytes.as_slice()) {
-            return Ok(Some((width, height, bytes)));
-        }
-        previous = Some(bytes);
-        if started.elapsed() >= SETTLE_LIMIT {
-            return Ok(Some(screen_pixels(region)?));
-        }
-        std::thread::sleep(SETTLE_POLL);
-    }
-}
-/// Moves the toolbar clear of a region that is being scrolled and reports
-/// progress in it. Neither the toolbar nor the options panel may end up in the
-/// stitched image, which is why the bar goes below the region, above it, or off
-/// the virtual screen when the region covers the whole capture.
-fn park_for_long_capture(slots: &UiSlots, dpi: u32, screen: RECT, region: RECT, status: &str) {
-    if let Some(panel) = slots.panel.get() {
-        snaplight_ui::hide_panel(panel);
-    }
-    let Some(weak) = slots.toolbar.get() else {
-        return;
-    };
-    let Some(logical_size) = slots.toolbar_size.get().copied() else {
-        return;
-    };
-    let size = snaplight_ui::scale_to_physical(logical_size, dpi);
-    snaplight_ui::set_toolbar_status(weak, status.to_string());
-    let (x, y) = progress_position(screen, region, size);
-    snaplight_ui::move_toolbar(weak, PhysicalPosition::new(x, y));
-    snaplight_ui::invoke(move || reshape_and_raise(snaplight_ui::TOOLBAR_TITLE, logical_size));
-}
-/// Places the toolbar outside a screen rectangle: below it when there is room,
-/// above it otherwise, and parked outside the virtual screen when the rectangle
-/// leaves no room at all.
-fn progress_position(screen: RECT, region: RECT, size: (i32, i32)) -> (i32, i32) {
-    const MARGIN: i32 = 16;
-    let max_x = (screen.right - size.0 - MARGIN).max(screen.left + MARGIN);
-    let x = region.left.clamp(screen.left + MARGIN, max_x);
-    let below = region.bottom + MARGIN;
-    if below + size.1 <= screen.bottom {
-        return (x, below);
-    }
-    let above = region.top - size.1 - MARGIN;
-    if above >= screen.top {
-        return (x, above);
-    }
-    parked_position(size)
-}
-/// Parses `--long-capture-demo=x,y,w,h`, in physical screen pixels.
-fn parse_long_capture_demo(arg: &str) -> Option<RECT> {
-    let value = arg.strip_prefix("--long-capture-demo=")?;
-    let mut parts = value.split(',').map(|part| part.trim().parse::<i32>());
-    let x = parts.next()?.ok()?;
-    let y = parts.next()?.ok()?;
-    let width = parts.next()?.ok()?;
-    let height = parts.next()?.ok()?;
-    if parts.next().is_some() || width <= 0 || height <= 0 {
-        return None;
-    }
-    Some(RECT {
-        left: x,
-        top: y,
-        right: x + width,
-        bottom: y + height,
-    })
 }
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Canvas;
@@ -803,10 +592,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 *state.active.lock() = hwnd.0 as usize;
                 let p = state.position(l);
                 state.interaction.cursor = Some(p);
-                let handle = state
-                    .doc
-                    .selection
-                    .and_then(|r| selection_handle(r, p, state.dpi).map(|h| (r, h)));
+                let handle = state.doc.selection.and_then(|r| {
+                    selection_handle(r, p, state.dpi, state.view.scale).map(|h| (r, h))
+                });
                 if let Some(resize) = handle {
                     park_toolbar(state);
                     state.resize = Some(resize);
@@ -851,15 +639,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     if GetCursorPos(&mut point).is_ok()
                         && ScreenToClient(hwnd, &mut point).as_bool()
                     {
-                        let p = ImagePoint {
-                            x: point.x as f32,
-                            y: point.y as f32,
-                        };
+                        let (px, py) = state.view.to_image(point.x as f32, point.y as f32);
+                        let p = ImagePoint { x: px, y: py };
                         let handle = state.resize.map(|(_, h)| h).or_else(|| {
                             state
                                 .doc
                                 .selection
-                                .and_then(|r| selection_handle(r, p, state.dpi))
+                                .and_then(|r| selection_handle(r, p, state.dpi, state.view.scale))
                         });
                         let cursor = match handle {
                             Some(SelectionHandle { col: 1, .. }) => IDC_SIZENS,
@@ -895,6 +681,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 state.hover_probe.pending = None;
                 state.hover_probe.last = None;
                 state.set_hover(None);
+                return LRESULT(0);
+            }
+            WM_MOUSEWHEEL => {
+                // `l` carries screen coordinates and `w` the rotation plus the
+                // modifier keys for this message.
+                let delta = (w.0 >> 16) as u16 as i16 as i32;
+                let flags = w.0 as u32;
+                let (x, y) = (
+                    l.0 as u16 as i16 as f32 - state.screen.left as f32,
+                    (l.0 >> 16) as u16 as i16 as f32 - state.screen.top as f32,
+                );
+                let (px, py) = state.view.to_image(x, y);
+                let p = ImagePoint { x: px, y: py };
+                state.wheel(delta, p, flags & 0x0008 != 0, flags & 0x0004 != 0);
                 return LRESULT(0);
             }
             HOVER_PROBE => {
@@ -994,6 +794,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 return LRESULT(0);
             }
             WM_DPICHANGED => return LRESULT(0),
+            // Long capture: the session samples the selected region on a timer, and
+            // the ring and panel windows post the two commands below.
+            WM_TIMER if w.0 == LONG_CAPTURE_TIMER => {
+                state.long_capture_tick();
+                return LRESULT(0);
+            }
+            LONG_CAPTURE_FINISH => {
+                state.finish_long_capture();
+                return LRESULT(0);
+            }
+            LONG_CAPTURE_CANCEL => {
+                state.cancel_long_capture();
+                return LRESULT(0);
+            }
             _ => {}
         }
     }
@@ -1218,12 +1032,15 @@ fn canvas_thread(
                     error: None,
                     base,
                     screen: s,
+                    view: ViewTransform::plain(),
                     device_rebuilds: 0,
                     capture_dir: capture_dir(&config),
                     ui_slots: ui_slots.clone(),
                     dpi: window_dpi.max(96),
                     detect: config.window_detect,
                     hover_probe: HoverProbe::default(),
+                    long_capture: None,
+                    demo: demo.is_some(),
                 });
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *canvas as *mut Canvas) as isize);
                 if *active.lock() == 0 {
@@ -1294,15 +1111,15 @@ fn canvas_thread(
                     canvas.renderer.record_composed(!stress);
                     canvas.renderer.render(
                         &canvas.doc,
-                        Viewport {
-                            width: frame.descriptor.width,
-                            height: frame.descriptor.height,
-                            dpi: canvas.dpi as f32,
-                            origin: ScreenPoint {
+                        Viewport::plain(
+                            frame.descriptor.width,
+                            frame.descriptor.height,
+                            canvas.dpi as f32,
+                            ScreenPoint {
                                 x: canvas.screen.left,
                                 y: canvas.screen.top,
                             },
-                        },
+                        ),
                         &Interaction::default(),
                     )?;
                     if !stress {
@@ -1390,15 +1207,15 @@ fn canvas_thread(
                         canvas.renderer.record_composed(true);
                         canvas.renderer.render(
                             &canvas.doc,
-                            Viewport {
-                                width: frame.descriptor.width,
-                                height: frame.descriptor.height,
-                                dpi: canvas.dpi as f32,
-                                origin: ScreenPoint {
+                            Viewport::plain(
+                                frame.descriptor.width,
+                                frame.descriptor.height,
+                                canvas.dpi as f32,
+                                ScreenPoint {
                                     x: canvas.screen.left,
                                     y: canvas.screen.top,
                                 },
-                            },
+                            ),
                             &Interaction {
                                 hover: Some(hover),
                                 ..Default::default()
@@ -1498,15 +1315,15 @@ fn canvas_thread(
                             });
                             canvas.renderer.render(
                                 &canvas.doc,
-                                Viewport {
-                                    width: frame.descriptor.width,
-                                    height: frame.descriptor.height,
-                                    dpi: canvas.dpi as f32,
-                                    origin: ScreenPoint {
+                                Viewport::plain(
+                                    frame.descriptor.width,
+                                    frame.descriptor.height,
+                                    canvas.dpi as f32,
+                                    ScreenPoint {
                                         x: canvas.screen.left,
                                         y: canvas.screen.top,
                                     },
-                                },
+                                ),
                                 &live,
                             )?;
                             canvas.renderer.collect_gpu_samples();
@@ -1557,34 +1374,14 @@ fn canvas_thread(
                     width: (region.right - region.left) as f32,
                     height: (region.bottom - region.top) as f32,
                 });
-                match canvas.long_capture() {
-                    Ok(report) => {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "long_capture": {
-                                    "region": [
-                                        region.left,
-                                        region.top,
-                                        region.right - region.left,
-                                        region.bottom - region.top
-                                    ],
-                                    "screens": report.screens + 1,
-                                    "width": report.width,
-                                    "height": report.height,
-                                    "image": report.image.as_ref().map(|p| p.display().to_string()),
-                                    "note": report.note,
-                                    "cancelled": report.cancelled,
-                                    "message": report.message(),
-                                }
-                            })
-                        );
-                        std::io::stdout().flush()?;
-                    }
+                match canvas.start_long_capture() {
+                    Ok(()) => {}
                     Err(error) => return Err(format!("long capture failed: {error}").into()),
                 }
             }
-            if !smoke && demo.is_none() {
+            // The demo needs the message loop too: the session advances on a timer
+            // and finishes when the driver sends Enter.
+            if !smoke || demo.is_some() {
                 let mut msg = MSG::default();
                 loop {
                     let result = GetMessageW(&mut msg, None, 0, 0).0;
@@ -2319,10 +2116,18 @@ fn settings(config: Config) -> std::result::Result<(), Box<dyn std::error::Error
             let restore = parse_hotkey(ui.get_restore_hotkey_value().trim())
                 .map_err(|_| "恢复贴图快捷键格式无效")?
                 .canonical();
+            // The held shortcut is not registered with the shell, so it accepts
+            // a lone modifier or a lone key as well.
+            let through = parse_held_shortcut(ui.get_through_hotkey_value().trim())
+                .map_err(|_| "穿透临时交互按键格式无效")?
+                .ok_or("穿透临时交互按键不能为空")?
+                .canonical();
             ui.set_capture_hotkey_value(capture.clone().into());
             ui.set_restore_hotkey_value(restore.clone().into());
+            ui.set_through_hotkey_value(through.clone().into());
             c.capture_hotkey = capture;
             c.restore_hotkey = restore;
+            c.through_hotkey = through;
             Ok(())
         })();
         if let Err(message) = hotkeys {
@@ -2889,15 +2694,26 @@ mod tests {
                     y: 100.0 + 50.0 * row as f32,
                 };
                 let expected = (col != 1 || row != 1).then_some(SelectionHandle { col, row });
-                assert_eq!(selection_handle(r, p, 144), expected);
+                assert_eq!(selection_handle(r, p, 144, 1.0), expected);
             }
         }
         assert_eq!(
-            selection_handle(r, ImagePoint { x: 89.0, y: 100.0 }, 144),
+            selection_handle(r, ImagePoint { x: 89.0, y: 100.0 }, 144, 1.0),
             Some(SelectionHandle { col: 0, row: 0 })
         );
         assert_eq!(
-            selection_handle(r, ImagePoint { x: 89.0, y: 100.0 }, 96),
+            selection_handle(r, ImagePoint { x: 89.0, y: 100.0 }, 96, 1.0),
+            None
+        );
+        // A zoomed-out view widens the grab radius in image pixels so the handles
+        // stay reachable on screen: at 0.2 the radius is 12 / 0.2 = 60 image
+        // pixels, so a point 50 away still grabs where it would not at 1.0.
+        assert_eq!(
+            selection_handle(r, ImagePoint { x: 50.0, y: 100.0 }, 144, 0.2),
+            Some(SelectionHandle { col: 0, row: 0 })
+        );
+        assert_eq!(
+            selection_handle(r, ImagePoint { x: 50.0, y: 100.0 }, 144, 1.0),
             None
         );
     }
@@ -3022,119 +2838,5 @@ mod tests {
             initial_toolbar_position(rect(0, 0, 300, 200), (400, 300)),
             (16, 16)
         );
-    }
-    /// A synthetic page: a sticky header stays on top while the body moves up by
-    /// `SCROLL` rows per screen, and every content row has its own colour, so the
-    /// overlap can only be found at the one correct offset. The last screen is
-    /// repeated twice so the session sees the end of the content.
-    struct FakePage {
-        frames: std::vec::IntoIter<(u32, u32, Vec<u8>)>,
-    }
-    impl FakePage {
-        const WIDTH: u32 = 200;
-        const HEIGHT: u32 = 300;
-        /// Rows of the header that never scroll away.
-        const HEADER: u32 = 30;
-        /// Rows one scroll step moves the body.
-        const SCROLL: u32 = 90;
-        /// Screens with new content.
-        const FRAMES: u32 = 6;
-        fn new() -> Self {
-            let last = (Self::FRAMES - 1) * Self::SCROLL;
-            let mut frames: Vec<(u32, u32, Vec<u8>)> = (0..Self::FRAMES)
-                .map(|index| Self::view(index * Self::SCROLL))
-                .collect();
-            frames.push(Self::view(last));
-            frames.push(Self::view(last));
-            Self {
-                frames: frames.into_iter(),
-            }
-        }
-        /// Colour of one header row.
-        fn header_colour(row: u32) -> [u8; 4] {
-            [(row * 3) as u8, (row * 5) as u8, (row * 7) as u8, 255]
-        }
-        /// Colour of one content row, unlike its neighbours in every channel.
-        fn content_colour(row: u32) -> [u8; 4] {
-            [
-                (row % 251) as u8,
-                (row * 7 % 241) as u8,
-                (row * 13 % 239) as u8,
-                255,
-            ]
-        }
-        /// One screen at the given scroll offset, in BGRA rows.
-        fn view(scroll: u32) -> (u32, u32, Vec<u8>) {
-            let mut bytes = vec![0u8; (Self::WIDTH * Self::HEIGHT * 4) as usize];
-            for y in 0..Self::HEIGHT {
-                let colour = if y < Self::HEADER {
-                    Self::header_colour(y)
-                } else {
-                    Self::content_colour(scroll + y - Self::HEADER)
-                };
-                for x in 0..Self::WIDTH {
-                    let at = ((y * Self::WIDTH + x) * 4) as usize;
-                    bytes[at..at + 4].copy_from_slice(&colour);
-                }
-            }
-            (Self::WIDTH, Self::HEIGHT, bytes)
-        }
-    }
-    impl FrameSource for FakePage {
-        fn next_frame(&mut self) -> ScreenFrameResult {
-            Ok(self.frames.next())
-        }
-    }
-    #[test]
-    fn long_capture_stitches_scrolling_screens() {
-        let mut source = FakePage::new();
-        let slots = UiSlots::default();
-        let session =
-            long_capture_session(&mut source, &slots).expect("the fake source cannot fail");
-        assert!(!session.cancelled);
-        assert_eq!(session.screens, FakePage::FRAMES - 1);
-        assert_eq!(session.note.as_deref(), Some("已到内容尽头"));
-        let engine = session.engine.expect("the first frame starts a stitch");
-        let expected = FakePage::HEIGHT + (FakePage::FRAMES - 1) * FakePage::SCROLL;
-        assert_eq!(engine.height(), expected);
-        assert_eq!(engine.width(), FakePage::WIDTH);
-        // Every row has to land in its own place: a missing or duplicated row would
-        // shift every row below it.
-        let stride = engine.stride();
-        let bytes = engine.bytes();
-        let colour_at = |y: u32| {
-            let at = (y as usize * stride) + 100 * 4;
-            &bytes[at..at + 4]
-        };
-        for y in 0..FakePage::HEADER {
-            assert_eq!(colour_at(y), FakePage::header_colour(y), "header row {y}");
-        }
-        for y in FakePage::HEADER..expected {
-            assert_eq!(
-                colour_at(y),
-                FakePage::content_colour(y - FakePage::HEADER),
-                "content row {y}"
-            );
-        }
-    }
-    #[test]
-    fn long_capture_reports_a_region_that_never_scrolls() {
-        // The same screen three times: the wheel never moved anything, which is a
-        // different outcome from having scrolled to the end of the content.
-        let view = FakePage::view(0);
-        let mut source = FakePage {
-            frames: vec![view.clone(), view.clone(), view].into_iter(),
-        };
-        let slots = UiSlots::default();
-        let session =
-            long_capture_session(&mut source, &slots).expect("the fake source cannot fail");
-        assert!(!session.cancelled);
-        assert_eq!(session.screens, 0);
-        assert_eq!(
-            session.note.as_deref(),
-            Some("没有检测到滚动：请确认选区覆盖的是可以滚动的内容（例如网页、聊天记录或列表）")
-        );
-        let engine = session.engine.expect("the first frame starts a stitch");
-        assert_eq!(engine.height(), FakePage::HEIGHT);
     }
 }

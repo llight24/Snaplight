@@ -56,6 +56,16 @@ fn bounds(w: u32, h: u32) -> D2D_RECT_F {
         height: h as f32,
     })
 }
+/// Maps a rectangle from image pixels to view pixels through `viewport`.
+fn to_view(r: ImageRect, viewport: &Viewport) -> ImageRect {
+    let (x, y) = viewport.to_view(r.x, r.y);
+    ImageRect {
+        x,
+        y,
+        width: r.width * viewport.scale,
+        height: r.height * viewport.scale,
+    }
+}
 fn point(p: ImagePoint) -> D2D_POINT_2F {
     D2D_POINT_2F { x: p.x, y: p.y }
 }
@@ -618,6 +628,9 @@ pub struct OverlayRenderer {
     mosaics: HashMap<u32, ID2D1Bitmap1>,
     width: u32,
     height: u32,
+    // Size of the swap chain and of the window's client area, in view pixels.
+    view_width: u32,
+    view_height: u32,
     pub frames: u64,
     pub cpu_us: Vec<u64>,
     pub present_us: Vec<u64>,
@@ -699,7 +712,11 @@ struct Targets {
     composition: Composition,
 }
 /// Recreates every device-dependent resource for `hwnd` from `frame`.
-fn create_targets(hwnd: HWND, frame: &FrozenFrame) -> Result<Targets> {
+///
+/// The source bitmap holds the whole document, while the swap chain is sized to
+/// `view`: a zoomed-out document (a long capture) is drawn into a smaller or
+/// differently shaped window than the image itself.
+fn create_targets(hwnd: HWND, frame: &FrozenFrame, view: (u32, u32)) -> Result<Targets> {
     unsafe {
         let gpu = frame.gpu.clone();
         let dc = gpu.dc()?;
@@ -780,8 +797,8 @@ fn create_targets(hwnd: HWND, frame: &FrozenFrame) -> Result<Targets> {
         dc.SetTransform(&identity());
         dc.SetTarget(None);
         let desc = DXGI_SWAP_CHAIN_DESC1 {
-            Width: width,
-            Height: height,
+            Width: view.0.max(1),
+            Height: view.1.max(1),
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
@@ -829,9 +846,9 @@ pub fn is_recoverable_device_error(error: &Error) -> bool {
 impl OverlayRenderer {
     pub fn new(hwnd: HWND, frame: &FrozenFrame) -> Result<Self> {
         unsafe {
-            let targets = create_targets(hwnd, frame)?;
             let width = frame.descriptor.width;
             let height = frame.descriptor.height;
+            let targets = create_targets(hwnd, frame, (width, height))?;
             let annotations = targets.dc.CreateBitmap(
                 D2D_SIZE_U { width, height },
                 None,
@@ -851,6 +868,8 @@ impl OverlayRenderer {
                 mosaics: HashMap::new(),
                 width,
                 height,
+                view_width: width,
+                view_height: height,
                 frames: 0,
                 cpu_us: vec![],
                 present_us: vec![],
@@ -867,19 +886,21 @@ impl OverlayRenderer {
     /// Rebuilds every device-dependent resource on a fresh device, keeping the window.
     ///
     /// `base` must be the immutable base image pixels for `descriptor` (BGRA8, `.stride`).
+    /// `view` is the swap chain size in view pixels (normally the window's client area).
     /// The caller must re-render the document afterwards; annotations are invalidated here.
     pub fn rebuild(
         &mut self,
         base: &[u8],
         descriptor: &ImageDescriptor,
         screen: RECT,
+        view: (u32, u32),
     ) -> Result<()> {
         unsafe {
             // Release the composition target before creating one for the same HWND.
             self.composition = None;
             let gpu = Gpu::new(None)?;
             let frame = gpu.frame_from_bgra(descriptor.clone(), base, screen)?;
-            let targets = create_targets(self.hwnd, &frame)?;
+            let targets = create_targets(self.hwnd, &frame, view)?;
             let annotations = targets.dc.CreateBitmap(
                 D2D_SIZE_U {
                     width: descriptor.width,
@@ -898,6 +919,8 @@ impl OverlayRenderer {
             self.annotations = annotations;
             self.width = descriptor.width;
             self.height = descriptor.height;
+            self.view_width = view.0.max(1);
+            self.view_height = view.1.max(1);
             self.mosaics.clear();
             self.cache_dirty = true;
             self.queries.clear();
@@ -921,8 +944,10 @@ impl OverlayRenderer {
     unsafe fn draw_selection_chrome(
         &mut self,
         r: ImageRect,
+        image: ImageRect,
         dpi: f32,
         origin: ScreenPoint,
+        view_width: f32,
     ) -> Result<()> {
         let scale = (dpi / 96.0).clamp(1.0, 4.0);
         let center = |p: D2D_POINT_2F, radius: f32| D2D1_ELLIPSE {
@@ -968,15 +993,15 @@ impl OverlayRenderer {
             "{},{}  {} × {} px",
             origin.x + r.x.round() as i32,
             origin.y + r.y.round() as i32,
-            r.width.round().max(0.0) as u32,
-            r.height.round().max(0.0) as u32
+            image.width.round().max(0.0) as u32,
+            image.height.round().max(0.0) as u32
         );
         let format = self.chip_text_format(CHROME_CHIP_FONT * scale)?;
         let utf16: Vec<u16> = text.encode_utf16().collect();
         let layout = self.gpu.write.CreateTextLayout(
             &utf16,
             &format,
-            self.width as f32,
+            view_width,
             CHROME_CHIP_HEIGHT * scale,
         )?;
         let mut metrics = DWRITE_TEXT_METRICS::default();
@@ -986,7 +1011,7 @@ impl OverlayRenderer {
         let chip = ImageRect {
             x: r.x.clamp(
                 2.0 * scale,
-                (self.width as f32 - width - 2.0 * scale).max(2.0 * scale),
+                (view_width - width - 2.0 * scale).max(2.0 * scale),
             ),
             y: (r.y - CHROME_CHIP_GAP * scale - height).max(2.0 * scale),
             width,
@@ -1072,10 +1097,12 @@ impl OverlayRenderer {
     /// Copies the render target into a CPU-readable buffer. Must run between
     /// `EndDraw` and `Present`, where the target holds the composed frame.
     unsafe fn copy_composed(&self) -> Result<ComposedFrame> {
+        // The target is the swap chain back buffer, so it is view-sized: a
+        // zoomed-out document is read back at the size it was drawn.
         let staging = self.dc.CreateBitmap(
             D2D_SIZE_U {
-                width: self.width,
-                height: self.height,
+                width: self.view_width,
+                height: self.view_height,
             },
             None,
             0,
@@ -1086,9 +1113,9 @@ impl OverlayRenderer {
         )?;
         staging.CopyFromBitmap(None, &self.target, None)?;
         let mapped = staging.Map(D2D1_MAP_OPTIONS_READ)?;
-        let stride = self.width as usize * 4;
-        let mut pixels = vec![0u8; stride * self.height as usize];
-        for y in 0..self.height as usize {
+        let stride = self.view_width as usize * 4;
+        let mut pixels = vec![0u8; stride * self.view_height as usize];
+        for y in 0..self.view_height as usize {
             let row = std::slice::from_raw_parts(
                 (mapped.bits as *const u8).add(y * mapped.pitch as usize),
                 stride,
@@ -1097,8 +1124,8 @@ impl OverlayRenderer {
         }
         let _ = staging.Unmap();
         Ok(ComposedFrame {
-            width: self.width,
-            height: self.height,
+            width: self.view_width,
+            height: self.view_height,
             pixels,
         })
     }
@@ -1430,8 +1457,24 @@ impl CanvasRenderer for OverlayRenderer {
                 None
             };
             self.update_cache(doc, interaction)?;
+            let scale = if viewport.scale > 0.0 {
+                viewport.scale
+            } else {
+                1.0
+            };
+            // Document layers are drawn in image pixels through this transform.
+            // Chrome and the magnifier are drawn afterwards in view pixels so
+            // their line widths and sizes stay constant at any zoom.
+            let document = Matrix3x2 {
+                M11: scale,
+                M12: 0.0,
+                M21: 0.0,
+                M22: scale,
+                M31: viewport.offset_x,
+                M32: viewport.offset_y,
+            };
             self.dc.SetTarget(&self.target);
-            self.dc.SetTransform(&identity());
+            self.dc.SetTransform(&document);
             self.dc.BeginDraw();
             self.dc.Clear(None);
             self.dc.DrawBitmap(
@@ -1505,10 +1548,17 @@ impl CanvasRenderer for OverlayRenderer {
             if let Some(a) = &interaction.draft {
                 self.draw_annotation(a)?;
             }
+            self.dc.SetTransform(&identity());
             if let Some(r) = selection {
-                self.draw_selection_chrome(r, viewport.dpi, viewport.origin)?;
+                self.draw_selection_chrome(
+                    to_view(r, &viewport),
+                    r,
+                    viewport.dpi,
+                    viewport.origin,
+                    self.view_width as f32,
+                )?;
             } else if let Some(r) = hover {
-                self.draw_hover_chrome(r, viewport.dpi)?;
+                self.draw_hover_chrome(to_view(r, &viewport), viewport.dpi)?;
             }
             if let Some(p) = interaction.cursor {
                 let sample = ImageRect {
@@ -1517,9 +1567,10 @@ impl CanvasRenderer for OverlayRenderer {
                     width: 20.0,
                     height: 20.0,
                 };
+                let (cx, cy) = viewport.to_view(p.x, p.y);
                 let zoom = ImageRect {
-                    x: (p.x + 24.0).min((self.width as f32 - 124.0).max(0.0)),
-                    y: (p.y + 24.0).min((self.height as f32 - 124.0).max(0.0)),
+                    x: (cx + 24.0).min((self.view_width as f32 - 124.0).max(0.0)),
+                    y: (cy + 24.0).min((self.view_height as f32 - 124.0).max(0.0)),
                     width: 120.0,
                     height: 120.0,
                 };

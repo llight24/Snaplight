@@ -12,6 +12,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_CAPTURE_HOTKEY: &str = "Ctrl+Shift+A";
 /// Default global shortcut that restores interaction for click-through pins.
 pub const DEFAULT_RESTORE_HOTKEY: &str = "Ctrl+Shift+P";
+/// Default shortcut held down to interact with click-through pins. Holding it
+/// only releases the click-through state while the keys are down, so the pin
+/// goes back to letting clicks through as soon as they are released.
+pub const DEFAULT_THROUGH_HOTKEY: &str = "Ctrl";
 
 /// Key part of a parsed hotkey. Letters and digits map to their ASCII virtual-key
 /// code; functions map to `VK_F1`..`VK_F24`.
@@ -67,20 +71,148 @@ pub fn parse_hotkey(text: &str) -> Result<Hotkey, &'static str> {
         key: HotkeyKey::Letter('A'),
     };
     for modifier in modifiers {
-        match modifier.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => hotkey.ctrl = true,
-            "shift" => hotkey.shift = true,
-            "alt" => hotkey.alt = true,
-            "win" | "super" | "meta" => hotkey.win = true,
-            "" => return Err("empty hotkey modifier"),
-            _ => return Err("unknown hotkey modifier"),
-        }
+        apply_modifier(&mut hotkey, modifier)?;
     }
     if !(hotkey.ctrl || hotkey.shift || hotkey.alt || hotkey.win) {
         return Err("hotkey needs at least one modifier");
     }
     hotkey.key = parse_hotkey_key(key_text)?;
     Ok(hotkey)
+}
+/// Shortcut that is *held* rather than pressed, used to interact with a
+/// click-through pin for as long as it is down.
+///
+/// Unlike `Hotkey` this is not registered with the shell, so it may be a lone
+/// modifier (`Ctrl`), a modifier combination (`Ctrl+Shift`), a lone key (`A`),
+/// or a combination (`Ctrl+Shift+A`). `None` means the shortcut is disabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeldShortcut {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub win: bool,
+    pub key: Option<HotkeyKey>,
+}
+impl HeldShortcut {
+    /// Canonical spelling (`Ctrl+Shift`), matching `Hotkey::canonical` so both
+    /// the settings field and the menu hint show the same text.
+    pub fn canonical(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for (enabled, name) in [
+            (self.ctrl, "Ctrl"),
+            (self.shift, "Shift"),
+            (self.alt, "Alt"),
+            (self.win, "Win"),
+        ] {
+            if enabled {
+                parts.push(name.into());
+            }
+        }
+        match self.key {
+            None => {}
+            Some(HotkeyKey::Letter(c) | HotkeyKey::Digit(c)) => parts.push(c.to_string()),
+            Some(HotkeyKey::Function(n)) => parts.push(format!("F{n}")),
+        }
+        parts.join("+")
+    }
+}
+/// Parses a held shortcut. `None` disables the shortcut; an empty string is
+/// rejected so a blank settings field cannot silently disable it.
+pub fn parse_held_shortcut(text: &str) -> Result<Option<HeldShortcut>, &'static str> {
+    if text.trim().is_empty() {
+        return Err("empty held shortcut");
+    }
+    let parts: Vec<&str> = text.split('+').map(str::trim).collect();
+    let mut shortcut = HeldShortcut {
+        ctrl: false,
+        shift: false,
+        alt: false,
+        win: false,
+        key: None,
+    };
+    let (key_text, modifiers) = parts.split_last().ok_or("empty held shortcut")?;
+    for modifier in modifiers {
+        apply_modifier(&mut shortcut, modifier)?;
+    }
+    // The last part is a modifier too when the whole shortcut is just
+    // modifiers, which is what makes `Ctrl`, `Ctrl+Shift` and `Alt` valid.
+    match shortcut_modifier(key_text) {
+        Some(None) => return Err("empty held shortcut modifier"),
+        Some(Some(modifier)) => apply_named_modifier(&mut shortcut, modifier),
+        // A lone non-modifier key needs no modifier at all: it is only watched
+        // while a pin is click-through, never registered with the shell.
+        None => shortcut.key = Some(parse_hotkey_key(key_text)?),
+    }
+    if !(shortcut.ctrl || shortcut.shift || shortcut.alt || shortcut.win || shortcut.key.is_some())
+    {
+        return Err("held shortcut needs a key");
+    }
+    Ok(Some(shortcut))
+}
+/// Modifiers of a parsed shortcut, in canonical order.
+fn apply_modifier<T>(shortcut: &mut T, modifier: &str) -> Result<(), &'static str>
+where
+    T: ModifierFlags,
+{
+    match shortcut_modifier(modifier) {
+        Some(Some(modifier)) => {
+            shortcut.set_modifier(modifier);
+            Ok(())
+        }
+        Some(None) => Err("empty hotkey modifier"),
+        None => Err("unknown hotkey modifier"),
+    }
+}
+/// Resolves a text part that names a modifier. `Some(None)` is an empty part, a
+/// shape the callers reject with their own message.
+fn shortcut_modifier(text: &str) -> Option<Option<Modifier>> {
+    if text.is_empty() {
+        return Some(None);
+    }
+    match text.to_ascii_lowercase().as_str() {
+        "ctrl" | "control" => Some(Some(Modifier::Ctrl)),
+        "shift" => Some(Some(Modifier::Shift)),
+        "alt" => Some(Some(Modifier::Alt)),
+        "win" | "super" | "meta" => Some(Some(Modifier::Win)),
+        _ => None,
+    }
+}
+fn apply_named_modifier<T>(shortcut: &mut T, modifier: Modifier)
+where
+    T: ModifierFlags,
+{
+    shortcut.set_modifier(modifier);
+}
+/// Modifier flag shared by `Hotkey` and `HeldShortcut`, so parsing them cannot
+/// drift apart.
+enum Modifier {
+    Ctrl,
+    Shift,
+    Alt,
+    Win,
+}
+trait ModifierFlags {
+    fn set_modifier(&mut self, modifier: Modifier);
+}
+impl ModifierFlags for Hotkey {
+    fn set_modifier(&mut self, modifier: Modifier) {
+        match modifier {
+            Modifier::Ctrl => self.ctrl = true,
+            Modifier::Shift => self.shift = true,
+            Modifier::Alt => self.alt = true,
+            Modifier::Win => self.win = true,
+        }
+    }
+}
+impl ModifierFlags for HeldShortcut {
+    fn set_modifier(&mut self, modifier: Modifier) {
+        match modifier {
+            Modifier::Ctrl => self.ctrl = true,
+            Modifier::Shift => self.shift = true,
+            Modifier::Alt => self.alt = true,
+            Modifier::Win => self.win = true,
+        }
+    }
 }
 fn parse_hotkey_key(text: &str) -> Result<HotkeyKey, &'static str> {
     let upper = text.to_ascii_uppercase();
@@ -372,6 +504,39 @@ pub struct Viewport {
     pub dpi: f32,
     /// Screen position of the image origin, so chrome can report screen pixels.
     pub origin: ScreenPoint,
+    /// Zoom applied to the document inside the viewport. `1.0` shows image pixels
+    /// 1:1; smaller values shrink a document taller than the window to fit it.
+    pub scale: f32,
+    /// Where the document's top-left corner lands inside the viewport, in view
+    /// pixels, after `scale`.
+    pub offset_x: f32,
+    pub offset_y: f32,
+}
+impl Viewport {
+    /// A 1:1 view: one image pixel per view pixel, document origin at the corner.
+    pub fn plain(width: u32, height: u32, dpi: f32, origin: ScreenPoint) -> Self {
+        Self {
+            width,
+            height,
+            dpi,
+            origin,
+            scale: 1.0,
+            offset_x: 0.0,
+            offset_y: 0.0,
+        }
+    }
+    /// Maps a point in image pixels to view pixels.
+    pub fn to_view(self, x: f32, y: f32) -> (f32, f32) {
+        (
+            x * self.scale + self.offset_x,
+            y * self.scale + self.offset_y,
+        )
+    }
+    /// Maps a point in view pixels back to image pixels.
+    pub fn to_image(self, x: f32, y: f32) -> (f32, f32) {
+        let scale = if self.scale > 0.0 { self.scale } else { 1.0 };
+        ((x - self.offset_x) / scale, (y - self.offset_y) / scale)
+    }
 }
 pub trait CanvasRenderer {
     type Error;
@@ -427,6 +592,10 @@ pub struct Config {
     pub capture_hotkey: String,
     /// Global shortcut that restores interaction for click-through pins.
     pub restore_hotkey: String,
+    /// Shortcut held down to interact with click-through pins. Unlike the two
+    /// shortcuts above this one is not registered with the shell, so a lone
+    /// modifier such as `Ctrl` is allowed.
+    pub through_hotkey: String,
     /// Automatic region detection under the cursor.
     pub window_detect: WindowDetect,
 }
@@ -451,6 +620,7 @@ impl Default for Config {
             capture_dir: None,
             capture_hotkey: DEFAULT_CAPTURE_HOTKEY.into(),
             restore_hotkey: DEFAULT_RESTORE_HOTKEY.into(),
+            through_hotkey: DEFAULT_THROUGH_HOTKEY.into(),
             window_detect: WindowDetect::default(),
         }
     }
@@ -483,6 +653,7 @@ impl Config {
         }
         parse_hotkey(&self.capture_hotkey).map_err(|_| "invalid capture hotkey")?;
         parse_hotkey(&self.restore_hotkey).map_err(|_| "invalid restore hotkey")?;
+        parse_held_shortcut(&self.through_hotkey).map_err(|_| "invalid through hotkey")?;
         Ok(())
     }
 }
@@ -735,6 +906,43 @@ mod tests {
         };
         assert_eq!(config.validate(), Err("invalid restore hotkey"));
         assert!(Config::default().validate().is_ok());
+    }
+    #[test]
+    fn held_shortcuts_accept_modifiers_keys_and_combinations() {
+        let held = |text: &str| parse_held_shortcut(text).unwrap().unwrap();
+        // A lone modifier, which the registered shortcuts must reject.
+        assert_eq!(held("Ctrl").canonical(), DEFAULT_THROUGH_HOTKEY);
+        assert!(parse_hotkey("Ctrl").is_err());
+        assert_eq!(held("ctrl+shift").canonical(), "Ctrl+Shift");
+        assert_eq!(held("alt").canonical(), "Alt");
+        assert_eq!(held("Win").canonical(), "Win");
+        // A lone key needs no modifier: nothing is registered with the shell.
+        let a = held("a");
+        assert_eq!(a.key, Some(HotkeyKey::Letter('A')));
+        assert_eq!(a.canonical(), "A");
+        assert_eq!(held("F8").key, Some(HotkeyKey::Function(8)));
+        let combo = held("Ctrl+Alt+F12");
+        assert_eq!((combo.ctrl, combo.alt), (true, true));
+        assert_eq!(combo.key, Some(HotkeyKey::Function(12)));
+        assert_eq!(combo.canonical(), "Ctrl+Alt+F12");
+        assert_eq!(held("  Ctrl + 5 ").key, Some(HotkeyKey::Digit('5')));
+    }
+    #[test]
+    fn invalid_held_shortcuts_are_rejected() {
+        for text in ["", "   ", "Ctrl+", "Ctrl+Shift+F25", "Foo", "Ctrl+Esc"] {
+            assert!(
+                parse_held_shortcut(text).is_err(),
+                "{text} should be rejected"
+            );
+        }
+        let config = Config {
+            through_hotkey: "Ctrl+".into(),
+            ..Config::default()
+        };
+        assert_eq!(config.validate(), Err("invalid through hotkey"));
+        // A configuration written before the option existed keeps the default.
+        let config: Config = serde_json::from_str("{\"version\":1}").unwrap();
+        assert_eq!(config.through_hotkey, DEFAULT_THROUGH_HOTKEY);
     }
     #[test]
     fn config_requires_a_usable_capture_directory() {
