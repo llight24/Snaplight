@@ -1,10 +1,11 @@
 use snaplight_domain::*;
 use snaplight_platform::popup_menu::{Entry, Item};
-use snaplight_platform::{popup_menu, read_pixels, Capabilities, WindowService};
+use snaplight_platform::{confirm, popup_menu, read_pixels, Capabilities, WindowService};
 use snaplight_render_win::{Gpu, StaticSurface};
 use std::{
     io::{BufRead, BufReader},
     path::PathBuf,
+    process::{Child, Command},
     sync::{Arc, Mutex},
 };
 use windows::{
@@ -13,10 +14,20 @@ use windows::{
         Foundation::*,
         Graphics::Gdi::*,
         System::{Com::*, LibraryLoader::*},
-        UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+        UI::{
+            HiDpi::GetDpiForWindow,
+            Input::{
+                GetRawInputData, HRAWINPUT, KeyboardAndMouse::*, RAWINPUT, RAWINPUTDEVICE,
+                RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEKEYBOARD,
+                RegisterRawInputDevices,
+            },
+            WindowsAndMessaging::*,
+        },
     },
 };
 
+/// Drop shadow of a pin: metrics, geometry and the composed bitmap.
+mod shadow;
 const INCOMING: u32 = WM_APP + 51;
 const CLOSED: u32 = WM_APP + 52;
 /// Posted by a pin window after a command that can change whether any pin is
@@ -31,26 +42,82 @@ const HELD_TIMER: usize = 1;
 /// Short enough that holding the key feels immediate, long enough that the
 /// polling stays negligible next to the compositor's own work.
 const HELD_POLL_MS: u32 = 16;
+/// Posted by the thread that waits for an annotation session's editor process,
+/// so the pin can pick up the picture the session wrote back.
+const EDIT_DONE: u32 = WM_APP + 54;
+/// Thickness of the frame that marks the pin the pointer last clicked, in
+/// physical pixels on screen.
+const OUTLINE_PX: f32 = 2.0;
 /// Entry indices of the pin context menu, in display order.
 mod pin_item {
-    pub const THROUGH: usize = 0;
-    pub const DESTROY: usize = 2;
+    pub const EDIT: usize = 0;
+    pub const THROUGH: usize = 1;
+    pub const RESET: usize = 2;
+    pub const SHADOW: usize = 3;
+    pub const DESTROY: usize = 5;
 }
 /// Pin context menu content, drawn by the same owner-drawn card as the tray
 /// menu. `restore_hotkey` is the shortcut that brings interaction back after the
 /// pin goes click-through and `through_hotkey` the one that only does so while
 /// it is held; both are shown on the right of that entry. Destroying the pin
 /// discards the image the user pinned, so it is drawn in red.
-fn menu_entries(restore_hotkey: &str, through_hotkey: &str) -> Vec<Entry> {
+///
+/// Restoring the original size lives here instead of on a double-click: the
+/// double-click now closes the pin (the "close" gesture the user asked for), so
+/// the size reset needs a home that says what it does.
+///
+/// The shadow entry names what it does instead of naming a state: the card has
+/// no checkmark to show one, and the shadow being on or off is visible on the
+/// desktop anyway.
+fn menu_entries(restore_hotkey: &str, through_hotkey: &str, shadow_on: bool) -> Vec<Entry> {
     let mut through = Item::new("鼠标穿透").with_shortcut(restore_hotkey);
     if !through_hotkey.is_empty() && through_hotkey != restore_hotkey {
         through = through.with_hint(format!("按住 {through_hotkey} 临时交互"));
     }
+    let shadow = if shadow_on {
+        "关闭阴影"
+    } else {
+        "开启阴影"
+    };
     vec![
+        // Annotating a pin again is the first thing the menu can do to it, and
+        // the hint teaches the shortcut that does the same from the pointer.
+        Entry::Item(Item::new("编辑标注").with_hint("空格")),
         Entry::Item(through),
+        Entry::Item(Item::new("恢复原始大小")),
+        Entry::Item(Item::new(shadow)),
         Entry::Separator,
         Entry::Item(Item::new("销毁").danger()),
     ]
+}
+/// Shadow state of one pin: what the configuration supplies plus the choice
+/// made in this pin's context menu.
+#[derive(Clone, Copy, Debug)]
+struct Shadow {
+    /// Metrics as configured, in logical pixels at 96 DPI.
+    settings: shadow::Settings,
+    /// Scale of the monitor the pin opened on, so a shadow keeps the same
+    /// visual thickness on every display.
+    dpi: f32,
+    /// What the configuration says a new pin gets; re-read on reload.
+    default_on: bool,
+    /// The per-pin choice from the context menu; `None` follows the default.
+    /// It deliberately survives a reload: changing the metrics in the settings
+    /// must not switch a shadow the user turned off back on.
+    choice: Option<bool>,
+}
+impl Shadow {
+    fn enabled(&self) -> bool {
+        self.choice.unwrap_or(self.default_on)
+    }
+    /// Metrics in physical pixels at 100% zoom, or `None` without a shadow.
+    fn params(&self) -> Option<shadow::Params> {
+        self.enabled().then(|| self.settings.at(self.dpi))
+    }
+    /// Room the shadow needs around the image at 100% zoom.
+    fn margin(&self) -> i32 {
+        self.params().map(|params| params.margin()).unwrap_or(0)
+    }
 }
 struct Pin {
     hwnd: HWND,
@@ -64,13 +131,149 @@ struct Pin {
     /// True while the held shortcut is temporarily restoring interaction, so the
     /// release restores click-through without waiting for the next poll.
     temporary: bool,
+    /// True while the pointer has clicked this pin and not left it again: the pin
+    /// is outlined, and pressing the annotation shortcut here opens its session,
+    /// so a key the rest of the desktop also uses is only ever read when the user
+    /// has just put the pointer on a pin on purpose.
+    armed: bool,
+    /// True while an annotation session is running for this pin, so the shortcut
+    /// and the context menu cannot start a second one.
+    editing: bool,
     scale: f32,
     opacity: f32,
+    /// Colour of the frame that marks an armed pin, from the configured theme.
+    accent: [f32; 4],
+    /// Drop shadow drawn behind the capture. The window reserves its margin, so
+    /// the pin is larger than the image whenever it is on.
+    shadow: Shadow,
     /// Shortcut hints shown in the context menu, resolved at startup.
     restore_hotkey: String,
     through_hotkey: String,
 }
+/// Nearest-neighbour zoom of a capture that has no shadow to compose. The
+/// descriptor describes the scaled bitmap, not the file, so callers can size the
+/// window and the DIB from it without a second formula.
+fn scaled_image(
+    image: &ImageDescriptor,
+    bytes: &[u8],
+    scale: f32,
+) -> std::result::Result<(ImageDescriptor, Vec<u8>), Box<dyn std::error::Error>> {
+    if bytes.len() < image.byte_len().map_err(|e| e.to_string())? {
+        return Err("pixel buffer is shorter than the image".into());
+    }
+    let (width, height) = shadow::composed_size(image.width, image.height, 0, scale);
+    let stride = width.checked_mul(4).ok_or("scaled image stride overflow")?;
+    let size = (stride as usize)
+        .checked_mul(height as usize)
+        .ok_or("scaled image overflow")?;
+    let mut scaled = vec![0u8; size];
+    for y in 0..height {
+        for x in 0..width {
+            let sx = (x as u64 * image.width as u64 / u64::from(width.max(1))) as usize;
+            let sy = (y as u64 * image.height as u64 / u64::from(height.max(1))) as usize;
+            let src = sy * image.stride as usize + sx * 4;
+            let dest = (y as usize * width as usize + x as usize) * 4;
+            scaled[dest..dest + 4].copy_from_slice(&bytes[src..src + 4]);
+        }
+    }
+    Ok((
+        ImageDescriptor {
+            id: image.id,
+            width,
+            height,
+            stride,
+            format: image.format,
+            alpha: image.alpha,
+            color_space: image.color_space,
+        },
+        scaled,
+    ))
+}
 impl Pin {
+    /// The bitmap this pin presents: the capture, plus its shadow when it has
+    /// one, both at `scale` (the surface path zooms with a transform, so it
+    /// composes at 100% instead).
+    fn composed_at(
+        &self,
+        scale: f32,
+    ) -> std::result::Result<(ImageDescriptor, Vec<u8>), Box<dyn std::error::Error>> {
+        let (image, bytes) = read_pixels(&self.path)?;
+        if let Some(params) = self.shadow.params() {
+            return shadow::compose(&image, &bytes, &params, scale);
+        }
+        if shadow::composed_size(image.width, image.height, 0, scale) == (image.width, image.height)
+        {
+            return Ok((image, bytes));
+        }
+        scaled_image(&image, &bytes, scale)
+    }
+    /// The bitmap this pin presents, framed while it is armed so the pointer's
+    /// target is visible before the annotation session opens. `zoom` is the scale
+    /// the bitmap itself is drawn at: the layered path composes at the pin's
+    /// zoom, the surface path composes at 100% and zooms with a transform, so the
+    /// frame is `OUTLINE_PX` physical pixels in both.
+    fn bitmap(
+        &self,
+        zoom: f32,
+    ) -> std::result::Result<(ImageDescriptor, Vec<u8>), Box<dyn std::error::Error>> {
+        let (image, mut bytes) = self.composed_at(zoom)?;
+        if self.armed {
+            let margin = shadow::scaled_margin(self.shadow.margin(), zoom) as i32;
+            let thickness = (OUTLINE_PX / zoom).round().max(1.0) as i32;
+            draw_outline(
+                &mut bytes,
+                &image,
+                (
+                    margin,
+                    margin,
+                    image.width as i32 - margin,
+                    image.height as i32 - margin,
+                ),
+                thickness,
+                self.accent,
+            );
+        }
+        Ok((image, bytes))
+    }
+    /// Margin the window reserves for the shadow at the current zoom.
+    fn margin(&self) -> i32 {
+        shadow::scaled_margin(self.shadow.margin(), self.scale) as i32
+    }
+    /// Size of the window: the zoomed image plus the shadow margin on every
+    /// side, from the same formula the composed bitmap is sized with.
+    fn window_size(&self) -> (i32, i32) {
+        let (width, height) = shadow::composed_size(
+            self.image.width,
+            self.image.height,
+            self.shadow.margin(),
+            self.scale,
+        );
+        (width as i32, height as i32)
+    }
+    /// Resizes and moves the window, keeping the image on the screen pixels it
+    /// occupies: the capture sits `margin` inside the window, so a margin that
+    /// changed by `previous - margin` moves the window's origin the other way.
+    /// Without this, toggling the shadow would shift the pin by the margin.
+    unsafe fn place(
+        &mut self,
+        previous_margin: i32,
+        flags: SET_WINDOW_POS_FLAGS,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut rect = RECT::default();
+        GetWindowRect(self.hwnd, &mut rect)?;
+        let (width, height) = self.window_size();
+        let margin = self.margin();
+        SetWindowPos(
+            self.hwnd,
+            HWND_TOPMOST,
+            rect.left + previous_margin - margin,
+            rect.top + previous_margin - margin,
+            width,
+            height,
+            flags,
+        )?;
+        Ok(())
+    }
     unsafe fn restore(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
         if self.is_click_through() || self.gpu.is_none() {
             return self.update_layered();
@@ -80,7 +283,9 @@ impl Pin {
             surface.opacity(self.opacity)?;
             return Ok(());
         }
-        let (image, bytes) = read_pixels(&self.path)?;
+        // The surface holds the bitmap at 100% and reaches the pin's zoom with
+        // its own scale transform, so the shadow is composed unscaled here.
+        let (image, bytes) = self.bitmap(1.0)?;
         // Coming back from click-through means the composition target of this
         // window has to be created again, and DirectComposition answers
         // `DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED` while it is still winding
@@ -105,26 +310,12 @@ impl Pin {
         Ok(())
     }
     unsafe fn update_layered(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let (image, mut bytes) = read_pixels(&self.path)?;
-        let width = (image.width as f32 * self.scale).max(1.0) as u32;
-        let height = (image.height as f32 * self.scale).max(1.0) as u32;
-        if width != image.width || height != image.height {
-            let size = (width as usize)
-                .checked_mul(height as usize)
-                .and_then(|n| n.checked_mul(4))
-                .ok_or("scaled image overflow")?;
-            let mut scaled = vec![0; size];
-            for y in 0..height {
-                for x in 0..width {
-                    let sx = (x as u64 * image.width as u64 / width as u64) as usize;
-                    let sy = (y as u64 * image.height as u64 / height as u64) as usize;
-                    let src = sy * image.stride as usize + sx * 4;
-                    let dest = (y as usize * width as usize + x as usize) * 4;
-                    scaled[dest..dest + 4].copy_from_slice(&bytes[src..src + 4]);
-                }
-            }
-            bytes = scaled;
-        }
+        // The composer already renders at this pin's zoom, so there is no
+        // second scaling step: this is the bitmap that goes on screen, shadow
+        // margin included.
+        let (image, bytes) = self.bitmap(self.scale)?;
+        let width = image.width;
+        let height = image.height;
         let desktop = GetDC(None);
         let memory = CreateCompatibleDC(desktop);
         let mut bits = std::ptr::null_mut();
@@ -213,6 +404,11 @@ impl Pin {
         if self.is_click_through() == was {
             return Ok(());
         }
+        // A click-through pin is no longer the pointer's target, so it cannot be
+        // waiting for the annotation shortcut either.
+        if self.is_click_through() {
+            self.armed = false;
+        }
         self.apply_through()
     }
     /// Applies the extended style for `is_click_through()` and redraws the pin.
@@ -224,6 +420,7 @@ impl Pin {
     /// no-redirection-bitmap style cannot be cleared afterwards, so both styles
     /// coexist and `restore` draws the image as a layered bitmap meanwhile.
     unsafe fn apply_through(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let previous = self.margin();
         self.surface = None;
         let through = self.is_click_through();
         let mut style = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
@@ -239,37 +436,192 @@ impl Pin {
         if through && self.gpu.is_some() {
             self.scale = 1.0;
         }
-        SetWindowPos(
-            self.hwnd,
-            HWND_TOPMOST,
-            0,
-            0,
-            (self.image.width as f32 * self.scale) as i32,
-            (self.image.height as f32 * self.scale) as i32,
-            SWP_NOMOVE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        )?;
+        self.place(previous, SWP_NOACTIVATE | SWP_FRAMECHANGED)?;
         self.restore()
     }
     unsafe fn zoom(&mut self, value: f32) -> std::result::Result<(), Box<dyn std::error::Error>> {
         if self.is_click_through() {
             return Ok(());
         }
+        let previous = self.margin();
         self.scale = value.clamp(0.1, 4.0);
         if let Some(surface) = &self.surface {
             surface.scale(self.scale)?;
         } else {
             self.update_layered()?;
         }
-        SetWindowPos(
-            self.hwnd,
-            HWND_TOPMOST,
-            0,
-            0,
-            (self.image.width as f32 * self.scale).max(1.0) as i32,
-            (self.image.height as f32 * self.scale).max(1.0) as i32,
-            SWP_NOMOVE | SWP_NOACTIVATE,
-        )?;
-        Ok(())
+        // Zoom grows the window, and with a shadow also grows the margin: the
+        // window's origin moves so the capture keeps its place on screen.
+        self.place(previous, SWP_NOACTIVATE)
+    }
+    /// Records the choice made in this pin's context menu and redraws it.
+    unsafe fn set_shadow(
+        &mut self,
+        enabled: bool,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        if self.shadow.enabled() == enabled {
+            return Ok(());
+        }
+        // The margin the window still has, needed to keep the capture in place.
+        let previous = self.margin();
+        self.shadow.choice = Some(enabled);
+        self.refresh_shadow(previous)
+    }
+    /// Rebuilds the presented bitmap after the shadow changed, either from the
+    /// context menu or from the settings. The window is resized and moved first
+    /// so the capture keeps its screen position while the margin changes, then
+    /// the new bitmap is presented.
+    unsafe fn refresh_shadow(
+        &mut self,
+        previous_margin: i32,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        self.surface = None;
+        self.place(previous_margin, SWP_NOACTIVATE)?;
+        self.restore()
+    }
+    /// Marks this pin as the pointer's target — or takes that back — and shows
+    /// the frame that says so. The frame lives in the presented bitmap, so the
+    /// pin is re-presented at once.
+    unsafe fn arm(&mut self, armed: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        if self.armed == armed {
+            return Ok(());
+        }
+        self.armed = armed;
+        self.refresh()
+    }
+    /// Presents the pin again: reloads the picture (an annotation session
+    /// rewrites the file while the pin is on screen), resizes the window when the
+    /// picture changed size, and uploads the bitmap. The surface path keeps the
+    /// bitmap it was built from, so it is rebuilt rather than rescaled.
+    unsafe fn refresh(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (image, _) = read_pixels(&self.path)?;
+        if image.width != self.image.width || image.height != self.image.height {
+            self.image = image;
+            let margin = self.margin();
+            self.surface = None;
+            self.place(margin, SWP_NOACTIVATE)?;
+            return self.restore();
+        }
+        if self.gpu.is_none() || self.is_click_through() {
+            return self.update_layered();
+        }
+        self.surface = None;
+        self.restore()
+    }
+    /// Screen rectangle the picture occupies: the window without the shadow
+    /// margin, which is what an annotation session has to cover.
+    unsafe fn picture_rect(&self) -> RECT {
+        let mut rect = RECT::default();
+        if GetWindowRect(self.hwnd, &mut rect).is_err() {
+            return rect;
+        }
+        let margin = self.margin();
+        let width = (self.image.width as f32 * self.scale).round() as i32;
+        let height = (self.image.height as f32 * self.scale).round() as i32;
+        RECT {
+            left: rect.left + margin,
+            top: rect.top + margin,
+            right: rect.left + margin + width,
+            bottom: rect.top + margin + height,
+        }
+    }
+}
+/// Draws a frame of one opaque colour along the inside of `area`, where the
+/// picture sits inside a composed bitmap: the mark of the pin the pointer last
+/// clicked, so the target of the annotation shortcut is visible before the
+/// session opens.
+fn draw_outline(
+    bytes: &mut [u8],
+    image: &ImageDescriptor,
+    area: (i32, i32, i32, i32),
+    thickness: i32,
+    color: [f32; 4],
+) {
+    let (left, top, right, bottom) = area;
+    if thickness < 1 || right - left <= 2 * thickness || bottom - top <= 2 * thickness {
+        return;
+    }
+    let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    // BGRA8 and opaque: the frame has to mark the pin over any picture.
+    let pixel = [byte(color[2]), byte(color[1]), byte(color[0]), 255];
+    let (width, height) = (image.width as i32, image.height as i32);
+    let mut put = |x: i32, y: i32| {
+        if x < 0 || y < 0 || x >= width || y >= height {
+            return;
+        }
+        let n = (y as usize * width as usize + x as usize) * 4;
+        if n + 4 <= bytes.len() {
+            bytes[n..n + 4].copy_from_slice(&pixel);
+        }
+    };
+    for band in 0..thickness {
+        for x in left + band..right - band {
+            put(x, top + band);
+            put(x, bottom - 1 - band);
+        }
+        for y in top + band..bottom - band {
+            put(left + band, y);
+            put(right - 1 - band, y);
+        }
+    }
+}
+/// Starts the editor on this pin's files, so the pinned picture can be annotated
+/// again. `demo` runs the editor's scripted session instead of showing a window,
+/// which is how the handoff is checked without a user.
+fn spawn_pin_editor(pin: &Pin, demo: bool) -> std::io::Result<Child> {
+    let rect = unsafe { pin.picture_rect() };
+    let flag = if demo { "--edit-pin-demo" } else { "--edit-pin" };
+    Command::new(snaplight_platform::sibling("snaplight-editor")?)
+        .arg(format!("{flag}={}", pin.path.display()))
+        .arg(format!(
+            "--pin-rect={},{},{},{}",
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top
+        ))
+        .spawn()
+}
+/// Opens an annotation session on a pin: the editor loads the document the
+/// capture was pinned with and writes the annotated picture back into the same
+/// files, which the pin reloads when that process exits.
+unsafe fn open_annotation(
+    pin: &mut Pin,
+    demo: bool,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    if pin.editing || pin.closed {
+        return Ok(());
+    }
+    let mut child = spawn_pin_editor(pin, demo)?;
+    pin.editing = true;
+    // The session's own window is the feedback from here on.
+    pin.arm(false)?;
+    // The window handle is carried as an integer: window handles are not `Send`,
+    // and the waiter only has to post one message to it.
+    let control = pin.control.0 as isize;
+    let address = (pin as *const Pin) as usize;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        unsafe {
+            let _ = PostMessageW(
+                HWND(control as *mut core::ffi::c_void),
+                EDIT_DONE,
+                WPARAM(address),
+                LPARAM(0),
+            );
+        }
+    });
+    Ok(())
+}
+/// Scale of the display a pin window sits on (1.0 = 96 DPI). The pin's content
+/// is physical pixels, so the shadow metrics are scaled by this to keep the same
+/// visual thickness on every display. A query that fails reports 100%.
+unsafe fn window_dpi_scale(hwnd: HWND) -> f32 {
+    let dpi = GetDpiForWindow(hwnd);
+    if dpi == 0 {
+        1.0
+    } else {
+        (dpi as f32 / 96.0).clamp(1.0, 4.0)
     }
 }
 struct NativeWindows;
@@ -304,13 +656,20 @@ impl WindowService for NativeWindows {
 /// another path while it is open (a `CloseAll` command, or the destroy entry of
 /// a second menu); the window is re-checked before it is touched.
 unsafe fn show_pin_menu(pin: &mut Pin) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let entries = menu_entries(&pin.restore_hotkey, &pin.through_hotkey);
+    let entries = menu_entries(
+        &pin.restore_hotkey,
+        &pin.through_hotkey,
+        pin.shadow.enabled(),
+    );
     let choice = popup_menu::show(&entries, None);
     if pin.closed || !IsWindow(pin.hwnd).as_bool() {
         return Ok(());
     }
     match choice {
+        Some(pin_item::EDIT) => open_annotation(pin, false)?,
         Some(pin_item::THROUGH) => toggle_through(pin)?,
+        Some(pin_item::RESET) => pin.zoom(1.0)?,
+        Some(pin_item::SHADOW) => pin.set_shadow(!pin.shadow.enabled())?,
         Some(pin_item::DESTROY) => {
             PostMessageW(pin.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0))?;
         }
@@ -331,15 +690,113 @@ unsafe fn toggle_through(pin: &mut Pin) -> std::result::Result<(), Box<dyn std::
     PostMessageW(control, HELD_SYNC, WPARAM(0), LPARAM(0))?;
     Ok(())
 }
-/// Presses or releases the control key through `SendInput`, so the smoke can
-/// check that the held shortcut is really read back from the keyboard. Only the
-/// opt-in smoke step calls this: it presses a key on the user's desktop.
-unsafe fn send_control(down: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
+/// Text of the prompt shown before a double-clicked pin is closed.
+fn close_options() -> confirm::Options {
+    confirm::Options {
+        title: "关闭贴图".into(),
+        message: "关闭后贴图会从桌面移除，截图文件仍保留。".into(),
+        checkbox: Some("下次不再提醒".into()),
+        confirm: "关闭贴图".into(),
+        cancel: "取消".into(),
+    }
+}
+
+/// Whether closing a pin asks first. Read from the configuration at the moment
+/// of the double-click rather than at startup: the prompt writes the "don't ask
+/// again" answer into this very field, and the settings switch has to take
+/// effect without the pin process being restarted.
+fn close_confirmation_enabled() -> bool {
+    match snaplight_platform::load_config() {
+        Ok(config) => config.pin_close_confirm,
+        // A configuration that cannot be read must not silently drop a
+        // confirmation, and closing a pin throws away what the user pinned, so
+        // asking is the conservative answer.
+        Err(error) => {
+            eprintln!("pin close confirmation setting unreadable ({error}); asking anyway");
+            true
+        }
+    }
+}
+
+/// Persists "don't ask again". The configuration is re-read first so this write
+/// cannot roll back a change the settings window saved in the meantime.
+fn remember_no_confirmation() {
+    let result = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut config = snaplight_platform::load_config()?;
+        if config.pin_close_confirm {
+            config.pin_close_confirm = false;
+            snaplight_platform::save_config(&config)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        // The pin still closes: the user asked for that, and a configuration
+        // that cannot be written is not a reason to keep it on screen.
+        eprintln!("could not remember the pin close confirmation: {error}");
+    }
+}
+
+/// Closes the pin the user double-clicked, asking first unless the
+/// configuration turned the prompt off. The prompt cannot be shown at all only
+/// when the environment refuses the window; the pin then stays on screen, and
+/// the context menu still closes it.
+unsafe fn close_pin(pin: &mut Pin) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    if close_confirmation_enabled() {
+        let mut rect = RECT::default();
+        GetWindowRect(pin.hwnd, &mut rect)?;
+        let anchor = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+        match confirm::ask(pin.hwnd, anchor, &close_options()) {
+            Ok(answer) => {
+                if !answer.accepted {
+                    return Ok(());
+                }
+                if answer.remember {
+                    remember_no_confirmation();
+                }
+            }
+            Err(error) => {
+                eprintln!("pin close confirmation failed: {error}");
+                return Ok(());
+            }
+        }
+    }
+    if pin.closed || !IsWindow(pin.hwnd).as_bool() {
+        return Ok(());
+    }
+    PostMessageW(pin.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0))?;
+    Ok(())
+}
+
+/// Pumps this thread's message queue for `timeout_ms`. An annotation session runs
+/// in the editor process and reaches its pin as a posted message, so a smoke step
+/// that waits for one has to keep this queue moving.
+fn pump_messages(timeout_ms: i32) {
+    let mut waited = 0;
+    while waited < timeout_ms {
+        let mut message = MSG::default();
+        unsafe {
+            if PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                waited += 20;
+            }
+        }
+    }
+}
+/// Presses or releases one key through `SendInput`, so the smoke can check that a
+/// shortcut is really read back from the keyboard. Only opt-in smoke steps call
+/// this: they press a key on the user's desktop.
+unsafe fn send_key(
+    key: VIRTUAL_KEY,
+    down: bool,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let input = INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: VK_CONTROL,
+                wVk: key,
                 wScan: 0,
                 dwFlags: if down {
                     KEYBD_EVENT_FLAGS(0)
@@ -352,10 +809,292 @@ unsafe fn send_control(down: bool) -> std::result::Result<(), Box<dyn std::error
         },
     };
     if SendInput(&[input], std::mem::size_of::<INPUT>() as i32) != 1 {
-        return Err("could not inject the held shortcut".into());
+        return Err("could not inject the shortcut key".into());
     }
     Ok(())
 }
+/// Answers the close prompt from another thread while the pin's window
+/// procedure is blocked inside it. A modal prompt cannot be clicked by the
+/// thread that is inside it, and sending keys to the prompt's procedure is also
+/// what keeps this check independent of the prompt taking focus from the user.
+///
+/// Returns once `keys` were delivered or the pin closed on its own, and fails
+/// when neither happened within a few seconds — a prompt that never appears is
+/// exactly what this has to catch. The window handle arrives as an address and
+/// the failure as a plain string, so nothing that is not `Send` crosses the
+/// thread boundary.
+fn answer_prompt(pin_address: usize, keys: &[u32]) -> std::result::Result<(), String> {
+    let pin = HWND(pin_address as *mut std::ffi::c_void);
+    for _ in 0..600 {
+        unsafe {
+            if !IsWindow(pin).as_bool() {
+                return Ok(());
+            }
+        }
+        if let Some(dialog) = unsafe { find_prompt(pin) } {
+            for key in keys {
+                unsafe { SendMessageW(dialog, WM_KEYDOWN, WPARAM(*key as usize), LPARAM(0)) };
+            }
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // Never leave a prompt unanswered: the smoke's main thread is blocked inside
+    // it, so a prompt nobody answers would hang the run instead of failing it.
+    if let Some(dialog) = unsafe { find_prompt(pin) } {
+        unsafe { SendMessageW(dialog, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+    }
+    Err("the pin close confirmation did not appear".into())
+}
+
+/// Finds the prompt owned by `pin`. The windows are enumerated instead of asked
+/// for by name: `FindWindowW` did not see a freshly created window on this
+/// machine before (see the tray menu record), and the owner check also keeps two
+/// pins' prompts apart.
+unsafe fn find_prompt(pin: HWND) -> Option<HWND> {
+    struct Search {
+        pin: HWND,
+        found: HWND,
+    }
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = &mut *(lparam.0 as *mut Search);
+        let mut class = [0u16; 128];
+        let length = GetClassNameW(hwnd, &mut class);
+        let is_prompt = length > 0
+            && String::from_utf16_lossy(&class[..length as usize]) == confirm::WINDOW_CLASS;
+        let owned = GetWindow(hwnd, GW_OWNER)
+            .map(|owner| owner == search.pin)
+            .unwrap_or(false);
+        if is_prompt && owned {
+            search.found = hwnd;
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+    let mut search = Search {
+        pin,
+        found: HWND::default(),
+    };
+    let _ = EnumWindows(Some(visit), LPARAM((&mut search as *mut Search) as isize));
+    (!search.found.0.is_null()).then_some(search.found)
+}
+
+/// Joins the thread that answers the prompt and reports its failure.
+fn join_answer(
+    worker: std::thread::JoinHandle<std::result::Result<(), String>>,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    worker
+        .join()
+        .map_err(|_| "the prompt answer thread panicked")??;
+    Ok(())
+}
+
+/// Double-clicks `pin` the way the system reports a click on its caption, then
+/// processes what that posted, and reports whether the pin window is gone.
+unsafe fn double_click_close(pin: HWND) -> bool {
+    let _ = SendMessageW(pin, WM_NCLBUTTONDBLCLK, WPARAM(0), LPARAM(0));
+    let mut queued = MSG::default();
+    while PeekMessageW(&mut queued, pin, 0, 0, PM_REMOVE).as_bool() {
+        let _ = TranslateMessage(&queued);
+        DispatchMessageW(&queued);
+    }
+    !IsWindow(pin).as_bool()
+}
+
+/// Window class of the plain window the shadow checks read the screen against.
+const BACKDROP_CLASS: PCWSTR = w!("Snaplight.SmokeBackdrop");
+
+/// Creates a solid-coloured window behind the pins. The smoke runs on a real
+/// desktop, so putting a known colour under the pin is the only way to tell a
+/// drawn shadow from whatever the user happens to have open there. It is
+/// created before the pin so the pin stays above it.
+unsafe fn backdrop(
+    rect: RECT,
+    color: COLORREF,
+) -> std::result::Result<HWND, Box<dyn std::error::Error>> {
+    let instance = GetModuleHandleW(None)?;
+    let class = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        hInstance: instance.into(),
+        lpszClassName: BACKDROP_CLASS,
+        lpfnWndProc: Some(backdrop_proc),
+        // The window paints nothing itself; the class brush is the colour.
+        hbrBackground: CreateSolidBrush(color),
+        ..Default::default()
+    };
+    let registered = RegisterClassW(&class);
+    if registered == 0 {
+        let error = Error::from_win32();
+        if error.code() != HRESULT::from_win32(ERROR_CLASS_ALREADY_EXISTS.0) {
+            return Err(error.into());
+        }
+    }
+    let hwnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        BACKDROP_CLASS,
+        w!("Snaplight Smoke Backdrop"),
+        WS_POPUP,
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        None,
+        None,
+        instance,
+        None,
+    )?;
+    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    Ok(hwnd)
+}
+
+/// Requires the desktop pixel at `(x, y)` to satisfy `matches` within a second,
+/// reporting what the desktop showed instead. The pins are layered windows on a
+/// live desktop, so the label says what the pixel is supposed to be.
+unsafe fn require_pixel(
+    x: i32,
+    y: i32,
+    what: &str,
+    matches: impl Fn((u8, u8, u8)) -> bool,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    match wait_for_pixel(x, y, matches) {
+        Ok(_) => Ok(()),
+        Err(pixel) => Err(format!("{what} at ({x}, {y}); the screen shows {pixel:?}").into()),
+    }
+}
+
+/// The backdrop has no behaviour of its own: the class brush paints it.
+unsafe extern "system" fn backdrop_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    DefWindowProcW(hwnd, msg, w, l)
+}
+
+/// Reads one pixel of the composed desktop as straight `(r, g, b)`.
+unsafe fn screen_pixel(x: i32, y: i32) -> Option<(u8, u8, u8)> {
+    let desktop = GetDC(None);
+    let value = GetPixel(desktop, x, y);
+    ReleaseDC(None, desktop);
+    if value.0 == CLR_INVALID {
+        return None;
+    }
+    Some((
+        (value.0 & 0xff) as u8,
+        ((value.0 >> 8) & 0xff) as u8,
+        ((value.0 >> 16) & 0xff) as u8,
+    ))
+}
+
+/// Waits for the desktop pixel at `(x, y)` to satisfy `matches`, for up to a
+/// second. A composition pin presents on the compositor's own schedule, so a
+/// single read can still show the frame before the change. `Err` carries the
+/// last pixel that was read, so a failure says what was there instead.
+unsafe fn wait_for_pixel(
+    x: i32,
+    y: i32,
+    matches: impl Fn((u8, u8, u8)) -> bool,
+) -> std::result::Result<(u8, u8, u8), (u8, u8, u8)> {
+    let mut last = (0, 0, 0);
+    for _ in 0..100 {
+        if let Some(pixel) = screen_pixel(x, y) {
+            if matches(pixel) {
+                return Ok(pixel);
+            }
+            last = pixel;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err(last)
+}
+
+/// Finds the popup menu window this process opened, if any. Only the pin's own
+/// menu can be open at this point and it belongs to this process, so its class
+/// name identifies it. Windows are enumerated instead of asked for by name:
+/// `FindWindowW` did not see a freshly created window on this machine before
+/// (see the tray menu record).
+unsafe fn find_popup_menu() -> Option<HWND> {
+    struct Search {
+        found: HWND,
+    }
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = &mut *(lparam.0 as *mut Search);
+        let mut class = [0u16; 128];
+        let length = GetClassNameW(hwnd, &mut class);
+        if length > 0
+            && String::from_utf16_lossy(&class[..length as usize]) == popup_menu::WINDOW_CLASS
+        {
+            search.found = hwnd;
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+    let mut search = Search {
+        found: HWND::default(),
+    };
+    let _ = EnumWindows(Some(visit), LPARAM((&mut search as *mut Search) as isize));
+    (!search.found.0.is_null()).then_some(search.found)
+}
+
+/// Presses and releases one row of `menu`, in coordinates taken from the same
+/// layout the menu draws with. The menu selects on the messages its own window
+/// procedure receives, so posting them is enough — the user's mouse is not
+/// moved and nothing is injected into the desktop.
+unsafe fn click_menu_row(menu: HWND, item: usize, entries: &[Entry]) -> Result<()> {
+    let mut window = RECT::default();
+    GetWindowRect(menu, &mut window)?;
+    let reference = popup_menu::render(entries, 1.0, None)?;
+    let row = reference
+        .layout
+        .rows
+        .iter()
+        .find(|row| row.entry == item)
+        .ok_or_else(|| Error::new(E_INVALIDARG, "the menu has no such row"))?;
+    // The rows are laid out in logical pixels, so the window the menu really
+    // opened at gives the scale (the monitor's) for every measurement.
+    let scale = (window.bottom - window.top) as f32 / reference.layout.height as f32;
+    let x = ((row.band.x as f32 + row.band.width as f32 / 2.0) * scale).round() as i32;
+    let y = ((row.band.y as f32 + row.band.height as f32 / 2.0) * scale).round() as i32;
+    let point = LPARAM((((x & 0xffff) | ((y & 0xffff) << 16)) as i32) as isize);
+    PostMessageW(menu, WM_MOUSEMOVE, WPARAM(0), point)?;
+    PostMessageW(menu, WM_LBUTTONDOWN, WPARAM(1), point)?;
+    PostMessageW(menu, WM_LBUTTONUP, WPARAM(0), point)?;
+    Ok(())
+}
+
+/// Picks one row of the pin menu, the way a user picks it.
+///
+/// It runs on its own thread because the caller is inside the menu's modal loop
+/// (the menu runs it inside `SendMessage`). If the menu never appears, the
+/// escape key is posted to the control window, which that loop reads, so a
+/// missing menu fails the smoke instead of hanging it.
+fn click_pin_menu(
+    pin_address: usize,
+    control_address: usize,
+    item: usize,
+    entries: Vec<Entry>,
+) -> std::result::Result<(), String> {
+    let pin = HWND(pin_address as *mut std::ffi::c_void);
+    let control = HWND(control_address as *mut std::ffi::c_void);
+    let escape = |control: HWND| unsafe {
+        let _ = PostMessageW(control, WM_KEYDOWN, WPARAM(VK_ESCAPE.0 as usize), LPARAM(0));
+    };
+    for _ in 0..600 {
+        unsafe {
+            // The pin can be gone (a close command arrived); nothing left to pick.
+            if !IsWindow(pin).as_bool() {
+                return Ok(());
+            }
+            if let Some(menu) = find_popup_menu() {
+                if let Err(error) = click_menu_row(menu, item, &entries) {
+                    escape(control);
+                    return Err(error.to_string());
+                }
+                return Ok(());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    escape(control);
+    Err("the pin menu did not open".into())
+}
+
 unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Pin;
     if !ptr.is_null() {
@@ -369,8 +1108,32 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 WM_ERASEBKGND => return Ok(Some(LRESULT(1))),
                 WM_MOUSEACTIVATE => return Ok(Some(LRESULT(MA_NOACTIVATE as isize))),
                 WM_NCHITTEST => return Ok(Some(LRESULT(HTCAPTION as isize))),
+                // Clicking a pin makes it the pointer's target: it is framed, and
+                // the annotation shortcut opens its session while the pointer
+                // stays on it. The window never takes focus, so this click cannot
+                // be the same gesture as typing into another application.
+                WM_NCLBUTTONDOWN => {
+                    pin.arm(true)?;
+                    return Ok(None);
+                }
+                // The frame is dropped as soon as the pointer leaves, so a pin does
+                // not stay selected behind the pointer's back.
+                WM_NCMOUSEMOVE => {
+                    let mut track = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE | TME_NONCLIENT,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut track);
+                    return Ok(None);
+                }
+                WM_NCMOUSELEAVE => {
+                    pin.arm(false)?;
+                    return Ok(Some(LRESULT(0)));
+                }
                 WM_NCLBUTTONDBLCLK => {
-                    pin.zoom(1.0)?;
+                    close_pin(pin)?;
                     return Ok(Some(LRESULT(0)));
                 }
                 WM_MOUSEWHEEL => {
@@ -450,6 +1213,14 @@ struct Host {
     /// Window timer watching the held shortcut, armed only while a pin is
     /// click-through.
     held_timer: Option<usize>,
+    /// Shadow metrics a new pin starts from, in logical pixels at 96 DPI. The
+    /// settings window refreshes them with [`Host::reload`].
+    shadow: shadow::Settings,
+    /// Whether a new pin draws a shadow by default.
+    shadow_default: bool,
+    /// Colour of the frame that marks the pin the pointer clicked, from the
+    /// configured theme.
+    accent: [f32; 4],
 }
 impl Host {
     unsafe fn open(
@@ -463,7 +1234,10 @@ impl Host {
         if doc.version != 1 {
             return Err("unsupported pin document version".into());
         }
-        let (image, bytes) = read_pixels(&path)?;
+        // Only the size is needed to create the window and the shadow margin;
+        // the pixels are read again when the pin presents itself, so a pin that
+        // is never shown does not hold a copy of its capture.
+        let (image, _) = read_pixels(&path)?;
         let instance = GetModuleHandleW(None)?;
         // The pin opens where the region was captured, so pinning does not move
         // the image. The only adjustment is the width clamp for regions wider
@@ -489,43 +1263,82 @@ impl Host {
             instance,
             None,
         )?;
-        let surface = if let Some(gpu) = &self.gpu {
-            match StaticSurface::new(gpu, hwnd, &image, &bytes) {
-                Ok(v) => {
-                    v.scale(scale)?;
-                    Some(v)
-                }
-                Err(e) => {
-                    let _ = DestroyWindow(hwnd);
-                    return Err(e.into());
-                }
-            }
-        } else {
-            None
-        };
-        drop(bytes);
         let mut pin = Box::new(Pin {
             hwnd,
             control,
             gpu: self.gpu.clone(),
-            surface,
+            surface: None,
             path,
             image,
             closed: false,
             through: false,
             temporary: false,
+            armed: false,
+            editing: false,
             scale,
             opacity: 1.0,
+            accent: self.accent,
+            shadow: Shadow {
+                settings: self.shadow,
+                // The shadow follows the display the pin opens on, so it reads
+                // the same size as the rest of the interface there.
+                dpi: window_dpi_scale(hwnd),
+                default_on: self.shadow_default,
+                choice: None,
+            },
             restore_hotkey: self.restore_hotkey.clone(),
             through_hotkey: self.through_hotkey.clone(),
         });
-        if pin.gpu.is_none() {
-            pin.update_layered()?;
+        // The window was created at the captured position with the image's own
+        // size, so it starts with no shadow margin: growing it here is what
+        // leaves the image on the screen pixels it was captured from.
+        let rendering = pin.place(0, SWP_NOACTIVATE).and_then(|()| pin.restore());
+        if let Err(error) = rendering {
+            pin.closed = true;
+            let _ = DestroyWindow(hwnd);
+            return Err(error);
         }
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *pin as *mut Pin) as isize);
         self.pins.push(pin);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         Ok(())
+    }
+    /// Re-reads the configuration and applies what a pin on screen can still
+    /// change: the shadow and its metrics. The settings window sends this after
+    /// a save, because nothing else tells this process that the file changed.
+    ///
+    /// The per-pin choice is left alone on purpose: a pin whose shadow the user
+    /// turned off must not get it back because the metrics were edited. Only a
+    /// pin that still follows the configured default follows it here.
+    unsafe fn reload(&mut self) {
+        let config = match snaplight_platform::load_config() {
+            Ok(config) => config,
+            // The shadow is presentation only, so an unreadable configuration
+            // leaves the pins exactly as they are instead of guessing.
+            Err(error) => {
+                eprintln!("pin settings reload failed ({error}); keeping the current shadow");
+                return;
+            }
+        };
+        self.shadow = shadow::Settings::from_config(&config);
+        self.shadow_default = config.pin_shadow;
+        for pin in &mut self.pins {
+            if pin.closed {
+                continue;
+            }
+            let before = (pin.shadow.enabled(), pin.shadow.params());
+            let previous = pin.margin();
+            pin.shadow.settings = self.shadow;
+            pin.shadow.default_on = self.shadow_default;
+            // Nothing to redraw when both the state and the metrics are what
+            // they were; a repaint would only flicker.
+            if (pin.shadow.enabled(), pin.shadow.params()) == before {
+                continue;
+            }
+            if let Err(error) = pin.refresh_shadow(previous) {
+                snaplight_platform::native::show_error(&error.to_string());
+            }
+        }
     }
     unsafe fn close_all(&mut self) {
         for pin in &mut self.pins {
@@ -631,8 +1444,81 @@ impl Host {
         }
         self.update_held_poll(control);
     }
+    /// Opens the annotation session of the armed pin under the pointer, which is
+    /// what the annotation shortcut does. Returns whether a session started: the
+    /// key is only read where the pointer has clicked a pin and not left it, so
+    /// pressing it while typing into another application cannot open a window
+    /// here.
+    unsafe fn open_armed(&mut self) -> std::result::Result<bool, Box<dyn std::error::Error>> {
+        let mut point = POINT::default();
+        GetCursorPos(&mut point)?;
+        let under = WindowFromPoint(point);
+        let Some(index) = self
+            .pins
+            .iter()
+            .position(|pin| pin.armed && !pin.closed && !pin.editing && pin.hwnd == under)
+        else {
+            return Ok(false);
+        };
+        open_annotation(&mut self.pins[index], false)?;
+        Ok(true)
+    }
+    /// Reloads the picture of the pin whose annotation session just ended.
+    unsafe fn finish_edit(
+        &mut self,
+        address: usize,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let Some(index) = self
+            .pins
+            .iter()
+            .position(|pin| (&**pin as *const Pin) as usize == address)
+        else {
+            // The pin was closed while the session ran; the annotated picture it
+            // wrote back stays on disk.
+            return Ok(());
+        };
+        let pin = &mut self.pins[index];
+        pin.editing = false;
+        if pin.closed {
+            return Ok(());
+        }
+        pin.refresh()
+    }
 }
-unsafe extern "system" fn control_proc(hwnd: HWND, msg: u32, _w: WPARAM, l: LPARAM) -> LRESULT {
+/// True when this raw input message is the annotation shortcut being pressed:
+/// Space, which is what the pin's context menu promises.
+unsafe fn annotation_shortcut(w: WPARAM) -> bool {
+    let mut input = RAWINPUT::default();
+    let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+    let read = GetRawInputData(
+        HRAWINPUT(w.0 as *mut core::ffi::c_void),
+        RID_INPUT,
+        Some((&mut input as *mut RAWINPUT).cast()),
+        &mut size,
+        std::mem::size_of::<RAWINPUTHEADER>() as u32,
+    );
+    if read == u32::MAX || input.header.dwType != RIM_TYPEKEYBOARD.0 {
+        return false;
+    }
+    let key = input.data.keyboard;
+    // The press opens the session; the release that follows must not open a
+    // second one.
+    key.VKey == VK_SPACE.0 && key.Flags & RI_KEY_BREAK as u16 == 0
+}
+/// Registers the raw keyboard sink that makes the annotation shortcut possible
+/// without focus: only this process's control window receives the keys, and an
+/// idle process does nothing with them.
+unsafe fn register_input_sink(hwnd: HWND) -> Result<()> {
+    let devices = [RAWINPUTDEVICE {
+        usUsagePage: 0x01,
+        // Generic desktop controls / keyboard.
+        usUsage: 0x06,
+        dwFlags: RIDEV_INPUTSINK,
+        hwndTarget: hwnd,
+    }];
+    RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32)
+}
+unsafe extern "system" fn control_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Host;
     if !ptr.is_null() {
         let host = &mut *ptr;
@@ -650,6 +1536,7 @@ unsafe extern "system" fn control_proc(hwnd: HWND, msg: u32, _w: WPARAM, l: LPAR
                                 snaplight_platform::native::show_error(&e.to_string());
                             }
                         }
+                        PinCommand::Reload => host.reload(),
                         PinCommand::CloseAll | PinCommand::Shutdown => {
                             host.close_all();
                             PostQuitMessage(0);
@@ -671,6 +1558,28 @@ unsafe extern "system" fn control_proc(hwnd: HWND, msg: u32, _w: WPARAM, l: LPAR
                     PostQuitMessage(0);
                 } else {
                     host.update_held_poll(hwnd);
+                }
+                return LRESULT(0);
+            }
+            WM_INPUT => {
+                // Pins never take focus, so the annotation shortcut arrives as raw
+                // input rather than a key message: a key message would be delivered
+                // to whatever application is in front instead.
+                if annotation_shortcut(w) {
+                    match host.open_armed() {
+                        Ok(true) => {}
+                        Ok(false) => {}
+                        Err(e) => snaplight_platform::native::show_error(&e.to_string()),
+                    }
+                }
+                return LRESULT(0);
+            }
+            EDIT_DONE => {
+                // The annotation session's process has exited; the picture it
+                // wrote back is on disk, so the pin reloads it. The pin's address
+                // arrives as the message's wparam.
+                if let Err(e) = host.finish_edit(w.0 as usize) {
+                    snaplight_platform::native::show_error(&e.to_string());
                 }
                 return LRESULT(0);
             }
@@ -696,7 +1605,7 @@ unsafe extern "system" fn control_proc(hwnd: HWND, msg: u32, _w: WPARAM, l: LPAR
             _ => {}
         }
     }
-    DefWindowProcW(hwnd, msg, _w, l)
+    DefWindowProcW(hwnd, msg, w, l)
 }
 /// Registers the configured pin-restore shortcut, falling back to the default
 /// when another application already owns the configured combination. Returns the
@@ -720,10 +1629,40 @@ unsafe fn register_restore_hotkey(
     }
     Ok(hotkey.canonical())
 }
+/// `--confirm-demo [x y]` shows the close prompt at a fixed anchor and prints
+/// what was answered, without needing a pin. Like the tray menu's demo mode it
+/// exists so the prompt can be looked at (and screenshotted) on a real desktop.
+unsafe fn confirm_demo() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut rest = std::env::args()
+        .skip_while(|a| a != "--confirm-demo")
+        .skip(1);
+    let anchor = match (rest.next(), rest.next()) {
+        (Some(x), Some(y)) => x.parse::<i32>().ok().zip(y.parse::<i32>().ok()),
+        _ => None,
+    };
+    let anchor = match anchor {
+        Some(anchor) => anchor,
+        None => {
+            let mut point = POINT::default();
+            GetCursorPos(&mut point)?;
+            (point.x, point.y)
+        }
+    };
+    let answer = confirm::ask(HWND::default(), anchor, &close_options())?;
+    println!(
+        "confirm demo: accepted={} remember={}",
+        answer.accepted, answer.remember
+    );
+    Ok(())
+}
+
 pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     snaplight_platform::native::dpi_aware();
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+        if std::env::args().any(|a| a == "--confirm-demo") {
+            return confirm_demo();
+        }
         let config = snaplight_platform::load_config()?;
         let use_gpu =
             config.gpu_pins || std::env::args().any(|a| a == "--composition" || a == "--smoke");
@@ -791,8 +1730,18 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             through_hotkey,
             held_down: false,
             held_timer: None,
+            shadow: shadow::Settings::from_config(&config),
+            shadow_default: config.pin_shadow,
+            // Same accent the editor's selection chrome uses, so the frame that
+            // marks a clicked pin reads as the same idea.
+            accent: parse_hex_color(&config.theme.accent).unwrap_or([0.2, 0.53, 1.0, 1.0]),
         });
         SetWindowLongPtrW(control, GWLP_USERDATA, (&mut *host as *mut Host) as isize);
+        // The annotation shortcut needs the keyboard while no pin has focus, which
+        // raw input provides without a system-wide hook.
+        if let Err(error) = register_input_sink(control) {
+            eprintln!("annotation shortcut unavailable ({error}); the context menu still annotates");
+        }
         let address = control.0 as usize;
         if std::env::args().any(|a| a == "--smoke" || a == "--smoke-low-memory") {
             let dir = snaplight_platform::data_dir();
@@ -817,29 +1766,217 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 &doc,
                 &serde_json::to_vec(&Document {
                     version: 1,
-                    image,
+                    image: image.clone(),
                     selection: None,
                     annotations: vec![],
                 })?,
             )?;
+            // The pin shadow is presentation, so it is checked on the real
+            // desktop: a known configuration, a known colour behind the pin and
+            // the pixels the compositor actually puts on screen.
+            let config_path = snaplight_platform::data_dir().join("config.json");
+            let config_snapshot = std::fs::read(&config_path).ok();
+            let mut smoke_config = snaplight_platform::load_config().unwrap_or_default();
+            smoke_config.pin_shadow = true;
+            smoke_config.pin_shadow_blur = DEFAULT_PIN_SHADOW_BLUR;
+            smoke_config.pin_shadow_offset = DEFAULT_PIN_SHADOW_OFFSET;
+            smoke_config.pin_shadow_opacity = DEFAULT_PIN_SHADOW_OPACITY;
+            snaplight_platform::save_config(&smoke_config)?;
+            host.reload();
+            let magenta = COLORREF(0x00FF00FF);
+            let background = backdrop(
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 640,
+                    bottom: 560,
+                },
+                magenta,
+            )?;
+            // The backdrop has to be up before anything is read from the screen;
+            // its first frame arrives one composition pass after `ShowWindow`.
+            require_pixel(
+                600,
+                550,
+                "the smoke backdrop never reached the screen",
+                |pixel| pixel.0 > 230 && pixel.2 > 230 && pixel.1 < 25,
+            )?;
             // The pin must open exactly where the captured region was, not at the
-            // pointer, so verify the window rect against the requested position.
+            // pointer, so verify the capture against the requested position. The
+            // window is bigger than the capture by the shadow margin.
             let requested = ScreenPoint { x: 60, y: 90 };
-            host.open(control, path, doc, requested)?;
+            host.open(control, path.clone(), doc.clone(), requested)?;
             let mut placed = RECT::default();
             GetWindowRect(host.pins[0].hwnd, &mut placed)?;
-            if (placed.left, placed.top) != (requested.x, requested.y) {
+            let margin = host.pins[0].margin();
+            if margin <= 0 {
                 return Err(format!(
-                    "pin opened at ({}, {}) instead of ({}, {})",
-                    placed.left, placed.top, requested.x, requested.y
+                    "a pin with the configured shadow reserved no margin ({margin})"
                 )
                 .into());
             }
+            if (placed.left + margin, placed.top + margin) != (requested.x, requested.y) {
+                return Err(format!(
+                    "pin capture opened at ({}, {}) instead of ({}, {})",
+                    placed.left + margin,
+                    placed.top + margin,
+                    requested.x,
+                    requested.y
+                )
+                .into());
+            }
+            let size = (placed.right - placed.left, placed.bottom - placed.top);
+            let expected_size = (
+                image.width as i32 + 2 * margin,
+                image.height as i32 + 2 * margin,
+            );
+            if size != expected_size {
+                return Err(format!(
+                    "pin window is {}x{} instead of {expected_size:?}",
+                    size.0, size.1
+                )
+                .into());
+            }
+            // Just below the capture the backdrop has to be darkened. Geometry
+            // alone would pass even if the shadow never reached the screen.
+            let shadow_sample = (placed.left + margin + 160, placed.bottom - margin + 3);
+            let shadowed = |pixel: (u8, u8, u8)| {
+                pixel.0 > 60 && pixel.0 < 210 && pixel.2 > 60 && pixel.2 < 210 && pixel.1 < 40
+            };
+            require_pixel(
+                shadow_sample.0,
+                shadow_sample.1,
+                "the shadow below the pin is not on screen",
+                shadowed,
+            )?;
+            // Without a shadow the window is the capture again, on the same
+            // pixels, and the backdrop shows through untouched. The smoke picks
+            // the menu entry the user picks, on the real menu: a helper thread
+            // presses the row while this thread sits inside the menu's modal
+            // loop.
+            let entries = menu_entries(
+                &host.pins[0].restore_hotkey,
+                &host.pins[0].through_hotkey,
+                true,
+            );
+            let pin_address = host.pins[0].hwnd.0 as usize;
+            let control_address = control.0 as usize;
+            let worker = std::thread::spawn(move || {
+                click_pin_menu(pin_address, control_address, pin_item::SHADOW, entries)
+            });
+            SendMessageW(host.pins[0].hwnd, WM_NCRBUTTONUP, WPARAM(0), LPARAM(0));
+            worker
+                .join()
+                .map_err(|_| "the menu click thread panicked")??;
+            let mut bare = RECT::default();
+            GetWindowRect(host.pins[0].hwnd, &mut bare)?;
+            if (bare.left, bare.top) != (requested.x, requested.y)
+                || (bare.right - bare.left, bare.bottom - bare.top)
+                    != (image.width as i32, image.height as i32)
+            {
+                return Err(format!(
+                    "without a shadow the pin is ({}, {}) {}x{} instead of the capture at ({}, {})",
+                    bare.left,
+                    bare.top,
+                    bare.right - bare.left,
+                    bare.bottom - bare.top,
+                    requested.x,
+                    requested.y
+                )
+                .into());
+            }
+            require_pixel(
+                shadow_sample.0,
+                shadow_sample.1,
+                "the pin shadow is still on screen after it was turned off",
+                |pixel| pixel.0 > 230 && pixel.2 > 230 && pixel.1 < 25,
+            )?;
+            // Turning it back on is what the other menu entry does, and it has
+            // to restore the very window the pin had before.
+            host.pins[0].set_shadow(true)?;
+            let mut again = RECT::default();
+            GetWindowRect(host.pins[0].hwnd, &mut again)?;
+            if (again.left, again.top, again.right, again.bottom)
+                != (placed.left, placed.top, placed.right, placed.bottom)
+            {
+                return Err(format!(
+                    "turning the shadow back on gave ({}, {}) {}x{} instead of ({}, {}) {}x{}",
+                    again.left,
+                    again.top,
+                    again.right - again.left,
+                    again.bottom - again.top,
+                    placed.left,
+                    placed.top,
+                    placed.right - placed.left,
+                    placed.bottom - placed.top
+                )
+                .into());
+            }
+            require_pixel(
+                shadow_sample.0,
+                shadow_sample.1,
+                "the shadow did not come back when it was turned on again",
+                shadowed,
+            )?;
+            // A settings change has to reach a pin that is already open: the
+            // window follows the new metrics and the capture stays put.
+            smoke_config.pin_shadow_blur = 32;
+            smoke_config.pin_shadow_offset = 0;
+            smoke_config.pin_shadow_opacity = 100;
+            snaplight_platform::save_config(&smoke_config)?;
+            host.reload();
+            let wide_margin = host.pins[0].margin();
+            let mut wider = RECT::default();
+            GetWindowRect(host.pins[0].hwnd, &mut wider)?;
+            if wide_margin <= margin {
+                return Err(format!(
+                    "the reloaded shadow kept its old margin ({margin} instead of {wide_margin})"
+                )
+                .into());
+            }
+            if (wider.left + wide_margin, wider.top + wide_margin) != (requested.x, requested.y) {
+                return Err(format!(
+                    "reloading the shadow moved the capture to ({}, {})",
+                    wider.left + wide_margin,
+                    wider.top + wide_margin
+                )
+                .into());
+            }
+            // The reloaded metrics are opaque, so the same pixel is now black.
+            require_pixel(
+                shadow_sample.0,
+                shadow_sample.1,
+                "the reloaded shadow metrics did not reach the pin",
+                |pixel| pixel.0 < 40 && pixel.2 < 40,
+            )?;
+            // The configured default only applies to pins that have no choice of
+            // their own, so switching it off leaves this one alone.
+            smoke_config.pin_shadow = false;
+            snaplight_platform::save_config(&smoke_config)?;
+            host.reload();
+            if !host.pins[0].shadow.enabled() {
+                return Err("reloading the settings cleared the pin's own shadow choice".into());
+            }
+            // One line per backend is enough to see what the checks above did
+            // without digging into the result JSON.
+            println!(
+                "pin shadow: margin {margin}, menu row {} removed it, reload margin {wide_margin}",
+                pin_item::SHADOW
+            );
+            let _ = DestroyWindow(background);
             host.pins[0].zoom(0.5)?;
             let mut zoomed = RECT::default();
             GetWindowRect(host.pins[0].hwnd, &mut zoomed)?;
-            if (zoomed.left, zoomed.top) != (placed.left, placed.top) {
-                return Err("scaling moved the pin window".into());
+            let zoomed_margin = host.pins[0].margin();
+            if (zoomed.left + zoomed_margin, zoomed.top + zoomed_margin)
+                != (requested.x, requested.y)
+            {
+                return Err(format!(
+                    "scaling moved the capture to ({}, {})",
+                    zoomed.left + zoomed_margin,
+                    zoomed.top + zoomed_margin
+                )
+                .into());
             }
             host.pins[0].toggle()?;
             host.pins[0].toggle()?;
@@ -938,7 +2075,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             // `GetAsyncKeyState`. Opt-in, because it presses a key on whatever
             // the user is doing at that moment.
             if std::env::var_os("SNAPLIGHT_SMOKE_HOLD_KEY").is_some() {
-                send_control(true)?;
+                send_key(VK_CONTROL, true)?;
                 let mut lifted = false;
                 for _ in 0..100 {
                     host.poll_held();
@@ -953,7 +2090,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         "pressing the held shortcut for real did not restore interaction".into(),
                     );
                 }
-                send_control(false)?;
+                send_key(VK_CONTROL, false)?;
                 let mut back = false;
                 for _ in 0..100 {
                     host.poll_held();
@@ -1010,10 +2147,100 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
             host.pins[0].opacity = 0.8;
             host.pins[0].restore()?;
+            // Annotating a pinned image again runs in the editor process: it loads
+            // the pin's files, writes the annotated picture back, and the pin
+            // picks that up when that process exits. The demo flag makes the
+            // session annotate one rectangle and exit, so the handoff is checked
+            // here without a user. The pin is armed the way clicking it arms it.
+            let _ = host.pins[0].arm(true)?;
+            host.pins[0].arm(false)?;
+            let picture = host.pins[0].picture_rect();
+            if (picture.left, picture.top) != (requested.x, requested.y) {
+                return Err(format!(
+                    "an annotation session would cover ({}, {}) instead of the capture at ({}, {})",
+                    picture.left, picture.top, requested.x, requested.y
+                )
+                .into());
+            }
+            open_annotation(&mut host.pins[0], true)?;
+            if !host.pins[0].editing || host.pins[0].armed {
+                return Err(
+                    "starting a session did not mark the pin as busy and unarmed".into(),
+                );
+            }
+            let mut waited = 0;
+            while host.pins[0].editing && waited < 30_000 {
+                pump_messages(20);
+                waited += 20;
+            }
+            if host.pins[0].editing {
+                return Err("the pin's annotation session did not finish".into());
+            }
+            // The session paints one filled rectangle a quarter of the way in, and
+            // the pin reloads the file it wrote, so the pixel proves both ends.
+            let (_, painted) = read_pixels(&host.pins[0].path)?;
+            let (px, py) = (
+                (image.width / 4 + 20) as usize,
+                (image.height / 4 + 15) as usize,
+            );
+            let n = (py * host.pins[0].image.stride as usize + px * 4) as usize;
+            let pixel = [painted[n], painted[n + 1], painted[n + 2]];
+            if pixel != [76, 204, 25] {
+                return Err(format!(
+                    "the pinned picture holds {pixel:?} where the session painted, expected the fill [76, 204, 25]"
+                )
+                .into());
+            }
+            // The other way into a session is the annotation shortcut, which runs
+            // through raw keyboard input: nothing that passes values around can
+            // cover it, so the key is pressed for real over an armed pin and the
+            // session has to start on its own. Opt-in, like the held shortcut,
+            // because it presses a key and moves the pointer while the user may be
+            // working somewhere else.
+            if std::env::var_os("SNAPLIGHT_SMOKE_PIN_KEY").is_some() {
+                let _ = host.pins[0].arm(true)?;
+                let mut rect = RECT::default();
+                GetWindowRect(host.pins[0].hwnd, &mut rect)?;
+                let mut previous = POINT::default();
+                GetCursorPos(&mut previous)?;
+                SetCursorPos((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)?;
+                send_key(VK_SPACE, true)?;
+                send_key(VK_SPACE, false)?;
+                let mut started = false;
+                let mut waited = 0;
+                while waited < 3_000 {
+                    pump_messages(20);
+                    waited += 20;
+                    if host.pins[0].editing {
+                        started = true;
+                        break;
+                    }
+                }
+                let _ = SetCursorPos(previous.x, previous.y);
+                if !started {
+                    return Err(
+                        "pressing the annotation shortcut over a pin started nothing".into(),
+                    );
+                }
+                // Let that session finish too, so the pin is not left mid-edit and
+                // the second write-back is queued behind the first.
+                let mut waited = 0;
+                while host.pins[0].editing && waited < 30_000 {
+                    pump_messages(20);
+                    waited += 20;
+                }
+                if host.pins[0].editing {
+                    return Err("the shortcut's annotation session did not finish".into());
+                }
+            }
             // The pin menu is drawn by the same component as the tray menu, so the
             // smoke only has to prove that the entries are wired to the commands
             // the handler maps and that 销毁 renders as the destructive row.
-            let entries = menu_entries(DEFAULT_RESTORE_HOTKEY, DEFAULT_THROUGH_HOTKEY);
+            let entries = menu_entries(
+                DEFAULT_RESTORE_HOTKEY,
+                DEFAULT_THROUGH_HOTKEY,
+                host.shadow_default,
+            );
             let menu = popup_menu::render(&entries, 1.0, None)?;
             let destroy = menu
                 .layout
@@ -1030,6 +2257,81 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             if !destructive {
                 return Err("the destroy entry is not drawn as destructive".into());
             }
+            // Closing by double-click runs the whole chain: the double-click
+            // message enters the window procedure, the prompt creates its own
+            // window and handles keys, the answer reaches the configuration and
+            // only then is the pin closed. The switch is read when the pin is
+            // double-clicked, so the smoke turns it on explicitly.
+            let mut confirm_on = snaplight_platform::load_config().unwrap_or_default();
+            confirm_on.pin_close_confirm = true;
+            snaplight_platform::save_config(&confirm_on)?;
+            let first = host.pins[0].hwnd;
+            let first_address = first.0 as usize;
+
+            // Cancelling leaves the pin exactly where it was.
+            let worker =
+                std::thread::spawn(move || answer_prompt(first_address, &[VK_ESCAPE.0 as u32]));
+            if double_click_close(first) {
+                return Err("cancelling the close prompt closed the pin".into());
+            }
+            join_answer(worker)?;
+
+            // Confirming with the box ticked closes the pin and remembers it.
+            let worker = std::thread::spawn(move || {
+                answer_prompt(first_address, &[VK_SPACE.0 as u32, VK_RETURN.0 as u32])
+            });
+            if !double_click_close(first) {
+                return Err("confirming the close prompt left the pin open".into());
+            }
+            join_answer(worker)?;
+            if snaplight_platform::load_config()?.pin_close_confirm {
+                return Err("the prompt's 下次不再提醒 box did not reach the configuration".into());
+            }
+
+            // With the switch off the pin closes at once. A prompt that appeared
+            // anyway is cancelled by the answering thread, so the check below
+            // fails instead of hanging on a prompt nobody answers.
+            host.open(control, path, doc, ScreenPoint { x: 400, y: 90 })?;
+            // A new pin follows the configured default, which the shadow check
+            // switched off: it must have no margin, and its window is then the
+            // capture itself again.
+            let mut bare_default = RECT::default();
+            GetWindowRect(host.pins[1].hwnd, &mut bare_default)?;
+            if host.pins[1].shadow.enabled() || host.pins[1].margin() != 0 {
+                return Err("a new pin ignored the configured shadow default".into());
+            }
+            let bare_size = (
+                bare_default.right - bare_default.left,
+                bare_default.bottom - bare_default.top,
+            );
+            if (bare_default.left, bare_default.top) != (400, 90)
+                || bare_size != (image.width as i32, image.height as i32)
+            {
+                return Err(format!(
+                    "a pin without a shadow is at ({}, {}) {}x{} instead of the capture at (400, 90)",
+                    bare_default.left,
+                    bare_default.top,
+                    bare_default.right - bare_default.left,
+                    bare_default.bottom - bare_default.top
+                )
+                .into());
+            }
+            let second = host.pins[1].hwnd;
+            let second_address = second.0 as usize;
+            let worker =
+                std::thread::spawn(move || answer_prompt(second_address, &[VK_ESCAPE.0 as u32]));
+            if !double_click_close(second) {
+                return Err("a pin did not close although the confirmation was off".into());
+            }
+            join_answer(worker)?;
+
+            match config_snapshot {
+                Some(bytes) => snaplight_platform::atomic_write(&config_path, &bytes)?,
+                None => {
+                    let _ = std::fs::remove_file(&config_path);
+                }
+            }
+
             host.close_all();
             snaplight_platform::atomic_write(
                 &dir.join(if use_gpu {
@@ -1038,7 +2340,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     "pin-smoke-low-memory-result.json"
                 }),
                 &serde_json::to_vec(
-                    &serde_json::json!({"composition":use_gpu,"layered_transition":true,"scale":true,"opacity":true,"menu_destroy":true,"held_interaction":true,"position":[placed.left,placed.top],"size":[placed.right-placed.left,placed.bottom-placed.top]}),
+                    &serde_json::json!({"composition":use_gpu,"layered_transition":true,"scale":true,"opacity":true,"menu_destroy":true,"menu_reset":true,"close_confirm":true,"held_interaction":true,"pin_shadow":true,"shadow_geometry":true,"shadow_pixels":true,"shadow_menu":true,"shadow_toggle":true,"shadow_reload":true,"shadow_default":true,"position":[placed.left,placed.top],"capture":[placed.left+margin,placed.top+margin],"shadow_margin":margin,"size":[placed.right-placed.left,placed.bottom-placed.top]}),
                 )?,
             )?;
         } else {
@@ -1077,21 +2379,35 @@ mod tests {
     /// keep pointing at the entry that performs that command.
     #[test]
     fn pin_menu_entries_match_the_commands_the_handler_maps() {
-        let entries = menu_entries(DEFAULT_RESTORE_HOTKEY, DEFAULT_THROUGH_HOTKEY);
-        assert_eq!(entries.len(), 3);
+        let entries = menu_entries(DEFAULT_RESTORE_HOTKEY, DEFAULT_THROUGH_HOTKEY, true);
+        assert_eq!(entries.len(), 6);
         let divider = entries
             .iter()
             .position(|entry| matches!(entry, Entry::Separator))
             .expect("the pin menu needs a divider");
         assert_eq!(
-            divider, 1,
-            "the divider separates 销毁 from the view command"
+            divider, 4,
+            "the divider separates 销毁 from the view commands"
         );
-        for index in [pin_item::THROUGH, pin_item::DESTROY] {
+        for index in [
+            pin_item::EDIT,
+            pin_item::THROUGH,
+            pin_item::RESET,
+            pin_item::SHADOW,
+            pin_item::DESTROY,
+        ] {
             assert_ne!(index, divider, "commands never point at the divider");
             assert!(matches!(entries[index], Entry::Item(_)));
         }
         assert_eq!(pin_item::DESTROY, entries.len() - 1);
+        let Entry::Item(edit) = &entries[pin_item::EDIT] else {
+            panic!("edit entry must be an item");
+        };
+        assert_eq!(
+            edit.label, "编辑标注（空格）",
+            "the menu must teach the shortcut that opens the same session"
+        );
+        assert!(!edit.danger);
         let Entry::Item(through) = &entries[pin_item::THROUGH] else {
             panic!("through entry must be an item");
         };
@@ -1102,18 +2418,77 @@ mod tests {
         );
         assert_eq!(through.shortcut.as_deref(), Some(DEFAULT_RESTORE_HOTKEY));
         assert!(!through.danger);
+        let Entry::Item(reset) = &entries[pin_item::RESET] else {
+            panic!("reset entry must be an item");
+        };
+        assert_eq!(
+            reset.label, "恢复原始大小",
+            "the size reset moved off the double-click, which now closes the pin"
+        );
+        assert!(!reset.danger);
+        let Entry::Item(shadow) = &entries[pin_item::SHADOW] else {
+            panic!("shadow entry must be an item");
+        };
+        assert_eq!(
+            shadow.label, "关闭阴影",
+            "the entry names the action, since the card cannot show a checkmark"
+        );
+        assert!(!shadow.danger);
         let Entry::Item(destroy) = &entries[pin_item::DESTROY] else {
             panic!("destroy entry must be an item");
         };
         assert_eq!(destroy.label, "销毁");
         assert!(destroy.danger, "destroy closes the pin and must read red");
     }
+    /// The shadow entry has to read as the action it performs, so a pin without
+    /// a shadow offers to turn one on.
+    #[test]
+    fn the_shadow_entry_names_the_action_it_performs() {
+        let entries = menu_entries(DEFAULT_RESTORE_HOTKEY, DEFAULT_THROUGH_HOTKEY, false);
+        let Entry::Item(shadow) = &entries[pin_item::SHADOW] else {
+            panic!("shadow entry must be an item");
+        };
+        assert_eq!(shadow.label, "开启阴影");
+    }
+    /// A pin's shadow follows the configuration until the context menu makes a
+    /// choice, and that choice is what a later settings change must not undo.
+    #[test]
+    fn the_per_pin_choice_outlives_a_settings_reload() {
+        let settings = shadow::Settings {
+            blur: 12,
+            offset_y: 4,
+            opacity: 40,
+        };
+        let mut shadow = Shadow {
+            settings,
+            dpi: 1.0,
+            default_on: true,
+            choice: None,
+        };
+        assert!(shadow.enabled(), "a new pin is shadowed by default");
+        assert_eq!(shadow.params().map(|p| p.margin()), Some(16));
+        shadow.choice = Some(false);
+        assert!(!shadow.enabled());
+        assert_eq!(shadow.params(), None);
+        // The settings change the metrics, not the user's choice for this pin.
+        shadow.settings = shadow::Settings {
+            blur: 24,
+            offset_y: 0,
+            opacity: 100,
+        };
+        assert!(!shadow.enabled());
+        shadow.choice = Some(true);
+        assert_eq!(shadow.margin(), 24);
+        // Turning the configured default off leaves an explicit choice alone.
+        shadow.default_on = false;
+        assert!(shadow.enabled());
+    }
     /// The hint only earns its place when it adds information: an empty or
     /// repeated shortcut must not produce a second, identical hint.
     #[test]
     fn the_held_hint_is_omitted_when_it_adds_nothing() {
         for held in ["", DEFAULT_RESTORE_HOTKEY] {
-            let entries = menu_entries(DEFAULT_RESTORE_HOTKEY, held);
+            let entries = menu_entries(DEFAULT_RESTORE_HOTKEY, held, true);
             let Entry::Item(through) = &entries[pin_item::THROUGH] else {
                 panic!("through entry must be an item");
             };

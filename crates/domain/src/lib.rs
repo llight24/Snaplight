@@ -16,6 +16,25 @@ pub const DEFAULT_RESTORE_HOTKEY: &str = "Ctrl+Shift+P";
 /// only releases the click-through state while the keys are down, so the pin
 /// goes back to letting clicks through as soon as they are released.
 pub const DEFAULT_THROUGH_HOTKEY: &str = "Ctrl";
+/// Default outline and fill colour of new annotations, so a fresh configuration
+/// matches the shape style the editor has always drawn.
+pub const DEFAULT_STROKE_COLOR: &str = "#F23340";
+/// Default fill opacity, in percent.
+pub const DEFAULT_FILL_OPACITY: u8 = 100;
+/// Range and default of the text size of annotations, in image pixels.
+pub const MIN_FONT_SIZE: u16 = 12;
+pub const MAX_FONT_SIZE: u16 = 200;
+pub const DEFAULT_FONT_SIZE: u16 = 32;
+/// Default drop shadow of a pin: a pin lifts off the desktop like the menu
+/// cards do, and the shadow is what says so. Its metrics are logical pixels at
+/// 96 DPI, so the pin scales them for the monitor it opens on.
+pub const DEFAULT_PIN_SHADOW: bool = true;
+pub const DEFAULT_PIN_SHADOW_BLUR: u32 = 12;
+pub const DEFAULT_PIN_SHADOW_OFFSET: u32 = 4;
+/// Default shadow opacity, in percent.
+pub const DEFAULT_PIN_SHADOW_OPACITY: u8 = 40;
+pub const MAX_PIN_SHADOW_BLUR: u32 = 48;
+pub const MAX_PIN_SHADOW_OFFSET: u32 = 24;
 
 /// Key part of a parsed hotkey. Letters and digits map to their ASCII virtual-key
 /// code; functions map to `VK_F1`..`VK_F24`.
@@ -381,18 +400,102 @@ pub enum Tool {
     Mosaic,
     Text,
 }
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+impl Tool {
+    /// Every tool in configuration order. The index is the stable tool id the
+    /// toolbar and the editor exchange, so the display order can change without
+    /// changing what a message means.
+    pub const ALL: [Tool; 7] = [
+        Tool::Select,
+        Tool::Rectangle,
+        Tool::Ellipse,
+        Tool::Arrow,
+        Tool::Pen,
+        Tool::Mosaic,
+        Tool::Text,
+    ];
+    pub fn id(self) -> i32 {
+        Tool::ALL
+            .iter()
+            .position(|tool| *tool == self)
+            .expect("every tool is listed") as i32
+    }
+    pub fn from_id(id: i32) -> Option<Tool> {
+        usize::try_from(id)
+            .ok()
+            .and_then(|id| Tool::ALL.get(id))
+            .copied()
+    }
+    /// True when the tool draws lines: a shape outline, an arrow or a stroke.
+    /// Mosaic has no paint of its own and the select tool draws nothing.
+    pub fn can_stroke(self) -> bool {
+        matches!(
+            self,
+            Tool::Rectangle | Tool::Ellipse | Tool::Arrow | Tool::Pen | Tool::Text
+        )
+    }
+    /// True when the tool has an interior to fill: the two shapes and text, which
+    /// fills its glyphs. An arrow or a pen stroke has none.
+    pub fn can_fill(self) -> bool {
+        matches!(self, Tool::Rectangle | Tool::Ellipse | Tool::Text)
+    }
+}
+/// Paint of one annotation: an outline, a fill, or both. Colours are RGBA in
+/// sRGB with premultiply-free alpha, so the fill carries its own opacity.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Style {
-    pub rgba: [f32; 4],
+    pub stroke: [f32; 4],
+    pub fill: [f32; 4],
+    /// Stroke width in image pixels.
     pub width: f32,
+    pub stroke_on: bool,
+    pub fill_on: bool,
+    /// Text size in image pixels; only `Shape::Text` reads it.
+    pub font_size: f32,
 }
 impl Default for Style {
     fn default() -> Self {
         Self {
-            rgba: [0.95, 0.2, 0.25, 1.0],
+            stroke: [0.95, 0.2, 0.25, 1.0],
+            fill: [0.95, 0.2, 0.25, 1.0],
             width: 3.0,
+            stroke_on: true,
+            fill_on: false,
+            font_size: 32.0,
         }
     }
+}
+/// Parses `#RRGGBB` (or `#RRGGBBAA`) into sRGB components. Whitespace around the
+/// text is ignored, so a value typed into a settings field is accepted as is.
+pub fn parse_hex_color(text: &str) -> Option<[f32; 4]> {
+    let text = text.trim();
+    let digits = text.strip_prefix('#')?;
+    if !matches!(digits.len(), 6 | 8) || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let byte = |at: usize| u8::from_str_radix(&digits[at..at + 2], 16).ok();
+    let alpha = if digits.len() == 8 {
+        byte(6)? as f32 / 255.0
+    } else {
+        1.0
+    };
+    Some([
+        byte(0)? as f32 / 255.0,
+        byte(2)? as f32 / 255.0,
+        byte(4)? as f32 / 255.0,
+        alpha,
+    ])
+}
+/// Formats sRGB components as `#RRGGBB`; alpha is reported separately by the
+/// callers that keep it, so it is not part of the text.
+pub fn format_hex_color(rgba: [f32; 4]) -> String {
+    let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!(
+        "#{:02X}{:02X}{:02X}",
+        byte(rgba[0]),
+        byte(rgba[1]),
+        byte(rgba[2])
+    )
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Shape {
@@ -496,6 +599,14 @@ pub struct Interaction {
     pub hover: Option<ImageRect>,
     pub cursor: Option<ImagePoint>,
     pub dragging: bool,
+    /// Transient readout drawn over the canvas while a value is being scrubbed
+    /// with the number keys, so the change is visible where the user is looking.
+    pub hud: Option<String>,
+    /// True while the document is a fixed image re-opened for annotation, which
+    /// is what a pinned image becomes. There is no capture region to choose, so
+    /// renderers draw neither the dimming mask nor the selection chrome: the
+    /// window is the image, and the canvas keeps region edits and detection off.
+    pub fixed_image: bool,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Viewport {
@@ -584,6 +695,20 @@ pub struct Config {
     pub tools: Vec<Tool>,
     pub stroke_width: f32,
     pub mosaic_block: u32,
+    /// Outline colour of new annotations, as `#RRGGBB`.
+    pub stroke_color: String,
+    /// Fill colour of new annotations, as `#RRGGBB`. Its opacity comes from
+    /// `fill_opacity` instead of the text, so one slider covers every tool.
+    pub fill_color: String,
+    /// Fill opacity of new annotations, in percent.
+    pub fill_opacity: u8,
+    /// Text size of new text annotations, in image pixels.
+    pub font_size: u16,
+    /// Tools that paint an outline, and tools that paint a fill. Text paints a
+    /// fill (its glyphs) instead of an outline, so the two lists overlap only
+    /// for tools the user asked to paint both.
+    pub stroke_tools: Vec<Tool>,
+    pub fill_tools: Vec<Tool>,
     pub cpu_cache_bytes: usize,
     pub gpu_pins: bool,
     /// Directory for saved captures. `None` uses `data_dir()/captures`.
@@ -596,6 +721,23 @@ pub struct Config {
     /// shortcuts above this one is not registered with the shell, so a lone
     /// modifier such as `Ctrl` is allowed.
     pub through_hotkey: String,
+    /// Whether closing a pin asks for confirmation first. The pin manager reads
+    /// this at the moment of the double-click instead of at startup, so the
+    /// "don't ask again" box in the dialog and the settings switch take effect
+    /// without restarting the pin process.
+    pub pin_close_confirm: bool,
+    /// Whether a new pin draws a drop shadow. The pin context menu toggles the
+    /// shadow of one pin without touching this default.
+    pub pin_shadow: bool,
+    /// Blur radius of the pin shadow, in logical pixels at 96 DPI: the distance
+    /// over which it fades out past the image edge.
+    pub pin_shadow_blur: u32,
+    /// How far the pin shadow is pushed down, in logical pixels. Pins are lit
+    /// from above, so it only ever moves down; the window reserves the margin
+    /// on every side regardless.
+    pub pin_shadow_offset: u32,
+    /// Opacity of the pin shadow at the image edge, in percent.
+    pub pin_shadow_opacity: u8,
     /// Automatic region detection under the cursor.
     pub window_detect: WindowDetect,
 }
@@ -615,12 +757,23 @@ impl Default for Config {
             ],
             stroke_width: 3.0,
             mosaic_block: 12,
+            stroke_color: DEFAULT_STROKE_COLOR.into(),
+            fill_color: DEFAULT_STROKE_COLOR.into(),
+            fill_opacity: DEFAULT_FILL_OPACITY,
+            font_size: DEFAULT_FONT_SIZE,
+            stroke_tools: vec![Tool::Rectangle, Tool::Ellipse, Tool::Arrow, Tool::Pen],
+            fill_tools: vec![Tool::Text],
             cpu_cache_bytes: 8 * 1024 * 1024,
             gpu_pins: false,
             capture_dir: None,
             capture_hotkey: DEFAULT_CAPTURE_HOTKEY.into(),
             restore_hotkey: DEFAULT_RESTORE_HOTKEY.into(),
             through_hotkey: DEFAULT_THROUGH_HOTKEY.into(),
+            pin_close_confirm: true,
+            pin_shadow: DEFAULT_PIN_SHADOW,
+            pin_shadow_blur: DEFAULT_PIN_SHADOW_BLUR,
+            pin_shadow_offset: DEFAULT_PIN_SHADOW_OFFSET,
+            pin_shadow_opacity: DEFAULT_PIN_SHADOW_OPACITY,
             window_detect: WindowDetect::default(),
         }
     }
@@ -635,6 +788,28 @@ impl Config {
             || !(2..=128).contains(&self.mosaic_block)
         {
             return Err("invalid drawing settings");
+        }
+        if self.fill_opacity > 100 || !(MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(&self.font_size) {
+            return Err("invalid fill opacity or font size");
+        }
+        // A shadow that is wider than its range would make a pin reserve an
+        // unbounded margin, so the configured range is the contract the pin
+        // process relies on when it sizes the window.
+        if self.pin_shadow_blur > MAX_PIN_SHADOW_BLUR
+            || self.pin_shadow_offset > MAX_PIN_SHADOW_OFFSET
+            || self.pin_shadow_opacity > 100
+        {
+            return Err("invalid pin shadow settings");
+        }
+        for color in [&self.stroke_color, &self.fill_color] {
+            parse_hex_color(color).ok_or("stroke and fill colours must be #RRGGBB")?;
+        }
+        // The lists say which tools paint what, so a tool that cannot paint a way
+        // at all has no business being listed for it.
+        if self.stroke_tools.iter().any(|tool| !tool.can_stroke())
+            || self.fill_tools.iter().any(|tool| !tool.can_fill())
+        {
+            return Err("paint defaults list tools that cannot paint that way");
         }
         for c in [
             &self.theme.background,
@@ -707,6 +882,10 @@ pub enum PinCommand {
         screen: ScreenPoint,
     },
     CloseAll,
+    /// Re-reads the configuration and reapplies the settings that are read live
+    /// (the pin shadow and its metrics). The settings window sends this after a
+    /// save so a change reaches pins that are already on screen.
+    Reload,
     Shutdown,
 }
 
@@ -970,6 +1149,16 @@ mod tests {
         assert!(serde_json::from_str::<Config>("{\"window_detect\":\"pixel\"}").is_err());
     }
     #[test]
+    fn closing_a_pin_confirms_by_default_and_survives_an_old_config() {
+        assert!(Config::default().pin_close_confirm);
+        // Closing a pin throws away what the user pinned, so a configuration
+        // written before the option existed has to keep asking.
+        let config: Config = serde_json::from_str("{\"version\":1}").unwrap();
+        assert!(config.pin_close_confirm);
+        let config: Config = serde_json::from_str("{\"pin_close_confirm\":false}").unwrap();
+        assert!(!config.pin_close_confirm);
+    }
+    #[test]
     fn screen_rects_intersect_or_report_no_overlap() {
         let a = ScreenRect {
             x: -1920,
@@ -1012,6 +1201,124 @@ mod tests {
             }),
             None
         );
+    }
+    #[test]
+    fn tool_ids_round_trip_and_stay_stable() {
+        for (index, tool) in Tool::ALL.iter().enumerate() {
+            assert_eq!(tool.id(), index as i32);
+            assert_eq!(Tool::from_id(index as i32), Some(*tool));
+        }
+        assert_eq!(Tool::from_id(-1), None);
+        assert_eq!(Tool::from_id(7), None);
+        // The toolbar and the editor agree on the id of every tool, so a
+        // reordered palette cannot make a message mean another tool.
+        assert_eq!(Tool::Rectangle.id(), 1);
+        assert_eq!(Tool::Text.id(), 6);
+    }
+    #[test]
+    fn paint_defaults_separate_text_from_shapes() {
+        // Defaults that documents written before fills existed deserialize to:
+        // an outline of the default red, which is what those documents show.
+        let old = Style::default();
+        assert!(old.stroke_on && !old.fill_on);
+        assert_eq!(old.width, 3.0);
+        assert_eq!(old.font_size, DEFAULT_FONT_SIZE as f32);
+        let stored: Style = serde_json::from_str("{\"rgba\":[1.0,0.0,0.0,1.0]}").unwrap();
+        assert_eq!(stored, old);
+        // New sessions start from the configured lists: shapes are outlined and
+        // text is filled, which is what its glyphs need to be readable.
+        let config = Config::default();
+        assert!(config.stroke_tools.contains(&Tool::Rectangle));
+        assert!(!config.fill_tools.contains(&Tool::Rectangle));
+        assert_eq!(config.fill_tools, vec![Tool::Text]);
+        assert!(!config.stroke_tools.contains(&Tool::Text));
+    }
+    #[test]
+    fn hex_colours_parse_and_round_trip() {
+        let red = parse_hex_color("#F23340").unwrap();
+        assert!((red[0] - 0.95).abs() < 0.01);
+        assert!((red[1] - 0.2).abs() < 0.01);
+        assert!((red[2] - 0.25).abs() < 0.01);
+        assert_eq!(red[3], 1.0);
+        assert_eq!(format_hex_color(red), "#F23340");
+        // Whitespace from a settings field is tolerated; alpha is parsed too.
+        assert_eq!(parse_hex_color(" #F23340 ").unwrap(), red);
+        assert_eq!(parse_hex_color("#F2334000").unwrap()[3], 0.0);
+        for text in ["", "F23340", "#F2334", "#F2334G", "#", "0xFF0000"] {
+            assert!(parse_hex_color(text).is_none(), "{text} should be rejected");
+        }
+        // Out-of-range components clamp instead of wrapping to another colour.
+        assert_eq!(format_hex_color([2.0, -1.0, 0.5, 1.0]), "#FF0080");
+    }
+    #[test]
+    fn config_rejects_unusable_paint_defaults() {
+        let mut config = Config::default();
+        assert!(config.validate().is_ok());
+        config.fill_opacity = 101;
+        assert_eq!(config.validate(), Err("invalid fill opacity or font size"));
+        config.fill_opacity = DEFAULT_FILL_OPACITY;
+        config.font_size = MIN_FONT_SIZE - 1;
+        assert_eq!(config.validate(), Err("invalid fill opacity or font size"));
+        config.font_size = DEFAULT_FONT_SIZE;
+        config.fill_color = "red".into();
+        assert_eq!(
+            config.validate(),
+            Err("stroke and fill colours must be #RRGGBB")
+        );
+        // A configuration written before paint defaults existed keeps the
+        // defaults instead of failing to load.
+        let config: Config = serde_json::from_str("{\"version\":1}").unwrap();
+        assert_eq!(config.stroke_color, DEFAULT_STROKE_COLOR);
+        assert_eq!(config.fill_tools, vec![Tool::Text]);
+        assert_eq!(config.stroke_tools.len(), 4);
+        // An arrow has no interior to fill and a mosaic has no paint at all, so
+        // listing them for that paint is rejected instead of silently ignored.
+        let arrow_fill = Config {
+            fill_tools: vec![Tool::Arrow],
+            ..Config::default()
+        };
+        assert_eq!(
+            arrow_fill.validate(),
+            Err("paint defaults list tools that cannot paint that way")
+        );
+        let mosaic_stroke = Config {
+            stroke_tools: vec![Tool::Mosaic],
+            ..Config::default()
+        };
+        assert_eq!(
+            mosaic_stroke.validate(),
+            Err("paint defaults list tools that cannot paint that way")
+        );
+    }
+    #[test]
+    fn pin_shadow_defaults_on_and_rejects_unusable_metrics() {
+        // Pins lift off the desktop by default; a configuration written before
+        // the shadow existed gets the same defaults.
+        assert!(Config::default().pin_shadow);
+        let config: Config = serde_json::from_str("{\"version\":1}").unwrap();
+        assert!(config.pin_shadow);
+        assert_eq!(config.pin_shadow_blur, DEFAULT_PIN_SHADOW_BLUR);
+        assert_eq!(config.pin_shadow_offset, DEFAULT_PIN_SHADOW_OFFSET);
+        assert_eq!(config.pin_shadow_opacity, DEFAULT_PIN_SHADOW_OPACITY);
+        assert!(config.validate().is_ok());
+        // Every metric has a range the pin process sizes its window by, so a
+        // hand-edited value outside it must not reach the pin.
+        for broken in [
+            Config {
+                pin_shadow_blur: MAX_PIN_SHADOW_BLUR + 1,
+                ..Config::default()
+            },
+            Config {
+                pin_shadow_offset: MAX_PIN_SHADOW_OFFSET + 1,
+                ..Config::default()
+            },
+            Config {
+                pin_shadow_opacity: 101,
+                ..Config::default()
+            },
+        ] {
+            assert_eq!(broken.validate(), Err("invalid pin shadow settings"));
+        }
     }
     #[test]
     fn window_state_defaults_to_unset_positions() {

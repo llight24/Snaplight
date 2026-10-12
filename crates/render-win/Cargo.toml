@@ -8,3 +8,6 @@ snaplight-domain.workspace = true
 snaplight-platform.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+# The glyph-outline text renderer is a COM interface implementation, which needs
+# the core crate in scope.
+windows-core.workspace = true

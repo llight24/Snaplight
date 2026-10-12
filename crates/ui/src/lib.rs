@@ -1,20 +1,11 @@
 slint::include_modules!();
-use slint::Model;
-pub use slint::{ComponentHandle, ModelRc, PhysicalPosition, SharedString, VecModel, Window};
-use snaplight_domain::{Config, Tool, WindowDetect};
-/// Stable command id for each tool. The toolbar sends these ids, so the visual
-/// order can change without changing the editor's tool mapping.
-fn tool_id(tool: Tool) -> i32 {
-    match tool {
-        Tool::Select => 0,
-        Tool::Rectangle => 1,
-        Tool::Ellipse => 2,
-        Tool::Arrow => 3,
-        Tool::Pen => 4,
-        Tool::Mosaic => 5,
-        Tool::Text => 6,
-    }
-}
+pub use slint::{
+    Color, ComponentHandle, Model, ModelRc, PhysicalPosition, SharedString, VecModel, Window,
+};
+use snaplight_domain::{
+    format_hex_color, parse_hex_color, Config, Tool, WindowDetect, DEFAULT_STROKE_COLOR,
+    MAX_PIN_SHADOW_BLUR, MAX_PIN_SHADOW_OFFSET,
+};
 /// Display name of each tool. Settings and the accessibility tree are the only
 /// places the toolbar shows text, and both are Chinese first.
 fn tool_label(tool: Tool) -> &'static str {
@@ -32,7 +23,7 @@ fn tool_items(tools: &[Tool]) -> Vec<ToolItem> {
     tools
         .iter()
         .map(|tool| ToolItem {
-            id: tool_id(*tool),
+            id: tool.id(),
             label: tool_label(*tool).into(),
         })
         .collect()
@@ -43,33 +34,88 @@ pub fn tool_order(model: &ModelRc<ToolItem>) -> Vec<i32> {
         .filter_map(|index| model.row_data(index).map(|item| item.id))
         .collect()
 }
+/// Ids and tools are defined once, in the domain, so the toolbar and the editor
+/// cannot disagree about what a message means.
 pub fn tool_from_id(id: i32) -> Option<Tool> {
-    [
-        Tool::Select,
-        Tool::Rectangle,
-        Tool::Ellipse,
-        Tool::Arrow,
-        Tool::Pen,
-        Tool::Mosaic,
-        Tool::Text,
-    ]
-    .get(usize::try_from(id).ok()?)
-    .copied()
+    Tool::from_id(id)
+}
+/// Parses a configured `#RRGGBB` colour, falling back to the default stroke red
+/// so a hand-edited configuration cannot leave the UI without a colour.
+fn config_color(text: &str) -> slint::Color {
+    let rgba = parse_hex_color(text)
+        .or_else(|| parse_hex_color(DEFAULT_STROKE_COLOR))
+        .unwrap_or([0.95, 0.2, 0.25, 1.0]);
+    slint_color(rgba)
+}
+/// One settings row per stable tool id, so every tool gets a paint choice even
+/// when the configured lists omit it. Tools that cannot paint the kind at all
+/// always report `false`, matching the options panel's conditional rows.
+pub fn tool_paint_rows(config: &Config) -> Vec<ToolPaintRow> {
+    Tool::ALL
+        .iter()
+        .map(|&tool| ToolPaintRow {
+            tool: tool.id(),
+            label: tool_label(tool).into(),
+            stroke: tool.can_stroke() && config.stroke_tools.contains(&tool),
+            fill: tool.can_fill() && config.fill_tools.contains(&tool),
+        })
+        .collect()
+}
+/// Reads the two configured tool lists back out of the settings model. Unknown
+/// tool ids are ignored and unchecked rows are left out.
+pub fn paint_tools(rows: &ModelRc<ToolPaintRow>) -> (Vec<Tool>, Vec<Tool>) {
+    let mut stroke = Vec::new();
+    let mut fill = Vec::new();
+    for index in 0..rows.row_count() {
+        let Some(row) = rows.row_data(index) else {
+            continue;
+        };
+        let Some(tool) = Tool::from_id(row.tool) else {
+            continue;
+        };
+        if row.stroke && tool.can_stroke() {
+            stroke.push(tool);
+        }
+        if row.fill && tool.can_fill() {
+            fill.push(tool);
+        }
+    }
+    (stroke, fill)
 }
 pub fn toolbar(config: &Config) -> Result<Toolbar, slint::PlatformError> {
     let ui = Toolbar::new()?;
     ui.set_actions(ModelRc::new(VecModel::from(toolbar_actions())));
     ui.set_bar_width(toolbar_logical_size(&config.tools).0 as f32);
     ui.set_tools(ModelRc::new(VecModel::from(tool_items(&config.tools))));
-    ui.set_stroke(config.stroke_width as i32);
+    ui.set_stroke_width(config.stroke_width as i32);
     ui.set_block(config.mosaic_block as i32);
+    ui.set_fill_opacity(config.fill_opacity as i32);
+    ui.set_font_size(config.font_size as i32);
+    ui.set_stroke_color(config_color(&config.stroke_color));
+    ui.set_fill_color(config_color(&config.fill_color));
     Ok(ui)
 }
 /// Quick-settings window shown when a tool's drop-down arrow is clicked.
 pub fn options_panel(config: &Config) -> Result<OptionsPanel, slint::PlatformError> {
     let ui = OptionsPanel::new()?;
-    ui.set_stroke(config.stroke_width as i32);
+    ui.set_stroke_width(config.stroke_width as i32);
     ui.set_block(config.mosaic_block as i32);
+    ui.set_fill_opacity(config.fill_opacity as i32);
+    ui.set_font_size(config.font_size as i32);
+    ui.set_stroke_color(config_color(&config.stroke_color));
+    ui.set_fill_color(config_color(&config.fill_color));
+    Ok(ui)
+}
+/// Persistent paint bar under the selection. It starts from the same values as
+/// the options panel; the editor sets the active tool when it shows it.
+pub fn paint_bar(config: &Config) -> Result<PaintBar, slint::PlatformError> {
+    let ui = PaintBar::new()?;
+    ui.set_stroke_width(config.stroke_width as i32);
+    ui.set_block(config.mosaic_block as i32);
+    ui.set_fill_opacity(config.fill_opacity as i32);
+    ui.set_font_size(config.font_size as i32);
+    ui.set_stroke_color(config_color(&config.stroke_color));
+    ui.set_fill_color(config_color(&config.fill_color));
     Ok(ui)
 }
 /// File-name slugs of the settings navigation entries, in the order the window
@@ -92,7 +138,17 @@ pub fn settings(config: &Config) -> Result<Settings, slint::PlatformError> {
     ui.set_tools(ModelRc::new(VecModel::from(tool_items(&config.tools))));
     ui.set_stroke(config.stroke_width as i32);
     ui.set_block(config.mosaic_block as i32);
+    ui.set_fill_opacity(config.fill_opacity as i32);
+    ui.set_font_size(config.font_size as i32);
+    ui.set_stroke_color_value(config.stroke_color.clone().into());
+    ui.set_fill_color_value(config.fill_color.clone().into());
+    ui.set_paint_tools(ModelRc::new(VecModel::from(tool_paint_rows(config))));
     ui.set_gpu_pins(config.gpu_pins);
+    ui.set_pin_close_confirm(config.pin_close_confirm);
+    ui.set_pin_shadow(config.pin_shadow);
+    ui.set_pin_shadow_blur(config.pin_shadow_blur.min(MAX_PIN_SHADOW_BLUR) as i32);
+    ui.set_pin_shadow_offset(config.pin_shadow_offset.min(MAX_PIN_SHADOW_OFFSET) as i32);
+    ui.set_pin_shadow_opacity(config.pin_shadow_opacity.min(100) as i32);
     ui.set_background_value(config.theme.background.clone().into());
     ui.set_foreground_value(config.theme.foreground.clone().into());
     ui.set_accent_value(config.theme.accent.clone().into());
@@ -177,12 +233,45 @@ pub fn toolbar_logical_size(tools: &[Tool]) -> (u32, u32) {
         52,
     )
 }
-/// Logical size of the tool options window; keep in sync with `toolbar.slint`.
-pub const OPTIONS_LOGICAL_SIZE: (u32, u32) = (400, 52);
+/// Logical size of the options panel for one tool: the paint row plus the close
+/// button, which only the panel has.
+pub fn paint_logical_size(tool: i32) -> (u32, u32) {
+    const CLOSE_BUTTON: u32 = 40;
+    const GAP: u32 = 10;
+    let (width, height) = paint_row_size(tool);
+    (width + CLOSE_BUTTON + GAP, height)
+}
+/// Logical size of the bottom paint bar for one tool; it carries the row alone.
+pub fn paint_bar_logical_size(tool: i32) -> (u32, u32) {
+    paint_row_size(tool)
+}
+/// Width and height of the row of paint controls for one tool. The options panel
+/// and the bottom paint bar show the same row, so both size themselves to it and
+/// a tool with fewer controls gets a shorter window instead of a wide one with
+/// empty space. The widths come from what the smoke measures for the row at its
+/// preferred size, plus that row's own padding and a little slack: the two shape
+/// groups need 423, text adds the size and text fields (711), a single outline
+/// group 219 and the mosaic row 186.
+fn paint_row_size(tool: i32) -> (u32, u32) {
+    const ROW_HEIGHT: u32 = 52;
+    let width = match tool {
+        1 | 2 => 430,
+        6 => 730,
+        // Mosaic shows one label and one spin box, the pen and arrow a single
+        // outline group.
+        5 => 205,
+        _ => 245,
+    };
+    (width, ROW_HEIGHT)
+}
+/// Logical size of the colour picker; keep in sync with `toolbar.slint`.
+pub const PICKER_LOGICAL_SIZE: (u32, u32) = (280, 256);
 /// Window titles, used to find the Slint-created windows again for the native
 /// rounding, taskbar styling and app icon; keep in sync with `toolbar.slint`.
 pub const TOOLBAR_TITLE: &str = "Snaplight Tools";
 pub const OPTIONS_TITLE: &str = "Snaplight Tool Options";
+pub const PICKER_TITLE: &str = "Snaplight Color";
+pub const PAINT_BAR_TITLE: &str = "Snaplight Paint";
 /// The settings window keeps its system frame, so it is the one Slint window
 /// that also needs the application icon applied to it.
 pub const SETTINGS_TITLE: &str = "Snaplight 设置";
@@ -197,6 +286,35 @@ pub fn scale_to_physical(logical: (u32, u32), dpi: u32) -> (i32, i32) {
 pub type ToolbarWeak = slint::Weak<Toolbar>;
 /// Handle to the tool options window that other threads may use.
 pub type PanelWeak = slint::Weak<OptionsPanel>;
+/// Handle to the colour picker window that other threads may use.
+pub type PickerWeak = slint::Weak<ColorPicker>;
+/// Handle to the persistent paint bar that other threads may use.
+pub type PaintBarWeak = slint::Weak<PaintBar>;
+/// Paint values of the toolbar for one tool id, so the editor can seed the
+/// options panel and the paint bar before showing them. `stroke-tools` and
+/// `fill-tools` are indexed by stable tool id; an out-of-range id reads false.
+pub fn toolbar_paint(toolbar: &Toolbar, tool: i32) -> ToolPaint {
+    let flag = |tools: ModelRc<bool>, id: i32| {
+        usize::try_from(id)
+            .ok()
+            .and_then(|id| tools.row_data(id))
+            .unwrap_or(false)
+    };
+    let stroke_on = flag(toolbar.get_stroke_tools(), tool);
+    let fill_on = flag(toolbar.get_fill_tools(), tool);
+    ToolPaint {
+        tool,
+        stroke_width: toolbar.get_stroke_width(),
+        fill_opacity: toolbar.get_fill_opacity(),
+        font_size: toolbar.get_font_size(),
+        block: toolbar.get_block(),
+        stroke_color: toolbar.get_stroke_color(),
+        fill_color: toolbar.get_fill_color(),
+        stroke_on,
+        fill_on,
+        text: toolbar.get_text_value(),
+    }
+}
 /// Hides the tool options from another thread, so quick settings never outlive
 /// the position of the toolbar they belong to.
 pub fn hide_panel(weak: &PanelWeak) {
@@ -204,6 +322,91 @@ pub fn hide_panel(weak: &PanelWeak) {
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = weak.upgrade() {
             let _ = ui.hide();
+        }
+    });
+}
+/// Hides the paint bar from another thread.
+pub fn hide_paint_bar(weak: &PaintBarWeak) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            let _ = ui.hide();
+        }
+    });
+}
+/// Hides the colour picker from another thread, e.g. after the editor consumes
+/// a picked colour.
+pub fn hide_picker(weak: &PickerWeak) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            let _ = ui.hide();
+        }
+    });
+}
+/// Writes a paint snapshot and the two tool lists into the toolbar from another
+/// thread, so a change made in the settings or the options panel is reflected on
+/// the floating bar.
+pub fn set_toolbar_paint(
+    weak: &ToolbarWeak,
+    paint: &ToolPaint,
+    stroke_tools: Vec<bool>,
+    fill_tools: Vec<bool>,
+) {
+    let weak = weak.clone();
+    let paint = paint.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_stroke_width(paint.stroke_width);
+            ui.set_fill_opacity(paint.fill_opacity);
+            ui.set_font_size(paint.font_size);
+            ui.set_block(paint.block);
+            ui.set_text_value(paint.text.clone());
+            ui.set_stroke_color(paint.stroke_color);
+            ui.set_fill_color(paint.fill_color);
+            ui.set_stroke_tools(ModelRc::new(VecModel::from(stroke_tools)));
+            ui.set_fill_tools(ModelRc::new(VecModel::from(fill_tools)));
+        }
+    });
+}
+/// Writes a paint snapshot into the options panel from another thread, so the
+/// panel opens with the values of the active tool.
+pub fn set_panel_paint(weak: &PanelWeak, paint: &ToolPaint) {
+    let weak = weak.clone();
+    let paint = paint.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_tool(paint.tool);
+            ui.set_stroke_width(paint.stroke_width);
+            ui.set_fill_opacity(paint.fill_opacity);
+            ui.set_font_size(paint.font_size);
+            ui.set_block(paint.block);
+            ui.set_text_value(paint.text.clone());
+            ui.set_stroke_color(paint.stroke_color);
+            ui.set_fill_color(paint.fill_color);
+            ui.set_stroke_on(paint.stroke_on);
+            ui.set_fill_on(paint.fill_on);
+        }
+    });
+}
+/// Writes a paint snapshot into the paint bar from another thread. Same fields
+/// as `set_panel_paint`, kept separate because the two windows are distinct
+/// component types.
+pub fn set_paint_bar(weak: &PaintBarWeak, paint: &ToolPaint) {
+    let weak = weak.clone();
+    let paint = paint.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_tool(paint.tool);
+            ui.set_stroke_width(paint.stroke_width);
+            ui.set_fill_opacity(paint.fill_opacity);
+            ui.set_font_size(paint.font_size);
+            ui.set_block(paint.block);
+            ui.set_text_value(paint.text.clone());
+            ui.set_stroke_color(paint.stroke_color);
+            ui.set_fill_color(paint.fill_color);
+            ui.set_stroke_on(paint.stroke_on);
+            ui.set_fill_on(paint.fill_on);
         }
     });
 }
@@ -229,6 +432,16 @@ pub fn set_toolbar_status(weak: &ToolbarWeak, status: String) {
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = weak.upgrade() {
             ui.set_status(status.into());
+        }
+    });
+}
+/// Selects a tool in the toolbar, so the highlight follows a tool the canvas
+/// switched to on its own (the Space shortcut returning to drawing).
+pub fn set_toolbar_active(weak: &ToolbarWeak, tool: i32) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_active(tool);
         }
     });
 }
@@ -265,6 +478,121 @@ pub fn invoke(f: impl FnOnce() + Send + 'static) {
     let _ = slint::invoke_from_event_loop(f);
 }
 
+/// Converts sRGB components to a Slint colour. Alpha is kept so a fill colour
+/// round-trips without losing its opacity.
+pub fn slint_color(rgba: [f32; 4]) -> slint::Color {
+    let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    slint::Color::from_argb_u8(byte(rgba[3]), byte(rgba[0]), byte(rgba[1]), byte(rgba[2]))
+}
+/// Converts a Slint colour back to sRGB components.
+pub fn rgba_of(color: slint::Color) -> [f32; 4] {
+    [
+        f32::from(color.red()) / 255.0,
+        f32::from(color.green()) / 255.0,
+        f32::from(color.blue()) / 255.0,
+        f32::from(color.alpha()) / 255.0,
+    ]
+}
+/// HSV (each 0..1) to opaque sRGB, using the standard six-sector formula.
+fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> [f32; 4] {
+    let hue = hue.rem_euclid(1.0);
+    let saturation = saturation.clamp(0.0, 1.0);
+    let value = value.clamp(0.0, 1.0);
+    let sector = hue * 6.0;
+    let fraction = sector - sector.floor();
+    let p = value * (1.0 - saturation);
+    let q = value * (1.0 - fraction * saturation);
+    let t = value * (1.0 - (1.0 - fraction) * saturation);
+    let (red, green, blue) = match sector.floor() as i32 % 6 {
+        0 => (value, t, p),
+        1 => (q, value, p),
+        2 => (p, value, t),
+        3 => (p, q, value),
+        4 => (t, p, value),
+        _ => (value, p, q),
+    };
+    [red, green, blue, 1.0]
+}
+/// sRGB to HSV. A grey or black input has no hue, so it reports zero hue and
+/// saturation; `picker_set_color` keeps the previous hue for black.
+fn rgb_to_hsv(red: f32, green: f32, blue: f32) -> (f32, f32, f32) {
+    let max = red.max(green).max(blue);
+    let min = red.min(green).min(blue);
+    let delta = max - min;
+    if delta <= f32::EPSILON {
+        return (0.0, 0.0, max);
+    }
+    let hue = if max == red {
+        (green - blue) / delta
+    } else if max == green {
+        (blue - red) / delta + 2.0
+    } else {
+        (red - green) / delta + 4.0
+    };
+    ((hue / 6.0).rem_euclid(1.0), delta / max, max)
+}
+/// Parses `#RRGGBB`(/`AA`) into a Slint colour; the validation path behind
+/// `picker_set_hex`.
+fn picker_hex_color(text: &str) -> Option<slint::Color> {
+    parse_hex_color(text).map(slint_color)
+}
+/// Creates the colour picker and seeds it with the default stroke colour, so
+/// its swatch, hex text and hue square agree from the first frame.
+pub fn color_picker() -> Result<ColorPicker, slint::PlatformError> {
+    let ui = ColorPicker::new()?;
+    picker_set_color(&ui, config_color(DEFAULT_STROKE_COLOR));
+    Ok(ui)
+}
+/// Moves the hue slider, keeping the current saturation and brightness. The
+/// square's base colour is the fully saturated shade of the new hue.
+pub fn picker_set_hue(picker: &ColorPicker, hue: f32) -> slint::Color {
+    let hue = hue.clamp(0.0, 1.0);
+    let saturation = picker.get_saturation().clamp(0.0, 1.0);
+    let brightness = picker.get_brightness().clamp(0.0, 1.0);
+    picker.set_hue(hue);
+    picker.set_sv_base(slint_color(hsv_to_rgb(hue, 1.0, 1.0)));
+    let color = slint_color(hsv_to_rgb(hue, saturation, brightness));
+    picker.set_color_value(color);
+    picker.set_hex_text(format_hex_color(rgba_of(color)).into());
+    color
+}
+/// Moves the position inside the saturation/brightness square, keeping the hue.
+pub fn picker_set_sv(picker: &ColorPicker, saturation: f32, brightness: f32) -> slint::Color {
+    let saturation = saturation.clamp(0.0, 1.0);
+    let brightness = brightness.clamp(0.0, 1.0);
+    let hue = picker.get_hue().clamp(0.0, 1.0);
+    picker.set_saturation(saturation);
+    picker.set_brightness(brightness);
+    let color = slint_color(hsv_to_rgb(hue, saturation, brightness));
+    picker.set_color_value(color);
+    picker.set_hex_text(format_hex_color(rgba_of(color)).into());
+    color
+}
+/// Parses a hex string typed into the picker. Returns `None` and leaves the
+/// window untouched when the text is not a colour.
+pub fn picker_set_hex(picker: &ColorPicker, text: &str) -> Option<slint::Color> {
+    let color = picker_hex_color(text)?;
+    Some(picker_set_color(picker, color))
+}
+/// Applies a colour wholesale, deriving hue, saturation and the square base
+/// from its RGB. Black keeps the previous hue and saturation because it has
+/// none of its own.
+pub fn picker_set_color(picker: &ColorPicker, color: slint::Color) -> slint::Color {
+    let rgba = rgba_of(color);
+    let (mut hue, mut saturation, brightness) = rgb_to_hsv(rgba[0], rgba[1], rgba[2]);
+    if brightness <= f32::EPSILON {
+        hue = picker.get_hue();
+        saturation = picker.get_saturation();
+    }
+    picker.set_hue(hue);
+    picker.set_saturation(saturation);
+    picker.set_brightness(brightness);
+    picker.set_sv_base(slint_color(hsv_to_rgb(hue, 1.0, 1.0)));
+    picker.set_color_value(color);
+    picker.set_hex_text(format_hex_color(rgba).into());
+    color
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,7 +627,16 @@ mod tests {
             scale_to_physical(toolbar_logical_size(&Config::default().tools), 144),
             (1137, 78)
         );
-        assert_eq!(scale_to_physical(OPTIONS_LOGICAL_SIZE, 144), (600, 78));
+        // The paint rows are sized per tool: the text tool is the widest, the two
+        // shape groups come next and a single group is the shortest.
+        assert_eq!(scale_to_physical(paint_logical_size(6), 96), (780, 52));
+        assert_eq!(scale_to_physical(paint_logical_size(6), 144), (1170, 78));
+        assert_eq!(scale_to_physical(paint_logical_size(1), 96), (480, 52));
+        assert_eq!(scale_to_physical(paint_logical_size(5), 96), (255, 52));
+        assert_eq!(scale_to_physical(paint_bar_logical_size(6), 96), (730, 52));
+        assert_eq!(scale_to_physical(paint_bar_logical_size(1), 96), (430, 52));
+        // The panel is the row plus its close button, the bar is the row alone.
+        assert_eq!(paint_logical_size(4).0 - paint_bar_logical_size(4).0, 50);
         assert_eq!(
             scale_to_physical(toolbar_logical_size(&Config::default().tools), 192),
             (1516, 104)
@@ -350,5 +687,76 @@ mod tests {
         );
         assert_eq!(config.tools.len(), 7);
         assert!(config.validate().is_ok());
+    }
+    #[test]
+    fn slint_colour_round_trips_within_a_byte() {
+        for rgba in [
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [0.95, 0.2, 0.25, 1.0],
+            [0.0, 0.5, 1.0, 0.25],
+        ] {
+            let back = rgba_of(slint_color(rgba));
+            for (expected, actual) in rgba.iter().zip(back.iter()) {
+                assert!(
+                    (expected - actual).abs() <= 1.0 / 255.0,
+                    "{rgba:?} -> {back:?}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn picker_hex_parsing_accepts_only_colours() {
+        let red = picker_hex_color("#F23340").expect("valid hex");
+        assert_eq!(
+            red,
+            slint_color([242.0 / 255.0, 51.0 / 255.0, 64.0 / 255.0, 1.0])
+        );
+        // Surrounding whitespace and alpha are accepted, as in the domain.
+        assert!(picker_hex_color(" #F23340 ").is_some());
+        assert!(picker_hex_color("#F2334000").is_some());
+        for text in ["F23340", "#GGGGGG", "#F2334", "", "#F23340Z"] {
+            assert!(
+                picker_hex_color(text).is_none(),
+                "{text} should be rejected"
+            );
+        }
+    }
+    #[test]
+    fn hsv_round_trips_through_rgb() {
+        for (hue, saturation, brightness) in [
+            (0.0, 1.0, 0.95),
+            (0.5, 0.8, 0.6),
+            (0.98, 0.5, 1.0),
+            (0.33, 1.0, 1.0),
+        ] {
+            let rgb = hsv_to_rgb(hue, saturation, brightness);
+            let (h, s, v) = rgb_to_hsv(rgb[0], rgb[1], rgb[2]);
+            assert!((h - hue).abs() < 1e-3, "hue {hue} -> {h}");
+            assert!(
+                (s - saturation).abs() < 1e-3,
+                "saturation {saturation} -> {s}"
+            );
+            assert!(
+                (v - brightness).abs() < 1e-3,
+                "brightness {brightness} -> {v}"
+            );
+        }
+        // Pure red resolves to hue zero with full saturation.
+        assert_eq!(rgb_to_hsv(1.0, 0.0, 0.0), (0.0, 1.0, 1.0));
+    }
+    #[test]
+    fn paint_rows_round_trip_through_the_settings_model() {
+        let config = Config::default();
+        let rows = ModelRc::new(VecModel::from(tool_paint_rows(&config)));
+        let (stroke, fill) = paint_tools(&rows);
+        assert_eq!(stroke, config.stroke_tools);
+        assert_eq!(fill, config.fill_tools);
+        let rows = tool_paint_rows(&config);
+        // Mosaic cannot be outlined and the arrow cannot be filled, so their
+        // rows stay false even if a configuration listed them.
+        assert!(!rows.iter().find(|row| row.tool == 5).unwrap().stroke);
+        assert!(!rows.iter().find(|row| row.tool == 3).unwrap().fill);
+        assert!(rows.iter().find(|row| row.tool == 6).unwrap().fill);
     }
 }
