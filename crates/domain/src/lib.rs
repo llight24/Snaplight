@@ -5,6 +5,8 @@ use std::{
     time::Instant,
 };
 
+pub mod long_capture;
+
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Default global shortcut that opens the capture overlay.
 pub const DEFAULT_CAPTURE_HOTKEY: &str = "Ctrl+Shift+A";

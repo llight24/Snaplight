@@ -850,6 +850,61 @@ pub mod native {
             );
         }
     }
+    /// Cursor position in physical screen pixels.
+    pub fn cursor_position() -> Option<ScreenPoint> {
+        unsafe {
+            let mut point = POINT::default();
+            GetCursorPos(&mut point).ok()?;
+            Some(ScreenPoint {
+                x: point.x,
+                y: point.y,
+            })
+        }
+    }
+    /// Moves the cursor, in physical screen pixels.
+    pub fn set_cursor_position(point: ScreenPoint) -> bool {
+        unsafe { SetCursorPos(point.x, point.y).is_ok() }
+    }
+    /// Sends mouse-wheel notches at the current cursor position. Positive scrolls
+    /// up, negative down; one notch is `WHEEL_DELTA` (120).
+    ///
+    /// The wheel goes to the window under the cursor, which is why long capture
+    /// parks the cursor inside the region it scrolls and restores it afterwards.
+    pub fn scroll_wheel(notches: i32) -> bool {
+        const WHEEL_DELTA: i32 = 120;
+        unsafe {
+            let input = INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        mouseData: (notches * WHEEL_DELTA) as u32,
+                        dwFlags: MOUSEEVENTF_WHEEL,
+                        ..Default::default()
+                    },
+                },
+            };
+            SendInput(&[input], std::mem::size_of::<INPUT>() as i32) == 1
+        }
+    }
+    /// True while the key is down, whichever window owns the focus. Long capture
+    /// watches `VK_ESCAPE` this way because it runs with its own windows hidden.
+    pub fn key_down(key: VIRTUAL_KEY) -> bool {
+        unsafe { (GetAsyncKeyState(key.0 as i32) as u16 & 0x8000) != 0 }
+    }
+    /// Top-level window under a screen point.
+    pub fn root_window_at(point: ScreenPoint) -> Option<HWND> {
+        unsafe {
+            let window = WindowFromPoint(POINT {
+                x: point.x,
+                y: point.y,
+            });
+            if window.is_invalid() {
+                return None;
+            }
+            let root = GetAncestor(window, GA_ROOT);
+            Some(if root.is_invalid() { window } else { root })
+        }
+    }
     pub fn message_loop() -> Result<()> {
         unsafe {
             let mut msg = MSG::default();

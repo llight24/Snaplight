@@ -499,6 +499,15 @@ unsafe fn gdi_bits(screen: RECT) -> Result<(u32, u32, Vec<u8>)> {
     ReleaseDC(None, desktop);
     result
 }
+/// Copies a desktop rectangle into a top-down BGRA8 buffer through GDI.
+///
+/// Long capture re-reads the scrolled region many times per session; GDI is the
+/// cheapest path that returns pixels for an arbitrary screen rectangle without a
+/// device round-trip. HDR displays go through the duplication path instead, so
+/// their content is tone mapped differently here.
+pub fn screen_pixels(screen: RECT) -> Result<(u32, u32, Vec<u8>)> {
+    unsafe { gdi_bits(screen) }
+}
 unsafe fn capture_gdi(gpu: &Gpu, screen: RECT) -> Result<ID3D11Texture2D> {
     let (width, height, bytes) = gdi_bits(screen)?;
     let td = D3D11_TEXTURE2D_DESC {
