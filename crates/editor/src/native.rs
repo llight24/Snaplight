@@ -897,7 +897,9 @@ impl Canvas {
     /// everything outside its selection — writes the result back the way
     /// 「钉住」 does, and reports what it found. The whole round trip of a pinned
     /// image can therefore be verified without a user clicking anything.
-    fn pin_edit_demo(&mut self) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error>> {
+    fn pin_edit_demo(
+        &mut self,
+    ) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error>> {
         const FILL: [f32; 4] = [0.1, 0.8, 0.3, 1.0];
         let edit = self.pin_edit.as_ref().ok_or("not a pinned image session")?;
         let (image_path, document_path) = (edit.image_path(), edit.document_path());
@@ -963,7 +965,9 @@ impl Canvas {
             255,
         ];
         if !within(painted, wanted, 8) {
-            return Err(format!("the scripted annotation is {painted:?}, expected {wanted:?}").into());
+            return Err(
+                format!("the scripted annotation is {painted:?}, expected {wanted:?}").into(),
+            );
         }
         // Bottom right corner: painted by neither the annotation nor any chrome,
         // so it shows exactly what the picture holds when nothing is dimmed.
@@ -1125,7 +1129,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                                 Some(_) => IDC_SIZENESW,
                                 // Inside the committed region the select tool moves
                                 // it, so the cursor offers that instead of a cross.
-                                None if move_target(state.tool, state.doc.selection, p).is_some() => {
+                                None if move_target(state.tool, state.doc.selection, p)
+                                    .is_some() =>
+                                {
                                     IDC_SIZEALL
                                 }
                                 None => IDC_CROSS,
@@ -1454,8 +1460,7 @@ impl PinEdit {
         let Some(image) = image else {
             return Ok(None);
         };
-        let rect =
-            rect.ok_or("--edit-pin needs --pin-rect=x,y,w,h to know where the pin is")?;
+        let rect = rect.ok_or("--edit-pin needs --pin-rect=x,y,w,h to know where the pin is")?;
         Ok(Some(Self {
             rect,
             stem: PathBuf::from(image).with_extension(""),
@@ -1482,8 +1487,8 @@ impl PinEdit {
     fn load(
         &self,
     ) -> std::result::Result<(ImageDescriptor, Vec<u8>, Document), Box<dyn std::error::Error>> {
-        let (image, base) = read_pixels(&self.source_path())
-            .or_else(|_| read_pixels(&self.image_path()))?;
+        let (image, base) =
+            read_pixels(&self.source_path()).or_else(|_| read_pixels(&self.image_path()))?;
         let document = match std::fs::read(self.document_path()) {
             Ok(bytes) => serde_json::from_slice::<Document>(&bytes)?,
             // A pin saved without a document still opens: it is a picture, with
@@ -1527,14 +1532,8 @@ impl PinEdit {
             selection: None,
             annotations: vec![],
         };
-        atomic_write(
-            &self.pin_document_path(),
-            &serde_json::to_vec(&flattened)?,
-        )?;
-        atomic_write(
-            &self.document_path(),
-            &serde_json::to_vec_pretty(document)?,
-        )?;
+        atomic_write(&self.pin_document_path(), &serde_json::to_vec(&flattened)?)?;
+        atomic_write(&self.document_path(), &serde_json::to_vec_pretty(document)?)?;
         // A pin that had no source keeps the picture it started from, so the
         // next session is editable even though this one was not handed one.
         if !self.source_path().exists() {
@@ -1543,16 +1542,31 @@ impl PinEdit {
         Ok(())
     }
 }
+/// What this editor process was asked to do: the verification switches, the long
+/// capture demo region, and the pinned image session if there is one.
+struct EditorSession {
+    /// `--smoke`: scripted checks against a synthetic frame instead of the user.
+    smoke: bool,
+    /// `--stress`: the 4K frame loop, which implies the smoke frame.
+    stress: bool,
+    /// `--long-capture-demo=x,y,w,h`: one long capture against a fixed region.
+    long_capture: Option<RECT>,
+    /// `--edit-pin=<image>`: annotate a pinned image in place.
+    pin_edit: Option<PinEdit>,
+}
 fn canvas_thread(
     config: Config,
     queue: Arc<Mutex<Vec<UiCommand>>>,
     ready: std::sync::mpsc::Sender<std::result::Result<CaptureReady, String>>,
     ui_slots: Arc<UiSlots>,
-    smoke: bool,
-    stress: bool,
-    demo: Option<RECT>,
-    mut pin_edit: Option<PinEdit>,
+    session: EditorSession,
 ) -> std::result::Result<(), String> {
+    let EditorSession {
+        smoke,
+        stress,
+        long_capture: demo,
+        mut pin_edit,
+    } = session;
     let result = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
@@ -2655,6 +2669,10 @@ fn publish_history(canvas: &Canvas) {
     // undoing the selection brings the capture back to the empty state.
     if let Some(selection) = canvas.doc.selection {
         publish_selection(canvas, selection);
+    } else if canvas.fixed_image() {
+        // A pinned image has no selection to follow, but its session still needs
+        // the toolbar — it is what offers the tools and the colours.
+        place_toolbar_for_pin(canvas);
     } else {
         park_toolbar(canvas);
     }
@@ -2807,6 +2825,38 @@ fn publish_selection(canvas: &Canvas, selection: ImageRect) {
     // The bar belongs to a finished selection: place it next to the selection and
     // put it back above the overlay, which took the mouse - and with it the top of
     // the topmost band - while the selection was dragged.
+    snaplight_ui::move_toolbar(weak, PhysicalPosition::new(x, y));
+    let logical_size = *canvas.ui_slots.toolbar_size.get().unwrap();
+    snaplight_ui::invoke(move || reshape_and_raise(snaplight_ui::TOOLBAR_TITLE, logical_size));
+}
+/// Places the toolbar inside a pinned image's window.
+///
+/// A capture session follows its selection, so the toolbar is parked until there
+/// is one. A pinned image is the whole document and has no selection, so without
+/// this the toolbar would stay parked off-screen and the session would offer no
+/// tools at all.
+fn place_toolbar_for_pin(canvas: &Canvas) {
+    let whole = ImageRect {
+        x: 0.0,
+        y: 0.0,
+        width: canvas.doc.image.width as f32,
+        height: canvas.doc.image.height as f32,
+    };
+    {
+        let mut displayed = canvas.ui_slots.toolbar_selection.lock();
+        if *displayed == Some(whole) {
+            return;
+        }
+        *displayed = Some(whole);
+    }
+    let Some(weak) = canvas.ui_slots.toolbar.get() else {
+        return;
+    };
+    let size =
+        snaplight_ui::scale_to_physical(*canvas.ui_slots.toolbar_size.get().unwrap(), canvas.dpi);
+    // Bottom-left of the pin: the toolbar is a window of its own and may reach
+    // beyond a small pin, but it starts where the picture does.
+    let (x, y) = initial_toolbar_position(canvas.screen, size);
     snaplight_ui::move_toolbar(weak, PhysicalPosition::new(x, y));
     let logical_size = *canvas.ui_slots.toolbar_size.get().unwrap();
     snaplight_ui::invoke(move || reshape_and_raise(snaplight_ui::TOOLBAR_TITLE, logical_size));
@@ -3241,8 +3291,10 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let pin_edit = PinEdit::from_args()?;
     // The demos run without the Slint toolbar: they drive the canvas directly and
     // exit when they are done.
-    let interactive =
-        !smoke && demo.is_none() && !pin_edit.as_ref().is_some_and(|edit| edit.demo);
+    let interactive = !smoke && demo.is_none() && !pin_edit.as_ref().is_some_and(|edit| edit.demo);
+    // A pinned image session keeps its own toolbar placement, inside the pin, and
+    // must not hand that position on to the next capture session.
+    let pin_session = pin_edit.is_some();
     let queue = Arc::new(Mutex::new(vec![]));
     let thread_queue = queue.clone();
     let ui_slots = Arc::new(UiSlots::default());
@@ -3254,10 +3306,12 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             thread_queue,
             tx.clone(),
             thread_slots,
-            smoke,
-            stress,
-            demo,
-            pin_edit,
+            EditorSession {
+                smoke,
+                stress,
+                long_capture: demo,
+                pin_edit,
+            },
         );
         if let Err(e) = &result {
             let _ = tx.send(Err(e.clone()));
@@ -3281,8 +3335,16 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             ready.dpi,
         );
         let parked = parked_position(size);
+        // A pinned image session has no selection to follow, so its toolbar
+        // starts inside the pin; a capture session waits off-screen until the
+        // selection places it.
+        let start = if pin_session {
+            initial_toolbar_position(ready.bounds, size)
+        } else {
+            parked
+        };
         ui.window()
-            .set_position(PhysicalPosition::new(parked.0, parked.1));
+            .set_position(PhysicalPosition::new(start.0, start.1));
         ui.show()?;
         // The window has its final size once it is shown, so the pill shape and
         // the tool window style are applied now and never again.
@@ -3488,9 +3550,10 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         snaplight_ui::hide_panel(&panel.as_weak());
         let result = snaplight_ui::run_event_loop();
         // A parked toolbar was never placed by a selection, so its position is not
-        // worth remembering.
+        // worth remembering — and neither is a pinned image session's, which sits
+        // inside the pin rather than where a capture toolbar belongs.
         let position = ui.window().position();
-        if (position.x, position.y) != parked {
+        if !pin_session && (position.x, position.y) != parked {
             remember_position(false, ui.window());
         }
         queue.lock().push(UiCommand::Action(15));

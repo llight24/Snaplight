@@ -1718,7 +1718,8 @@ impl CanvasRenderer for OverlayRenderer {
             // The detected region is only a preview: it is shown while nothing is
             // committed and the user is not drawing, and it never reaches the
             // document until a click adopts it. A fixed image never detects.
-            let hover = if selection.is_none() && !interaction.dragging && !interaction.fixed_image {
+            let hover = if selection.is_none() && !interaction.dragging && !interaction.fixed_image
+            {
                 interaction.hover
             } else {
                 None

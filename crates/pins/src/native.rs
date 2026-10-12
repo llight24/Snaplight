@@ -17,9 +17,8 @@ use windows::{
         UI::{
             HiDpi::GetDpiForWindow,
             Input::{
-                GetRawInputData, HRAWINPUT, KeyboardAndMouse::*, RAWINPUT, RAWINPUTDEVICE,
-                RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEKEYBOARD,
-                RegisterRawInputDevices,
+                GetRawInputData, KeyboardAndMouse::*, RegisterRawInputDevices, HRAWINPUT, RAWINPUT,
+                RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEKEYBOARD,
             },
             WindowsAndMessaging::*,
         },
@@ -570,7 +569,11 @@ fn draw_outline(
 /// which is how the handoff is checked without a user.
 fn spawn_pin_editor(pin: &Pin, demo: bool) -> std::io::Result<Child> {
     let rect = unsafe { pin.picture_rect() };
-    let flag = if demo { "--edit-pin-demo" } else { "--edit-pin" };
+    let flag = if demo {
+        "--edit-pin-demo"
+    } else {
+        "--edit-pin"
+    };
     Command::new(snaplight_platform::sibling("snaplight-editor")?)
         .arg(format!("{flag}={}", pin.path.display()))
         .arg(format!(
@@ -1221,6 +1224,9 @@ struct Host {
     /// Colour of the frame that marks the pin the pointer clicked, from the
     /// configured theme.
     accent: [f32; 4],
+    /// Smoke only: run the editor's scripted annotation session instead of an
+    /// interactive one, so the shortcut's own path can be checked without a user.
+    edit_demo: bool,
 }
 impl Host {
     unsafe fn open(
@@ -1460,7 +1466,7 @@ impl Host {
         else {
             return Ok(false);
         };
-        open_annotation(&mut self.pins[index], false)?;
+        open_annotation(&mut self.pins[index], self.edit_demo)?;
         Ok(true)
     }
     /// Reloads the picture of the pin whose annotation session just ended.
@@ -1487,11 +1493,17 @@ impl Host {
 }
 /// True when this raw input message is the annotation shortcut being pressed:
 /// Space, which is what the pin's context menu promises.
-unsafe fn annotation_shortcut(w: WPARAM) -> bool {
+///
+/// `WM_INPUT` carries the device type in its wparam and the handle to pass to
+/// `GetRawInputData` in its lparam.
+unsafe fn annotation_shortcut(w: WPARAM, l: LPARAM) -> bool {
+    if w.0 as u32 != RIM_TYPEKEYBOARD.0 {
+        return false;
+    }
     let mut input = RAWINPUT::default();
     let mut size = std::mem::size_of::<RAWINPUT>() as u32;
     let read = GetRawInputData(
-        HRAWINPUT(w.0 as *mut core::ffi::c_void),
+        HRAWINPUT(l.0 as *mut core::ffi::c_void),
         RID_INPUT,
         Some((&mut input as *mut RAWINPUT).cast()),
         &mut size,
@@ -1565,7 +1577,7 @@ unsafe extern "system" fn control_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                 // Pins never take focus, so the annotation shortcut arrives as raw
                 // input rather than a key message: a key message would be delivered
                 // to whatever application is in front instead.
-                if annotation_shortcut(w) {
+                if annotation_shortcut(w, l) {
                     match host.open_armed() {
                         Ok(true) => {}
                         Ok(false) => {}
@@ -1578,7 +1590,7 @@ unsafe extern "system" fn control_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                 // The annotation session's process has exited; the picture it
                 // wrote back is on disk, so the pin reloads it. The pin's address
                 // arrives as the message's wparam.
-                if let Err(e) = host.finish_edit(w.0 as usize) {
+                if let Err(e) = host.finish_edit(w.0) {
                     snaplight_platform::native::show_error(&e.to_string());
                 }
                 return LRESULT(0);
@@ -1735,12 +1747,15 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             // Same accent the editor's selection chrome uses, so the frame that
             // marks a clicked pin reads as the same idea.
             accent: parse_hex_color(&config.theme.accent).unwrap_or([0.2, 0.53, 1.0, 1.0]),
+            edit_demo: false,
         });
         SetWindowLongPtrW(control, GWLP_USERDATA, (&mut *host as *mut Host) as isize);
         // The annotation shortcut needs the keyboard while no pin has focus, which
         // raw input provides without a system-wide hook.
         if let Err(error) = register_input_sink(control) {
-            eprintln!("annotation shortcut unavailable ({error}); the context menu still annotates");
+            eprintln!(
+                "annotation shortcut unavailable ({error}); the context menu still annotates"
+            );
         }
         let address = control.0 as usize;
         if std::env::args().any(|a| a == "--smoke" || a == "--smoke-low-memory") {
@@ -2152,7 +2167,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             // picks that up when that process exits. The demo flag makes the
             // session annotate one rectangle and exit, so the handoff is checked
             // here without a user. The pin is armed the way clicking it arms it.
-            let _ = host.pins[0].arm(true)?;
+            host.pins[0].arm(true)?;
             host.pins[0].arm(false)?;
             let picture = host.pins[0].picture_rect();
             if (picture.left, picture.top) != (requested.x, requested.y) {
@@ -2164,9 +2179,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
             open_annotation(&mut host.pins[0], true)?;
             if !host.pins[0].editing || host.pins[0].armed {
-                return Err(
-                    "starting a session did not mark the pin as busy and unarmed".into(),
-                );
+                return Err("starting a session did not mark the pin as busy and unarmed".into());
             }
             let mut waited = 0;
             while host.pins[0].editing && waited < 30_000 {
@@ -2198,7 +2211,11 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             // because it presses a key and moves the pointer while the user may be
             // working somewhere else.
             if std::env::var_os("SNAPLIGHT_SMOKE_PIN_KEY").is_some() {
-                let _ = host.pins[0].arm(true)?;
+                // The shortcut's own path is what is under test, so it runs the
+                // editor's scripted session: an interactive one would wait here
+                // for a user who is not there.
+                host.edit_demo = true;
+                host.pins[0].arm(true)?;
                 let mut rect = RECT::default();
                 GetWindowRect(host.pins[0].hwnd, &mut rect)?;
                 let mut previous = POINT::default();
