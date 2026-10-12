@@ -38,16 +38,12 @@ mod pin_item {
 }
 /// Pin context menu content, drawn by the same owner-drawn card as the tray
 /// menu. `restore_hotkey` is the shortcut that brings interaction back after the
-/// pin goes click-through and `through_hotkey` the one that only does so while
-/// it is held; both are shown on the right of that entry. Destroying the pin
-/// discards the image the user pinned, so it is drawn in red.
-fn menu_entries(restore_hotkey: &str, through_hotkey: &str) -> Vec<Entry> {
-    let mut through = Item::new("鼠标穿透").with_shortcut(restore_hotkey);
-    if !through_hotkey.is_empty() && through_hotkey != restore_hotkey {
-        through = through.with_hint(format!("按住 {through_hotkey} 临时交互"));
-    }
+/// pin goes click-through, and it is shown on the right of that entry; the entry
+/// itself stays a plain label so the card never has to explain the held key.
+/// Destroying the pin discards the image the user pinned, so it is drawn in red.
+fn menu_entries(restore_hotkey: &str) -> Vec<Entry> {
     vec![
-        Entry::Item(through),
+        Entry::Item(Item::new("鼠标穿透").with_shortcut(restore_hotkey)),
         Entry::Separator,
         Entry::Item(Item::new("销毁").danger()),
     ]
@@ -66,9 +62,8 @@ struct Pin {
     temporary: bool,
     scale: f32,
     opacity: f32,
-    /// Shortcut hints shown in the context menu, resolved at startup.
+    /// Shortcut shown next to the context menu entry, resolved at startup.
     restore_hotkey: String,
-    through_hotkey: String,
 }
 impl Pin {
     unsafe fn restore(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -304,7 +299,7 @@ impl WindowService for NativeWindows {
 /// another path while it is open (a `CloseAll` command, or the destroy entry of
 /// a second menu); the window is re-checked before it is touched.
 unsafe fn show_pin_menu(pin: &mut Pin) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let entries = menu_entries(&pin.restore_hotkey, &pin.through_hotkey);
+    let entries = menu_entries(&pin.restore_hotkey);
     let choice = popup_menu::show(&entries, None);
     if pin.closed || !IsWindow(pin.hwnd).as_bool() {
         return Ok(());
@@ -517,7 +512,6 @@ impl Host {
             scale,
             opacity: 1.0,
             restore_hotkey: self.restore_hotkey.clone(),
-            through_hotkey: self.through_hotkey.clone(),
         });
         if pin.gpu.is_none() {
             pin.update_layered()?;
@@ -1013,7 +1007,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             // The pin menu is drawn by the same component as the tray menu, so the
             // smoke only has to prove that the entries are wired to the commands
             // the handler maps and that 销毁 renders as the destructive row.
-            let entries = menu_entries(DEFAULT_RESTORE_HOTKEY, DEFAULT_THROUGH_HOTKEY);
+            let entries = menu_entries(DEFAULT_RESTORE_HOTKEY);
             let menu = popup_menu::render(&entries, 1.0, None)?;
             let destroy = menu
                 .layout
@@ -1077,7 +1071,7 @@ mod tests {
     /// keep pointing at the entry that performs that command.
     #[test]
     fn pin_menu_entries_match_the_commands_the_handler_maps() {
-        let entries = menu_entries(DEFAULT_RESTORE_HOTKEY, DEFAULT_THROUGH_HOTKEY);
+        let entries = menu_entries(DEFAULT_RESTORE_HOTKEY);
         assert_eq!(entries.len(), 3);
         let divider = entries
             .iter()
@@ -1095,11 +1089,10 @@ mod tests {
         let Entry::Item(through) = &entries[pin_item::THROUGH] else {
             panic!("through entry must be an item");
         };
-        assert_eq!(
-            through.label,
-            format!("鼠标穿透（按住 {DEFAULT_THROUGH_HOTKEY} 临时交互）"),
-            "the menu must teach the held shortcut, which has no visible state"
-        );
+        // The held-interaction key has no visible state, but the entry that turns
+        // click-through on must not carry a second explanation either: the card
+        // stays as short as the tray menu's rows.
+        assert_eq!(through.label, "鼠标穿透");
         assert_eq!(through.shortcut.as_deref(), Some(DEFAULT_RESTORE_HOTKEY));
         assert!(!through.danger);
         let Entry::Item(destroy) = &entries[pin_item::DESTROY] else {
@@ -1107,18 +1100,5 @@ mod tests {
         };
         assert_eq!(destroy.label, "销毁");
         assert!(destroy.danger, "destroy closes the pin and must read red");
-    }
-    /// The hint only earns its place when it adds information: an empty or
-    /// repeated shortcut must not produce a second, identical hint.
-    #[test]
-    fn the_held_hint_is_omitted_when_it_adds_nothing() {
-        for held in ["", DEFAULT_RESTORE_HOTKEY] {
-            let entries = menu_entries(DEFAULT_RESTORE_HOTKEY, held);
-            let Entry::Item(through) = &entries[pin_item::THROUGH] else {
-                panic!("through entry must be an item");
-            };
-            assert_eq!(through.label, "鼠标穿透", "hint leaked for {held:?}");
-            assert_eq!(through.shortcut.as_deref(), Some(DEFAULT_RESTORE_HOTKEY));
-        }
     }
 }

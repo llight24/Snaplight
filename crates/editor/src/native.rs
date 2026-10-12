@@ -54,10 +54,6 @@ const ZOOM_STEP: f32 = 1.1;
 const PAN_STEP: f32 = 96.0;
 /// Timer that samples the selected region while a long capture runs.
 const LONG_CAPTURE_TIMER: usize = 1;
-/// Posted by the long-capture panel when the user finishes.
-const LONG_CAPTURE_FINISH: u32 = WM_APP + 44;
-/// Posted by the long-capture panel when the user cancels.
-const LONG_CAPTURE_CANCEL: u32 = WM_APP + 45;
 #[derive(Clone)]
 enum UiCommand {
     Action(i32),
@@ -476,6 +472,20 @@ impl Canvas {
         });
     }
     fn action(&mut self, id: i32) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // A running long capture owns the toolbar: the four action buttons act on
+        // the stitch instead of the hidden overlay document, and the drawing
+        // tools, the history and the tool options do nothing. Save, copy, pin and
+        // close therefore mean the same thing here as in a normal capture.
+        if self.long_capture.is_some() {
+            match id {
+                12 => self.copy_long_capture()?,
+                13 => self.finish_long_capture(),
+                14 => self.pin_long_capture()?,
+                15 => self.cancel_long_capture(),
+                _ => {}
+            }
+            return Ok(());
+        }
         match id {
             0..=6 => {
                 self.tool = [
@@ -505,51 +515,28 @@ impl Canvas {
                 if id == 12 {
                     clipboard(self.hwnd, &image, &bytes)?;
                 } else {
-                    let folder = self.capture_dir.clone();
-                    std::fs::create_dir_all(&folder)?;
-                    let key = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-                    let stem = folder.join(format!("{key}"));
                     let original = self.renderer.original(&self.doc)?;
-                    write_pixels(
-                        &stem.with_extension("source.bgra"),
-                        &self.doc.image,
-                        &original,
-                    )?;
-                    drop(original);
-                    atomic_write(
-                        &stem.with_extension("document.json"),
-                        &serde_json::to_vec_pretty(&self.doc)?,
-                    )?;
                     if id == 13 {
+                        let folder = self.capture_dir.clone();
+                        std::fs::create_dir_all(&folder)?;
+                        let key = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+                        let stem = folder.join(format!("{key}"));
+                        write_capture_source(&stem, &self.doc, &original)?;
                         write_png(&stem.with_extension("png"), &image, &bytes)?;
                     } else {
-                        let path = stem.with_extension("bgra");
-                        write_pixels(&path, &image, &bytes)?;
-                        let flattened = Document {
-                            version: 1,
-                            image,
-                            selection: None,
-                            annotations: vec![],
-                        };
-                        let doc_path = stem.with_extension("pin.json");
-                        atomic_write(&doc_path, &serde_json::to_vec(&flattened)?)?;
                         let origin = self.renderer.export_origin(&self.doc);
                         let screen = ScreenPoint {
                             x: self.screen.left + origin.x as i32,
                             y: self.screen.top + origin.y as i32,
                         };
-                        println!(
-                            "{}",
-                            serde_json::to_string(&Envelope::new(PinCommand::Open {
-                                image: path,
-                                document: doc_path,
-                                screen,
-                            }))?
-                        );
-                        std::io::stdout().flush()?;
-                        unsafe {
-                            PostQuitMessage(0);
-                        }
+                        write_pin_bundle(
+                            &self.capture_dir,
+                            &self.doc,
+                            &original,
+                            image,
+                            &bytes,
+                            screen,
+                        )?;
                     }
                 }
             }
@@ -794,18 +781,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 return LRESULT(0);
             }
             WM_DPICHANGED => return LRESULT(0),
-            // Long capture: the session samples the selected region on a timer, and
-            // the ring and panel windows post the two commands below.
+            // Long capture: the session samples the selected region on a timer
+            // and is driven by the toolbar's buttons through `action`.
             WM_TIMER if w.0 == LONG_CAPTURE_TIMER => {
                 state.long_capture_tick();
-                return LRESULT(0);
-            }
-            LONG_CAPTURE_FINISH => {
-                state.finish_long_capture();
-                return LRESULT(0);
-            }
-            LONG_CAPTURE_CANCEL => {
-                state.cancel_long_capture();
                 return LRESULT(0);
             }
             _ => {}
@@ -1396,7 +1375,16 @@ fn canvas_thread(
                         for command in commands {
                             match command {
                                 UiCommand::Action(id) => {
-                                    if id <= 6 {
+                                    // A running long capture owns the toolbar:
+                                    // its canvas maps the action buttons onto the
+                                    // session and ignores everything else.
+                                    if let Some(c) =
+                                        canvases.iter_mut().find(|c| c.long_capture.is_some())
+                                    {
+                                        if let Err(e) = c.action(id) {
+                                            snaplight_platform::native::show_error(&e.to_string());
+                                        }
+                                    } else if id <= 6 {
                                         for c in &mut canvases {
                                             let _ = c.action(id);
                                         }
@@ -1530,6 +1518,66 @@ fn clipboard(hwnd: HWND, image: &ImageDescriptor, bytes: &[u8]) -> Result<()> {
         closed
     }
 }
+/// Writes the two files every saved capture shares: the pristine pixels and the
+/// document that describes them.
+fn write_capture_source(
+    stem: &std::path::Path,
+    document: &Document,
+    original: &[u8],
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    write_pixels(
+        &stem.with_extension("source.bgra"),
+        &document.image,
+        original,
+    )?;
+    atomic_write(
+        &stem.with_extension("document.json"),
+        &serde_json::to_vec_pretty(document)?,
+    )?;
+    Ok(())
+}
+
+/// Writes a pin bundle into `folder` — the pristine pixels, the document, the
+/// flattened image and the pin document — and hands the pin to the pins process,
+/// which takes over and quits this editor. A normal capture and a finished long
+/// capture both go through here, so the two leave the same library behind.
+fn write_pin_bundle(
+    folder: &std::path::Path,
+    document: &Document,
+    original: &[u8],
+    image: ImageDescriptor,
+    bytes: &[u8],
+    screen: ScreenPoint,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(folder)?;
+    let key = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let stem = folder.join(format!("{key}"));
+    write_capture_source(&stem, document, original)?;
+    let path = stem.with_extension("bgra");
+    write_pixels(&path, &image, bytes)?;
+    let flattened = Document {
+        version: 1,
+        image,
+        selection: None,
+        annotations: vec![],
+    };
+    let doc_path = stem.with_extension("pin.json");
+    atomic_write(&doc_path, &serde_json::to_vec(&flattened)?)?;
+    println!(
+        "{}",
+        serde_json::to_string(&Envelope::new(PinCommand::Open {
+            image: path,
+            document: doc_path,
+            screen,
+        }))?
+    );
+    std::io::stdout().flush()?;
+    unsafe {
+        PostQuitMessage(0);
+    }
+    Ok(())
+}
+
 /// Toolbar and tool options handles shared with the canvas thread, which moves
 /// the toolbar after a selection and closes options that no longer belong to it.
 #[derive(Default)]
@@ -1538,6 +1586,9 @@ struct UiSlots {
     panel: OnceLock<snaplight_ui::PanelWeak>,
     toolbar_size: OnceLock<(u32, u32)>,
     toolbar_selection: Mutex<Option<ImageRect>>,
+    /// Physical screen rectangle of the placed toolbar, so a long capture can
+    /// keep its own pill out of the region it stitches.
+    toolbar_rect: Mutex<Option<RECT>>,
 }
 /// Captured desktop bounds, monitor DPI, and the canvas thread id.
 #[derive(Clone, Copy)]
@@ -1836,6 +1887,9 @@ fn publish_history(canvas: &Canvas) {
 }
 fn park_toolbar(canvas: &Canvas) {
     *canvas.ui_slots.toolbar_selection.lock() = None;
+    // Parked windows sit outside the virtual screen, so they cannot sit over a
+    // region either.
+    *canvas.ui_slots.toolbar_rect.lock() = None;
     if let Some(weak) = canvas.ui_slots.toolbar.get() {
         let size = snaplight_ui::scale_to_physical(
             *canvas.ui_slots.toolbar_size.get().unwrap(),
@@ -1872,6 +1926,12 @@ fn publish_selection(canvas: &Canvas, selection: ImageRect) {
     let size =
         snaplight_ui::scale_to_physical(*canvas.ui_slots.toolbar_size.get().unwrap(), canvas.dpi);
     let (x, y) = follow_position(canvas.screen, anchor, size);
+    *canvas.ui_slots.toolbar_rect.lock() = Some(RECT {
+        left: x,
+        top: y,
+        right: x + size.0,
+        bottom: y + size.1,
+    });
     snaplight_ui::set_toolbar_status(
         weak,
         format!(

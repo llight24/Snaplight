@@ -1,7 +1,8 @@
 import { Button, ComboBox, HorizontalBox, VerticalBox, SpinBox, LineEdit, CheckBox, ScrollView } from "std-widgets.slint";
 
 export struct ToolItem { id:int, label:string }
-export struct CommandItem { id:int, glyph:int, label:string }
+// `capture` marks the commands that stay live while a long capture runs.
+export struct CommandItem { id:int, glyph:int, label:string, capture:bool }
 export struct CaptureItem { id:string, label:string }
 
 // Icons are paths so the toolbar ships no image assets; the ink colour comes
@@ -74,9 +75,8 @@ component IconPin inherits ToolbarIcon {
 component IconClose inherits ToolbarIcon {
     commands: "M6 6 L18 18 M18 6 L6 18";
 }
-// Long capture: a captured band with an arrow scrolling past it. The entry is
-// visible but its engine is not connected yet, so clicking it only explains the
-// state; see the editor's command 17.
+// Long capture: a captured band with an arrow scrolling past it. Clicking it
+// starts a session on the current selection; see the editor's command 17.
 component IconLongCapture inherits ToolbarIcon {
     commands: "M5 4 H19 Q20 4 20 5 V10 Q20 11 19 11 H5 Q4 11 4 10 V5 Q4 4 5 4 Z M12 14 V20 M9 17 L12 20 L15 17";
 }
@@ -98,25 +98,28 @@ component ToolButton inherits Rectangle {
     in property <int> tool-id: 0;
     in property <bool> selected: false;
     in property <bool> has-options: false;
+    in property <bool> enabled: true;
     in property <string> label: "";
     callback activated();
     callback options-activated();
     width: root.has-options ? 50px : 40px;
     height: 40px;
     border-radius: 8px;
-    background: root.selected ? #e8f0fe : (main-hit.has-hover || arrow-hit.has-hover ? #f2f4f7 : transparent);
+    background: !root.enabled ? transparent : (root.selected ? #e8f0fe : (main-hit.has-hover || arrow-hit.has-hover ? #f2f4f7 : transparent));
     ToolGlyph {
         tool-id: root.tool-id;
-        ink: root.selected ? #1668dc : #252a31;
+        ink: !root.enabled ? #c9ced5 : (root.selected ? #1668dc : #252a31);
         x: root.has-options ? 7px : 9px;
         y: 9px;
     }
     IconChevron {
         visible: root.has-options;
+        ink: root.enabled ? #6b7280 : #c9ced5;
         x: root.width - 16px;
         y: 17px;
     }
     main-hit := TouchArea {
+        enabled: root.enabled;
         width: root.has-options ? root.width - 19px : root.width;
         height: root.height;
         accessible-role: button;
@@ -124,6 +127,7 @@ component ToolButton inherits Rectangle {
         clicked => { root.activated(); }
     }
     arrow-hit := TouchArea {
+        enabled: root.enabled;
         x: root.has-options ? root.width - 19px : root.width;
         width: root.has-options ? 19px : 0px;
         height: root.height;
@@ -203,6 +207,10 @@ export component Toolbar inherits Window {
     default-font-family: "Segoe UI";
     in property <[ToolItem]> tools;
     in property <[CommandItem]> actions;
+    // True while a long capture runs: the drawing tools, the history and the tool
+    // options step aside, only the action buttons marked `capture` stay live, and
+    // the pill stops being draggable so it cannot be moved over the region.
+    in-out property <bool> long-capture: false;
     in-out property <int> active: 0;
     in-out property <int> stroke: 3;
     in-out property <int> block: 12;
@@ -224,6 +232,7 @@ export component Toolbar inherits Window {
         HorizontalLayout {
             padding-left: 10px; padding-right: 10px; padding-top: 6px; padding-bottom: 6px; spacing: 2px;
             WindowMoveArea {
+                enabled: !root.long-capture;
                 width: 18px; height: 40px;
                 IconGrip { x: 4px; y: 12px; }
             }
@@ -232,21 +241,23 @@ export component Toolbar inherits Window {
                 label: tool.label;
                 selected: root.active == tool.id;
                 has-options: tool.id != 0;
+                enabled: !root.long-capture;
                 activated => { root.active = tool.id; root.command(tool.id); }
                 options-activated => { root.options-toggled(tool.id); }
             }
             Divider { }
             BarButton {
-                glyph: 0; label: "撤销"; enabled: root.can-undo;
+                glyph: 0; label: "撤销"; enabled: root.can-undo && !root.long-capture;
                 activated => { root.command(10); }
             }
             BarButton {
-                glyph: 1; label: "重做"; enabled: root.can-redo;
+                glyph: 1; label: "重做"; enabled: root.can-redo && !root.long-capture;
                 activated => { root.command(11); }
             }
             Divider { }
             for action in root.actions: BarButton {
                 glyph: action.glyph; label: action.label;
+                enabled: !root.long-capture || action.capture;
                 activated => {
                     if action.id == 16 { root.options-toggled(root.active); }
                     else { root.command(action.id); }

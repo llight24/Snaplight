@@ -1,6 +1,6 @@
 //! Long capture (plan B09): the user scrolls the selected region by hand while
 //! the editor stitches every new row into one tall image, then trims the last
-//! screen and opens the result as a document of its own.
+//! screen and turns the result into a document of its own.
 //!
 //! The session is driven by a timer on the overlay window instead of a blocking
 //! loop: the overlay is hidden, so the wheel keeps reaching the content
@@ -8,6 +8,11 @@
 //! Snaplight window holds the focus while the user scrolls. The region is framed
 //! by a window whose middle is a hole, so the frame can be dragged without
 //! stealing clicks or the wheel from the content inside it.
+//!
+//! The bird's eye panel is a preview and nothing else: the session is ended with
+//! the toolbar's own save, copy, pin and close buttons, which act on the stitch
+//! exactly as they act on a normal capture, so the two paths share one set of
+//! controls (see `Canvas::action`).
 
 use super::*;
 use snaplight_domain::long_capture::{Direction, Frame, LongCapture, Step};
@@ -19,11 +24,10 @@ const STILLS: u32 = 2;
 /// Thickness of the frame drawn around the region, in physical pixels. Wide
 /// enough to grab, narrow enough not to hide what sits next to the region.
 const BAND: i32 = 22;
-/// Bird's eye panel: width, gap to the region and the two fixed strips.
+/// Bird's eye panel: width, gap to the region and the title strip.
 const PANEL_WIDTH: i32 = 320;
 const PANEL_GAP: i32 = 12;
 const PANEL_TITLE: i32 = 40;
-const PANEL_BUTTONS: i32 = 52;
 const PANEL_MIN_HEIGHT: i32 = 220;
 /// Window classes of the two helper windows.
 const RING_CLASS: PCWSTR = w!("Snaplight.LongCaptureRing");
@@ -36,17 +40,14 @@ const PANEL_TEXT: COLORREF = COLORREF(0x00f2f2f2);
 const PANEL_HINT: COLORREF = COLORREF(0x00a8a8a8);
 const PANEL_WARN: COLORREF = COLORREF(0x0070b0ff);
 const BUTTON_TEXT: COLORREF = COLORREF(0x00ffffff);
-const BUTTON_BACK: COLORREF = COLORREF(0x00ff8833);
-const BUTTON_HOVER: COLORREF = COLORREF(0x00ffb070);
-const BUTTON_QUIET: COLORREF = COLORREF(0x00504840);
 
 /// One running long capture.
 pub(super) struct LongCaptureSession {
     /// The region the user selected, in screen pixels: what is stitched.
     region: RECT,
-    /// The part of `region` that is read. It excludes the bird's eye panel when
-    /// the panel had to overlap the region, because a Snaplight window must never
-    /// end up inside the stitched image.
+    /// The part of `region` that is read. It excludes the Snaplight windows that
+    /// sit over the region (the bird's eye panel and the toolbar), because a
+    /// Snaplight window must never end up inside the stitched image.
     source: RECT,
     /// `None` until the first frame has been read.
     engine: Option<LongCapture>,
@@ -64,8 +65,6 @@ pub(super) struct LongCaptureSession {
     trim_end: u32,
     /// Edge being dragged (`0` top, `1` bottom) and the screen row it started at.
     drag: Option<(u8, i32)>,
-    /// Button under the pointer in the panel (`0` finish, `1` cancel).
-    hover: Option<u8>,
     /// Key states, so a held key fires once.
     escape: bool,
     enter: bool,
@@ -111,10 +110,21 @@ impl Report {
     }
 }
 
+/// What a closed session leaves behind: the trimmed stitch and the key its
+/// capture files are named after.
+struct Stitch {
+    image: ImageDescriptor,
+    bytes: Vec<u8>,
+    key: u128,
+}
+
 impl Canvas {
     /// Starts a long capture on the current selection: the overlay is hidden, the
     /// region gets a draggable frame and a bird's eye panel, and a timer samples
     /// the region while the user scrolls the content underneath it.
+    ///
+    /// The toolbar stays on screen and carries the buttons that end the session,
+    /// so the session is driven by the same controls as a normal capture.
     pub(super) fn start_long_capture(
         &mut self,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -128,20 +138,22 @@ impl Canvas {
         if region.right - region.left < 8 || region.bottom - region.top < 8 {
             return Err("长截图区域太小：请至少框选 8 × 8 像素。".into());
         }
+        // The toolbar has to stay reachable for the duration of the session, so
+        // it is put back beside the selection (it may have been dragged) and both
+        // it and the panel are kept out of the region that gets sampled.
+        *self.ui_slots.toolbar_selection.lock() = None;
+        publish_selection(self, selection);
         let panel = panel_rect(region, self.screen);
-        let source = source_rect(region, panel);
+        let mut occluders = vec![panel];
+        if let Some(toolbar) = *self.ui_slots.toolbar_rect.lock() {
+            occluders.push(toolbar);
+        }
+        let source = source_rect(region, &occluders);
         if source.right - source.left < 8 || source.bottom - source.top < 8 {
-            return Err("长截图区域太窄：请把选区放大一些，右侧要给鸟瞰图留出位置。".into());
+            return Err("长截图区域太小：请把选区放大一些，给鸟瞰图和工具条留出位置。".into());
         }
-        // The overlay covers the region: it would be stitched into the image, and
-        // it would take the wheel away from the content being scrolled.
-        let overlay_was_visible = unsafe { IsWindowVisible(self.hwnd).as_bool() };
-        unsafe {
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
-        }
-        // The toolbar acts on the hidden canvas and shows no progress, so it is
-        // parked off screen for the duration of the session.
-        park_toolbar(self);
+        // The helper windows only draw once a session exists, so they are created
+        // before anything that would need undoing when they fail.
         let canvas = self as *mut Canvas;
         let ring = unsafe { create_helper(RING_CLASS, Some(ring_proc), region, BAND, canvas) }?;
         let panel_window =
@@ -154,6 +166,15 @@ impl Canvas {
                     return Err(error);
                 }
             };
+        // The overlay covers the region: it would be stitched into the image, and
+        // it would take the wheel away from the content being scrolled.
+        let overlay_was_visible = unsafe { IsWindowVisible(self.hwnd).as_bool() };
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+        }
+        if let Some(weak) = self.ui_slots.toolbar.get() {
+            snaplight_ui::set_toolbar_long_capture(weak, true);
+        }
         self.long_capture = Some(LongCaptureSession {
             region,
             source,
@@ -166,7 +187,6 @@ impl Canvas {
             trim_start: 0,
             trim_end: 0,
             drag: None,
-            hover: None,
             escape: false,
             enter: false,
             note: None,
@@ -262,14 +282,109 @@ impl Canvas {
 
     /// Ends the session: the trimmed stitch is saved into the capture folder and
     /// opened as this canvas's document, so it can be annotated like any capture.
+    /// This is the toolbar's save button and Enter.
     pub(super) fn finish_long_capture(&mut self) {
+        let (stitch, mut report) = self.settle_long_capture(true);
+        if let Some(stitch) = stitch {
+            match self.save_long_capture(&stitch.image, &stitch.bytes, stitch.key) {
+                Ok(path) => report.image = Some(path),
+                Err(error) => report.note = Some(format!("保存失败：{error}")),
+            }
+            if let Err(error) = self.open_document(stitch.image, stitch.bytes) {
+                self.error = Some(error.to_string());
+            }
+            // The toolbar goes back to its normal duties and is placed beside the
+            // stitch that has just become the document.
+            self.restore_after_long_capture();
+        }
+        self.report_long_capture(report);
+    }
+
+    /// Pins the stitch and quits, the same way pinning a normal capture does:
+    /// the session is closed, the result is written into the capture folder as a
+    /// bundle the pins process understands, and that process takes over.
+    /// This is the toolbar's pin button.
+    pub(super) fn pin_long_capture(
+        &mut self,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        match self.settle_long_capture(false) {
+            (Some(stitch), report) => {
+                let document = Document {
+                    version: 1,
+                    image: stitch.image.clone(),
+                    selection: None,
+                    annotations: vec![],
+                };
+                // The pin lands where the user framed the capture, which is what
+                // pinning a normal capture does with its region.
+                let region = report.region;
+                let screen = ScreenPoint {
+                    x: region.left,
+                    y: region.top,
+                };
+                write_pin_bundle(
+                    &self.capture_dir,
+                    &document,
+                    &stitch.bytes,
+                    stitch.image,
+                    &stitch.bytes,
+                    screen,
+                )
+            }
+            (None, report) => {
+                // Nothing was readable: the session is over, so the editor comes
+                // back instead of quitting with nothing to show.
+                self.restore_after_long_capture();
+                self.report_long_capture(report);
+                Ok(())
+            }
+        }
+    }
+
+    /// Copies the stitch, with the current trim applied, to the clipboard. The
+    /// session keeps running, exactly like copying a normal capture does.
+    /// This is the toolbar's copy button.
+    pub(super) fn copy_long_capture(
+        &mut self,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let Some(session) = self.long_capture.as_ref() else {
+            return Ok(());
+        };
+        let Some(engine) = &session.engine else {
+            return Err("还没有拼出任何画面：先滚动内容，停下后再复制。".into());
+        };
+        let (image, bytes) = engine.cropped(session.trim_start, session.trim_end, ImageId(0));
+        if image.width == 0 || image.height == 0 {
+            return Err("长图为空，没有可复制的内容。".into());
+        }
+        clipboard(self.hwnd, &image, &bytes)?;
+        Ok(())
+    }
+
+    /// Closes the session and returns the trimmed stitch. `restore` brings the
+    /// overlay and the toolbar back into their normal roles; the pin path skips
+    /// that because that command quits the editor as soon as the bundle is
+    /// written. Nothing is reported or opened here: the caller decides what
+    /// becomes of the stitch.
+    fn settle_long_capture(&mut self, restore: bool) -> (Option<Stitch>, Report) {
         let Some(mut session) = self.long_capture.take() else {
-            return;
+            return (
+                None,
+                Report {
+                    region: RECT::default(),
+                    screens: 0,
+                    width: 0,
+                    height: 0,
+                    image: None,
+                    note: Some("没有正在进行的长截图".to_string()),
+                    cancelled: true,
+                },
+            );
         };
         session.teardown(self);
         // Finishing before the last screen came to rest must not drop that
         // scroll, so the newest sample is stitched here. The helper windows are
-        // already gone, and `source` never covers them anyway.
+        // already gone, and `source` never covered them anyway.
         if !session.settled {
             if let Some(bytes) = session.last.clone() {
                 let width = (session.source.right - session.source.left).max(1) as u32;
@@ -284,18 +399,19 @@ impl Canvas {
             }
         }
         let Some(engine) = &session.engine else {
-            self.restore_after_long_capture();
-            let report = Report {
-                region: session.region,
-                screens: 0,
-                width: 0,
-                height: 0,
-                image: None,
-                note: Some("没有读到任何画面".to_string()),
-                cancelled: true,
-            };
-            self.report_long_capture(report);
-            return;
+            session.restore_overlay(self);
+            return (
+                None,
+                Report {
+                    region: session.region,
+                    screens: 0,
+                    width: 0,
+                    height: 0,
+                    image: None,
+                    note: Some("没有读到任何画面".to_string()),
+                    cancelled: true,
+                },
+            );
         };
         let key = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -303,7 +419,7 @@ impl Canvas {
             .unwrap_or(0);
         let (image, bytes) =
             engine.cropped(session.trim_start, session.trim_end, ImageId(key as u64));
-        let mut report = Report {
+        let report = Report {
             region: session.region,
             screens: session.screens,
             width: image.width,
@@ -312,23 +428,20 @@ impl Canvas {
             note: session.note.clone(),
             cancelled: false,
         };
-        match self.save_long_capture(&image, &bytes, key) {
-            Ok(path) => report.image = Some(path),
-            Err(error) => report.note = Some(format!("保存失败：{error}")),
+        if restore {
+            session.restore_overlay(self);
         }
-        if let Err(error) = self.open_document(image, bytes) {
-            self.error = Some(error.to_string());
-        }
-        self.restore_after_long_capture();
-        self.report_long_capture(report);
+        (Some(Stitch { image, bytes, key }), report)
     }
 
-    /// Drops the session without saving anything.
+    /// Drops the session without saving anything. This is the toolbar's close
+    /// button and Esc.
     pub(super) fn cancel_long_capture(&mut self) {
         let Some(session) = self.long_capture.take() else {
             return;
         };
         session.teardown(self);
+        session.restore_overlay(self);
         self.restore_after_long_capture();
         self.report_long_capture(Report {
             region: session.region,
@@ -359,13 +472,15 @@ impl Canvas {
         if height == 0 {
             return true;
         }
-        let region_height = (session.region.bottom - session.region.top).max(1) as u32;
+        // The source is a vertical crop of the region, so one screen row is one
+        // stitched row and one screen's worth of new rows is the source height.
+        let screen_height = (session.source.bottom - session.source.top).max(1) as u32;
         let (trim_start, trim_end) = trim_after_drag(
             edge,
             start,
             screen_y,
             height,
-            region_height,
+            screen_height,
             session.trim_start,
             session.trim_end,
         );
@@ -387,8 +502,13 @@ impl Canvas {
         }
     }
 
-    /// Brings the canvas back to its normal state after a session.
+    /// Brings the canvas and the toolbar back to their normal state after a
+    /// session: the toolbar leaves long-capture mode and is placed beside
+    /// whatever document is current.
     fn restore_after_long_capture(&mut self) {
+        if let Some(weak) = self.ui_slots.toolbar.get() {
+            snaplight_ui::set_toolbar_long_capture(weak, false);
+        }
         publish_history(self);
         unsafe {
             self.invalidate();
@@ -473,14 +593,19 @@ impl Canvas {
 }
 
 impl LongCaptureSession {
-    /// Removes the helper windows and the timer, and restores the overlay when it
-    /// was on screen before the session started.
+    /// Removes the helper windows and the sampling timer.
     fn teardown(&self, canvas: &Canvas) {
         unsafe {
             let _ = KillTimer(canvas.hwnd, LONG_CAPTURE_TIMER);
             let _ = DestroyWindow(self.ring);
             let _ = DestroyWindow(self.panel_window);
-            if self.overlay_was_visible {
+        }
+    }
+
+    /// Puts the overlay back on screen when the session took it off.
+    fn restore_overlay(&self, canvas: &Canvas) {
+        if self.overlay_was_visible {
+            unsafe {
                 let _ = ShowWindow(canvas.hwnd, SW_SHOW);
             }
         }
@@ -544,20 +669,21 @@ fn stitch_sample(session: &mut LongCaptureSession, width: u32, height: u32, byte
 }
 
 /// Applies an edge drag: dragging an edge inwards cuts rows off that end. `edge`
-/// is `0` for the top edge and `1` for the bottom one, and `start` is the screen
-/// row the drag began at. Returns the new `(trim_start, trim_end)`.
+/// is `0` for the top edge and `1` for the bottom one, `start` is the screen row
+/// the drag began at, and `screen_height` is how many rows one screen
+/// contributes, so at most one screen can be trimmed.
 fn trim_after_drag(
     edge: u8,
     start: i32,
     screen_y: i32,
     height: u32,
-    region_height: u32,
+    screen_height: u32,
     trim_start: u32,
     trim_end: u32,
 ) -> (u32, u32) {
     // At most the last screen is trimmed, so content the user asked for is never
     // cut away by accident, and the two ends can never overlap.
-    let most = region_height.min(height.saturating_sub(1));
+    let most = screen_height.min(height.saturating_sub(1));
     let delta = if edge == 0 {
         screen_y - start
     } else {
@@ -612,27 +738,55 @@ fn panel_rect(region: RECT, screen: RECT) -> RECT {
     }
 }
 
-/// The part of the region that is read: the region itself, or the columns the
-/// panel leaves free when the two overlap.
-fn source_rect(region: RECT, panel: RECT) -> RECT {
-    let clear = panel.right <= region.left
-        || panel.left >= region.right
-        || panel.bottom <= region.top
-        || panel.top >= region.bottom;
+/// The part of the region that is read: the region minus every Snaplight window
+/// that sits on top of it. A window that covers an edge of the region cuts rows
+/// off, a strip beside it cuts columns, and the side that keeps the most of the
+/// region wins.
+fn source_rect(region: RECT, occluders: &[RECT]) -> RECT {
+    occluders
+        .iter()
+        .fold(region, |source, occluder| exclude(source, *occluder))
+}
+
+/// Removes one occluder from `source` by cutting the side that keeps the most
+/// area. The result never overlaps `occluder`, and shrinking an already clear
+/// rectangle keeps it clear of the occluders handled before.
+fn exclude(source: RECT, occluder: RECT) -> RECT {
+    let clear = source.right <= occluder.left
+        || source.left >= occluder.right
+        || source.bottom <= occluder.top
+        || source.top >= occluder.bottom;
     if clear {
-        return region;
+        return source;
     }
-    if panel.left - region.left >= region.right - panel.right {
+    let area = |rect: &RECT| {
+        (rect.right - rect.left).max(0) as i64 * (rect.bottom - rect.top).max(0) as i64
+    };
+    let candidates = [
         RECT {
-            right: (panel.left - 1).max(region.left),
-            ..region
-        }
-    } else {
+            top: occluder.bottom + 1,
+            ..source
+        },
         RECT {
-            left: (panel.right + 1).min(region.right),
-            ..region
+            bottom: occluder.top - 1,
+            ..source
+        },
+        RECT {
+            left: occluder.right + 1,
+            ..source
+        },
+        RECT {
+            right: occluder.left - 1,
+            ..source
+        },
+    ];
+    let mut best = candidates[0];
+    for candidate in &candidates[1..] {
+        if area(candidate) > area(&best) {
+            best = *candidate;
         }
     }
+    best
 }
 
 /// Which edge a press at `screen_y` grabbed, if any: the frame's hit region only
@@ -645,34 +799,6 @@ fn edge_at(region: RECT, screen_y: i32) -> Option<u8> {
     } else {
         None
     }
-}
-
-/// The two buttons of the panel, in client coordinates.
-fn button_rects(client: &RECT) -> (RECT, RECT) {
-    const INSET: i32 = 10;
-    const GAP: i32 = 10;
-    let width = (client.right - INSET * 2 - GAP) / 2;
-    let top = client.bottom - PANEL_BUTTONS + INSET;
-    let bottom = client.bottom - INSET;
-    (
-        RECT {
-            left: INSET,
-            top,
-            right: INSET + width,
-            bottom,
-        },
-        RECT {
-            left: INSET + width + GAP,
-            top,
-            right: client.right - INSET,
-            bottom,
-        },
-    )
-}
-
-/// Whether a point is inside a rectangle.
-fn contains(rect: &RECT, x: i32, y: i32) -> bool {
-    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
 }
 
 /// Creates one helper window: a borderless, topmost popup that never takes the
@@ -791,9 +917,8 @@ unsafe extern "system" fn ring_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
     DefWindowProcW(hwnd, msg, w, l)
 }
 
-/// Window procedure of the bird's eye panel: it draws the stitch and reports its
-/// two buttons. The buttons destroy this window, so the work is posted to the
-/// overlay instead of being done here.
+/// Window procedure of the bird's eye panel. It is a preview only: the session
+/// is driven by the toolbar buttons, so the panel takes no input at all.
 unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Canvas;
     if !ptr.is_null() {
@@ -807,63 +932,6 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                 return LRESULT(0);
             }
             WM_ERASEBKGND => return LRESULT(1),
-            WM_LBUTTONDOWN => {
-                let mut client = RECT::default();
-                let mut point = POINT::default();
-                if GetClientRect(hwnd, &mut client).is_ok()
-                    && GetCursorPos(&mut point).is_ok()
-                    && ScreenToClient(hwnd, &mut point).as_bool()
-                {
-                    let (finish, cancel) = button_rects(&client);
-                    let message = if contains(&finish, point.x, point.y) {
-                        LONG_CAPTURE_FINISH
-                    } else if contains(&cancel, point.x, point.y) {
-                        LONG_CAPTURE_CANCEL
-                    } else {
-                        return LRESULT(0);
-                    };
-                    let _ = PostMessageW(canvas.hwnd, message, WPARAM(0), LPARAM(0));
-                }
-                return LRESULT(0);
-            }
-            WM_MOUSEMOVE => {
-                let mut client = RECT::default();
-                let mut point = POINT::default();
-                if GetClientRect(hwnd, &mut client).is_ok()
-                    && GetCursorPos(&mut point).is_ok()
-                    && ScreenToClient(hwnd, &mut point).as_bool()
-                {
-                    let (finish, cancel) = button_rects(&client);
-                    let hover = if contains(&finish, point.x, point.y) {
-                        Some(0)
-                    } else if contains(&cancel, point.x, point.y) {
-                        Some(1)
-                    } else {
-                        None
-                    };
-                    let changed = canvas
-                        .long_capture
-                        .as_ref()
-                        .is_some_and(|session| session.hover != hover);
-                    if changed {
-                        if let Some(session) = canvas.long_capture.as_mut() {
-                            session.hover = hover;
-                        }
-                        let _ = InvalidateRect(hwnd, None, false);
-                    }
-                    let cursor = if hover.is_some() { IDC_HAND } else { IDC_ARROW };
-                    if let Ok(cursor) = LoadCursorW(None, cursor) {
-                        SetCursor(cursor);
-                    }
-                }
-                return LRESULT(0);
-            }
-            WM_SETCURSOR if (l.0 as u32 & 0xffff) == HTCLIENT => {
-                if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
-                    SetCursor(cursor);
-                }
-                return LRESULT(1);
-            }
             _ => {}
         }
     }
@@ -922,7 +990,8 @@ unsafe fn paint_ring(hdc: HDC, canvas: &Canvas, hwnd: HWND) {
 }
 
 /// Paints the bird's eye: how much has been stitched, the stitch itself with the
-/// trim applied, and the two buttons.
+/// trim applied, and what to do next. Everything the user can press lives on the
+/// toolbar, so the panel carries no buttons.
 unsafe fn paint_panel(hdc: HDC, canvas: &Canvas, hwnd: HWND) {
     let Some(session) = canvas.long_capture.as_ref() else {
         return;
@@ -951,7 +1020,7 @@ unsafe fn paint_panel(hdc: HDC, canvas: &Canvas, hwnd: HWND) {
     // explains why the stitch stopped growing.
     let (hint, hint_colour) = match (&session.note, session.settled) {
         (Some(note), _) => (note.as_str(), PANEL_WARN),
-        (None, true) => ("画面已停下：拖动上下边线微调，再点完成", PANEL_HINT),
+        (None, true) => ("画面已停下：拖边线微调，用工具条保存或贴图", PANEL_HINT),
         (None, false) => ("把鼠标放进选区滚动，画面停下后自动拼接", PANEL_HINT),
     };
     let mut title_area = RECT {
@@ -986,7 +1055,7 @@ unsafe fn paint_panel(hdc: HDC, canvas: &Canvas, hwnd: HWND) {
         left: 0,
         top: PANEL_TITLE,
         right: client.right,
-        bottom: client.bottom - PANEL_BUTTONS,
+        bottom: client.bottom,
     };
     if let Some(engine) = &session.engine {
         let (image, bytes) = engine.cropped(session.trim_start, session.trim_end, ImageId(0));
@@ -1027,33 +1096,6 @@ unsafe fn paint_panel(hdc: HDC, canvas: &Canvas, hwnd: HWND) {
                 SRCCOPY,
             );
         }
-    }
-    let (finish, cancel) = button_rects(&client);
-    for (index, rect) in [(0u8, finish), (1u8, cancel)] {
-        let hovered = session.hover == Some(index);
-        let colour = match (index, hovered) {
-            (0, true) => BUTTON_HOVER,
-            (0, false) => BUTTON_BACK,
-            (_, true) => BUTTON_HOVER,
-            (_, false) => BUTTON_QUIET,
-        };
-        let brush = CreateSolidBrush(colour);
-        FillRect(hdc, &rect, brush);
-        let _ = DeleteObject(brush);
-        SetTextColor(hdc, BUTTON_TEXT);
-        let label = if index == 0 {
-            "完成（Enter）"
-        } else {
-            "取消（Esc）"
-        };
-        let mut text: Vec<u16> = label.encode_utf16().collect();
-        let mut area = rect;
-        DrawTextW(
-            hdc,
-            &mut text,
-            &mut area,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
     }
     SelectObject(hdc, old);
 }
@@ -1126,7 +1168,7 @@ mod tests {
         assert_eq!(panel.right - panel.left, PANEL_WIDTH);
         assert_eq!(panel.top, region.top);
         // Nothing overlaps, so the whole region is read.
-        assert_eq!(source_rect(region, panel), region);
+        assert_eq!(source_rect(region, &[panel]), region);
     }
 
     #[test]
@@ -1135,7 +1177,7 @@ mod tests {
         let region = rect(1500, 100, 1900, 700);
         let panel = panel_rect(region, screen);
         assert!(panel.right <= region.left);
-        assert_eq!(source_rect(region, panel), region);
+        assert_eq!(source_rect(region, &[panel]), region);
     }
 
     #[test]
@@ -1145,12 +1187,57 @@ mod tests {
         let region = rect(100, 100, 1900, 700);
         let panel = panel_rect(region, screen);
         assert!(panel.left > region.left && panel.left < region.right);
-        let source = source_rect(region, panel);
+        let source = source_rect(region, &[panel]);
         // The panel covers the right edge, so the sampled columns stop before it.
         assert!(source.right <= panel.left);
         assert_eq!(source.left, region.left);
         assert_eq!(source.top, region.top);
         assert_eq!(source.bottom, region.bottom);
+    }
+
+    #[test]
+    fn a_toolbar_over_the_region_cuts_rows_but_stays_clear_below_it() {
+        let region = rect(200, 40, 1200, 1060);
+        // The usual placement: below the region, so nothing is given up.
+        let below = rect(200, 1076, 1337, 1154);
+        assert_eq!(source_rect(region, &[below]), region);
+        // A region that reaches the top of the screen pushes the toolbar onto its
+        // top rows. The band covers the whole width, so rows go and columns stay.
+        let above = rect(200, 16, 1337, 94);
+        let source = source_rect(region, &[above]);
+        assert_eq!(source.left, region.left);
+        assert_eq!(source.right, region.right);
+        assert!(source.top > above.bottom);
+        assert_eq!(source.bottom, region.bottom);
+        // A strip beside the region still cuts columns instead.
+        let beside = rect(900, 100, 1300, 400);
+        let source = source_rect(region, &[beside]);
+        assert!(source.right <= beside.left);
+        assert_eq!(source.top, region.top);
+        assert_eq!(source.bottom, region.bottom);
+    }
+
+    #[test]
+    fn every_occluder_is_kept_out_of_the_source() {
+        // The panel on the right edge and the toolbar over the top at once: the
+        // two cuts are applied one after the other and neither is undone.
+        let screen = rect(0, 0, 1920, 1080);
+        let region = rect(100, 20, 1900, 1040);
+        let panel = panel_rect(region, screen);
+        let toolbar = rect(100, 900, 1237, 978);
+        let source = source_rect(region, &[panel, toolbar]);
+        let clear_of = |source: RECT, occluder: RECT| {
+            source.right <= occluder.left
+                || source.left >= occluder.right
+                || source.bottom <= occluder.top
+                || source.top >= occluder.bottom
+        };
+        assert!(clear_of(source, panel), "{source:?} still covers the panel");
+        assert!(
+            clear_of(source, toolbar),
+            "{source:?} still covers the toolbar"
+        );
+        assert!(source.right - source.left >= 8 && source.bottom - source.top >= 8);
     }
 
     #[test]
@@ -1170,16 +1257,6 @@ mod tests {
         assert_eq!(edge_at(region, 400), None);
         assert_eq!(edge_at(region, 200), None);
         assert_eq!(edge_at(region, 600), None);
-    }
-
-    #[test]
-    fn the_two_buttons_are_inside_the_panel() {
-        let client = rect(0, 0, PANEL_WIDTH, 600);
-        let (finish, cancel) = button_rects(&client);
-        assert!(finish.left >= 0 && finish.right <= cancel.left);
-        assert!(cancel.right <= client.right);
-        assert_eq!(finish.bottom, client.bottom - 10);
-        assert_eq!(cancel.bottom, finish.bottom);
     }
 
     #[test]

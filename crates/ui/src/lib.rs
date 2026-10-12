@@ -145,22 +145,25 @@ pub fn apply_tool_order(config: &mut Config, items: &ModelRc<ToolItem>) {
     }
 }
 /// Logical size derived from configured tools and the action list.
-// Display order is independent of stable editor command ids.
-const TOOLBAR_ACTIONS: &[(i32, i32, &str)] = &[
-    (16, 2, "工具选项"),
-    (17, 7, "长截图"),
-    (14, 5, "贴图"),
-    (13, 4, "保存"),
-    (15, 6, "关闭"),
-    (12, 3, "复制"),
+// Display order is independent of stable editor command ids. The last field marks
+// the buttons that stay live while a long capture runs: saving, copying, pinning
+// and closing the stitch act exactly like the same buttons on a normal capture.
+const TOOLBAR_ACTIONS: &[(i32, i32, &str, bool)] = &[
+    (16, 2, "工具选项", false),
+    (17, 7, "长截图", false),
+    (14, 5, "贴图", true),
+    (13, 4, "保存", true),
+    (15, 6, "关闭", true),
+    (12, 3, "复制", true),
 ];
 fn toolbar_actions() -> Vec<CommandItem> {
     TOOLBAR_ACTIONS
         .iter()
-        .map(|&(id, glyph, label)| CommandItem {
+        .map(|&(id, glyph, label, capture)| CommandItem {
             id,
             glyph,
             label: label.into(),
+            capture,
         })
         .collect()
 }
@@ -229,6 +232,17 @@ pub fn set_toolbar_status(weak: &ToolbarWeak, status: String) {
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = weak.upgrade() {
             ui.set_status(status.into());
+        }
+    });
+}
+/// Puts the toolbar into long-capture mode, or takes it out again: the drawing
+/// tools, the history and the tool options step aside while the four action
+/// buttons stay live, and the pill stops being draggable.
+pub fn set_toolbar_long_capture(weak: &ToolbarWeak, active: bool) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_long_capture(active);
         }
     });
 }
@@ -324,6 +338,14 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), count);
+        // A long capture keeps exactly the four action buttons live: save, pin,
+        // close and copy, in display order.
+        let live: Vec<i32> = actions
+            .iter()
+            .filter(|action| action.capture)
+            .map(|action| action.id)
+            .collect();
+        assert_eq!(live, vec![14, 13, 15, 12]);
     }
     #[test]
     fn detection_mode_index_round_trips() {
