@@ -22,9 +22,7 @@ const CLOSED: u32 = WM_APP + 52;
 /// Entry indices of the pin context menu, in display order.
 mod pin_item {
     pub const THROUGH: usize = 0;
-    pub const ACTUAL_SIZE: usize = 1;
-    pub const HALF_SIZE: usize = 2;
-    pub const DESTROY: usize = 4;
+    pub const DESTROY: usize = 2;
 }
 /// Pin context menu content, drawn by the same owner-drawn card as the tray
 /// menu. `restore_hotkey` is the shortcut that brings interaction back after the
@@ -33,8 +31,6 @@ mod pin_item {
 fn menu_entries(restore_hotkey: &str) -> Vec<Entry> {
     vec![
         Entry::Item(Item::new("鼠标穿透").with_shortcut(restore_hotkey)),
-        Entry::Item(Item::new("原始大小")),
-        Entry::Item(Item::new("缩小一半")),
         Entry::Separator,
         Entry::Item(Item::new("销毁").danger()),
     ]
@@ -239,8 +235,6 @@ unsafe fn show_pin_menu(pin: &mut Pin) -> std::result::Result<(), Box<dyn std::e
     }
     match choice {
         Some(pin_item::THROUGH) => pin.toggle()?,
-        Some(pin_item::ACTUAL_SIZE) => pin.zoom(1.0)?,
-        Some(pin_item::HALF_SIZE) => pin.zoom(0.5)?,
         Some(pin_item::DESTROY) => {
             PostMessageW(pin.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0))?;
         }
@@ -668,21 +662,16 @@ mod tests {
     #[test]
     fn pin_menu_entries_match_the_commands_the_handler_maps() {
         let entries = menu_entries(DEFAULT_RESTORE_HOTKEY);
-        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.len(), 3);
         let divider = entries
             .iter()
             .position(|entry| matches!(entry, Entry::Separator))
             .expect("the pin menu needs a divider");
         assert_eq!(
-            divider, 3,
-            "the divider separates 销毁 from the view commands"
+            divider, 1,
+            "the divider separates 销毁 from the view command"
         );
-        for index in [
-            pin_item::THROUGH,
-            pin_item::ACTUAL_SIZE,
-            pin_item::HALF_SIZE,
-            pin_item::DESTROY,
-        ] {
+        for index in [pin_item::THROUGH, pin_item::DESTROY] {
             assert_ne!(index, divider, "commands never point at the divider");
             assert!(matches!(entries[index], Entry::Item(_)));
         }
@@ -693,14 +682,6 @@ mod tests {
         assert_eq!(through.label, "鼠标穿透");
         assert_eq!(through.shortcut.as_deref(), Some(DEFAULT_RESTORE_HOTKEY));
         assert!(!through.danger);
-        let Entry::Item(actual) = &entries[pin_item::ACTUAL_SIZE] else {
-            panic!("actual-size entry must be an item");
-        };
-        assert_eq!(actual.label, "原始大小");
-        let Entry::Item(half) = &entries[pin_item::HALF_SIZE] else {
-            panic!("half-size entry must be an item");
-        };
-        assert_eq!(half.label, "缩小一半");
         let Entry::Item(destroy) = &entries[pin_item::DESTROY] else {
             panic!("destroy entry must be an item");
         };
