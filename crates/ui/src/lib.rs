@@ -147,6 +147,7 @@ pub fn apply_tool_order(config: &mut Config, items: &ModelRc<ToolItem>) {
 // Display order is independent of stable editor command ids.
 const TOOLBAR_ACTIONS: &[(i32, i32, &str)] = &[
     (16, 2, "工具选项"),
+    (17, 7, "长截图"),
     (14, 5, "贴图"),
     (13, 4, "保存"),
     (15, 6, "关闭"),
@@ -163,7 +164,7 @@ fn toolbar_actions() -> Vec<CommandItem> {
         .collect()
 }
 pub fn toolbar_logical_size(tools: &[Tool]) -> (u32, u32) {
-    // Padding + grip + two dividers + seven commands + inter-item gaps.
+    // Padding + grip + two dividers + eight commands + inter-item gaps.
     let tools_width: u32 = tools
         .iter()
         .map(|tool| if *tool == Tool::Select { 40 } else { 50 })
@@ -291,19 +292,37 @@ mod tests {
     fn logical_sizes_scale_to_monitor_dpi() {
         assert_eq!(
             scale_to_physical(toolbar_logical_size(&Config::default().tools), 96),
-            (716, 52)
+            (758, 52)
         );
         assert_eq!(
             scale_to_physical(toolbar_logical_size(&Config::default().tools), 144),
-            (1074, 78)
+            (1137, 78)
         );
         assert_eq!(scale_to_physical(OPTIONS_LOGICAL_SIZE, 144), (600, 78));
         assert_eq!(
             scale_to_physical(toolbar_logical_size(&Config::default().tools), 192),
-            (1432, 104)
+            (1516, 104)
         );
         // Rounded to the nearest physical pixel.
         assert_eq!(scale_to_physical((1, 1), 144), (2, 2));
+    }
+    #[test]
+    fn long_capture_sits_left_of_the_pin_command() {
+        let actions = toolbar_actions();
+        let pin = actions
+            .iter()
+            .position(|action| action.id == 14)
+            .expect("pin command");
+        let long_capture = &actions[pin - 1];
+        assert_eq!(long_capture.id, 17);
+        assert_eq!(long_capture.glyph, 7);
+        assert_eq!(long_capture.label, "长截图");
+        // Command ids stay unique, so no button shadows another command.
+        let mut ids: Vec<i32> = actions.iter().map(|action| action.id).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count);
     }
     #[test]
     fn detection_mode_index_round_trips() {

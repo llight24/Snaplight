@@ -420,6 +420,14 @@ impl Canvas {
             15 => unsafe {
                 PostQuitMessage(0);
             },
+            // Long capture is an entry without an engine behind it (plan B09):
+            // say so instead of silently doing nothing or pretending to work.
+            17 => {
+                snaplight_platform::native::show_notice(
+                    "长截图尚未接入：滚动捕获与画面拼接（开发计划 B09）还未实现，当前版本不能使用。",
+                );
+                return Ok(());
+            }
             _ => {}
         }
         unsafe {

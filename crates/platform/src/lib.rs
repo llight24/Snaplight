@@ -834,6 +834,22 @@ pub mod native {
             );
         }
     }
+    /// Shows an informational message. Same suppression switch as `show_error`,
+    /// so non-interactive runs never block on a dialog.
+    pub fn show_notice(text: &str) {
+        if std::env::var_os("SNAPLIGHT_NONINTERACTIVE").is_some() {
+            eprintln!("{text}");
+            return;
+        }
+        unsafe {
+            MessageBoxW(
+                None,
+                &HSTRING::from(text),
+                w!("Snaplight"),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+    }
     pub fn message_loop() -> Result<()> {
         unsafe {
             let mut msg = MSG::default();

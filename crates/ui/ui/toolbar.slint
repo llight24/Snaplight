@@ -74,6 +74,12 @@ component IconPin inherits ToolbarIcon {
 component IconClose inherits ToolbarIcon {
     commands: "M6 6 L18 18 M18 6 L6 18";
 }
+// Long capture: a captured band with an arrow scrolling past it. The entry is
+// visible but its engine is not connected yet, so clicking it only explains the
+// state; see the editor's command 17.
+component IconLongCapture inherits ToolbarIcon {
+    commands: "M5 4 H19 Q20 4 20 5 V10 Q20 11 19 11 H5 Q4 11 4 10 V5 Q4 4 5 4 Z M12 14 V20 M9 17 L12 20 L15 17";
+}
 component ToolGlyph inherits Rectangle {
     in property <int> tool-id: 0;
     in property <color> ink: #252a31;
@@ -139,6 +145,7 @@ component CommandGlyph inherits Rectangle {
     IconSave { visible: root.glyph == 4; ink: root.ink; }
     IconPin { visible: root.glyph == 5; ink: root.ink; }
     IconClose { visible: root.glyph == 6; ink: root.ink; }
+    IconLongCapture { visible: root.glyph == 7; ink: root.ink; }
 }
 // Plain icon button used for history and the command group.
 component BarButton inherits Rectangle {
@@ -188,7 +195,7 @@ export component Toolbar inherits Window {
     title: "Snaplight Tools";
     no-frame: true;
     always-on-top: true;
-    in property <length> bar-width: 716px;
+    in property <length> bar-width: 758px;
     width: root.bar-width;
     height: 52px;
     in-out property <bool> repaint: false;
