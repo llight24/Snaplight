@@ -141,11 +141,11 @@ impl Canvas {
         // The toolbar has to stay reachable for the duration of the session, so
         // it is put back beside the selection (it may have been dragged) and both
         // it and the panel are kept out of the region that gets sampled.
-        *self.ui_slots.toolbar_selection.lock() = None;
+        self.ui_slots.clear_selection_cache();
         publish_selection(self, selection);
         let panel = panel_rect(region, self.screen);
         let mut occluders = vec![panel];
-        if let Some(toolbar) = *self.ui_slots.toolbar_rect.lock() {
+        if let Some(toolbar) = self.ui_slots.toolbar_rect() {
             occluders.push(toolbar);
         }
         let source = source_rect(region, &occluders);
@@ -172,7 +172,7 @@ impl Canvas {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
-        if let Some(weak) = self.ui_slots.toolbar.get() {
+        if let Some(weak) = self.ui_slots.toolbar() {
             snaplight_ui::set_toolbar_long_capture(weak, true);
         }
         self.long_capture = Some(LongCaptureSession {
@@ -506,7 +506,7 @@ impl Canvas {
     /// session: the toolbar leaves long-capture mode and is placed beside
     /// whatever document is current.
     fn restore_after_long_capture(&mut self) {
-        if let Some(weak) = self.ui_slots.toolbar.get() {
+        if let Some(weak) = self.ui_slots.toolbar() {
             snaplight_ui::set_toolbar_long_capture(weak, false);
         }
         publish_history(self);

@@ -154,13 +154,13 @@ impl SharedImage {
                 ..Default::default()
             };
             let mut texture = None;
-            gpu.device
+            gpu.device()
                 .CreateTexture2D(&desc, None, Some(&mut texture))?;
             let texture = texture.ok_or_else(|| Error::from(E_UNEXPECTED))?;
             let keyed: IDXGIKeyedMutex = texture.cast()?;
             // The surface is created unowned; acquiring key 0 cannot block.
             acquire(&keyed, 0, 0)?;
-            gpu.context.UpdateSubresource(
+            gpu.context().UpdateSubresource(
                 &texture,
                 0,
                 None,
@@ -175,7 +175,7 @@ impl SharedImage {
                 DXGI_SHARED_RESOURCE_READ.0 | DXGI_SHARED_RESOURCE_WRITE.0,
                 &HSTRING::from(&name),
             )?;
-            let luid = gpu.dxgi.GetAdapter()?.GetDesc()?.AdapterLuid;
+            let luid = gpu.dxgi().GetAdapter()?.GetDesc()?.AdapterLuid;
             Ok(Self {
                 name,
                 adapter_luid: adapter_luid_key(luid),

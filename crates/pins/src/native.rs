@@ -76,8 +76,9 @@ fn menu_entries(restore_hotkey: &str, shadow_on: bool) -> Vec<Entry> {
     };
     vec![
         // Annotating a pin again is the first thing the menu can do to it, and
-        // the hint teaches the shortcut that does the same from the pointer.
-        Entry::Item(Item::new("编辑标注").with_hint("空格")),
+        // the shortcut on its right teaches the key that does the same from the
+        // pointer.
+        Entry::Item(Item::new("编辑").with_shortcut("空格")),
         Entry::Item(Item::new("鼠标穿透").with_shortcut(restore_hotkey)),
         Entry::Item(Item::new("恢复原始大小")),
         Entry::Item(Item::new(shadow)),
@@ -1481,15 +1482,15 @@ impl Host {
         pin.refresh()
     }
 }
-/// True when this raw input message is the annotation shortcut being pressed:
+/// True when this `WM_INPUT` message is the annotation shortcut being pressed:
 /// Space, which is what the pin's context menu promises.
 ///
-/// `WM_INPUT` carries the device type in its wparam and the handle to pass to
-/// `GetRawInputData` in its lparam.
-unsafe fn annotation_shortcut(w: WPARAM, l: LPARAM) -> bool {
-    if w.0 as u32 != RIM_TYPEKEYBOARD.0 {
-        return false;
-    }
+/// The device type comes from the `RAWINPUTHEADER` that `GetRawInputData`
+/// fills in, never from the message's wparam: `WM_INPUT`'s wparam only says
+/// whether the message was delivered in the foreground or through the input
+/// sink, and those two values overlap the device types. The handle to hand to
+/// `GetRawInputData` is the lparam.
+unsafe fn annotation_shortcut(l: LPARAM) -> bool {
     let mut input = RAWINPUT::default();
     let mut size = std::mem::size_of::<RAWINPUT>() as u32;
     let read = GetRawInputData(
@@ -1502,10 +1503,13 @@ unsafe fn annotation_shortcut(w: WPARAM, l: LPARAM) -> bool {
     if read == u32::MAX || input.header.dwType != RIM_TYPEKEYBOARD.0 {
         return false;
     }
-    let key = input.data.keyboard;
-    // The press opens the session; the release that follows must not open a
-    // second one.
-    key.VKey == VK_SPACE.0 && key.Flags & RI_KEY_BREAK as u16 == 0
+    space_key_down(input.data.keyboard.VKey, input.data.keyboard.Flags)
+}
+/// True when this keyboard event is Space being pressed rather than released:
+/// the press opens the session, and the release that follows must not open a
+/// second one.
+fn space_key_down(virtual_key: u16, flags: u16) -> bool {
+    virtual_key == VK_SPACE.0 && flags & RI_KEY_BREAK as u16 == 0
 }
 /// Registers the raw keyboard sink that makes the annotation shortcut possible
 /// without focus: only this process's control window receives the keys, and an
@@ -1567,7 +1571,7 @@ unsafe extern "system" fn control_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                 // Pins never take focus, so the annotation shortcut arrives as raw
                 // input rather than a key message: a key message would be delivered
                 // to whatever application is in front instead.
-                if annotation_shortcut(w, l) {
+                if annotation_shortcut(l) {
                     match host.open_armed() {
                         Ok(true) => {}
                         Ok(false) => {}
@@ -2403,7 +2407,12 @@ mod tests {
             panic!("edit entry must be an item");
         };
         assert_eq!(
-            edit.label, "编辑标注（空格）",
+            edit.label, "编辑",
+            "the main label must be just the command; the key sits on its right"
+        );
+        assert_eq!(
+            edit.shortcut.as_deref(),
+            Some("空格"),
             "the menu must teach the shortcut that opens the same session"
         );
         assert!(!edit.danger);
@@ -2437,6 +2446,17 @@ mod tests {
         };
         assert_eq!(destroy.label, "销毁");
         assert!(destroy.danger, "destroy closes the pin and must read red");
+    }
+    /// The annotation shortcut is the spacebar press, not its release. The key
+    /// arrives as raw keyboard input so a pin that never takes focus can still
+    /// open a session, and the release that follows must not open a second one.
+    #[test]
+    fn the_annotation_shortcut_is_the_spacebar_press() {
+        assert!(space_key_down(VK_SPACE.0, 0));
+        assert!(!space_key_down(VK_SPACE.0, RI_KEY_BREAK as u16));
+        // Any other key is ignored, pressed or released.
+        assert!(!space_key_down(VK_RETURN.0, 0));
+        assert!(!space_key_down(VK_RETURN.0, RI_KEY_BREAK as u16));
     }
     /// The shadow entry has to read as the action it performs, so a pin without
     /// a shadow offers to turn one on.

@@ -1,10 +1,9 @@
-use core::ffi::c_void;
+use crate::capture::FrozenFrame;
+use crate::composition::Composition;
+use crate::d2d::{bounds, identity, properties};
+use crate::gpu::Gpu;
 use snaplight_domain::*;
-use snaplight_platform::CaptureService;
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
-use std::time::{Duration, Instant};
 use windows::{
     core::*,
     Foundation::Numerics::Matrix3x2,
@@ -12,12 +11,9 @@ use windows::{
         Foundation::*,
         Graphics::{
             Direct2D::{Common::*, *},
-            Direct3D::*,
             Direct3D11::*,
-            DirectComposition::*,
             DirectWrite::*,
             Dxgi::{Common::*, *},
-            Gdi::*,
         },
     },
 };
@@ -33,16 +29,6 @@ const CHROME_CHIP_PADDING: f32 = 13.0;
 const CHROME_CHIP_GAP: f32 = 7.0;
 const CHROME_CHIP_FONT: f32 = 17.0;
 
-fn identity() -> Matrix3x2 {
-    Matrix3x2 {
-        M11: 1.0,
-        M12: 0.0,
-        M21: 0.0,
-        M22: 1.0,
-        M31: 0.0,
-        M32: 0.0,
-    }
-}
 fn rect(r: ImageRect) -> D2D_RECT_F {
     D2D_RECT_F {
         left: r.x,
@@ -50,14 +36,6 @@ fn rect(r: ImageRect) -> D2D_RECT_F {
         right: r.x + r.width,
         bottom: r.y + r.height,
     }
-}
-fn bounds(w: u32, h: u32) -> D2D_RECT_F {
-    rect(ImageRect {
-        x: 0.0,
-        y: 0.0,
-        width: w as f32,
-        height: h as f32,
-    })
 }
 /// Maps a rectangle from image pixels to view pixels through `viewport`.
 fn to_view(r: ImageRect, viewport: &Viewport) -> ImageRect {
@@ -72,155 +50,13 @@ fn to_view(r: ImageRect, viewport: &Viewport) -> ImageRect {
 fn point(p: ImagePoint) -> D2D_POINT_2F {
     D2D_POINT_2F { x: p.x, y: p.y }
 }
-/// Glyph outlines of one text layout, in image pixels and ready to draw.
-type Outlines = Rc<RefCell<Vec<ID2D1Geometry>>>;
 /// Horizontal reference of a chip: `Left` from its left edge, `Centre` from its
 /// middle, so a chip can sit next to a selection or over the pointer.
 enum ChipAnchor {
     Left(f32),
     Centre(f32),
 }
-/// Collects the glyph outlines of a text layout instead of drawing the glyphs.
-///
-/// Text is rendered from its outlines so that one glyph shape serves both the
-/// fill and the outline: a stroke drawn from a separately shaped glyph run would
-/// drift away from the fill. The renderer is handed the runs DirectWrite already
-/// resolved, so text in fonts the requested family does not cover (CJK, emoji)
-/// keeps its fallback font instead of turning into boxes.
-#[windows::core::implement(IDWriteTextRenderer)]
-struct GlyphOutline {
-    factory: ID2D1Factory,
-    /// Shared with the caller: the object is moved into the interface that
-    /// `IDWriteTextLayout::Draw` consumes, so the outlines are read through
-    /// this handle afterwards.
-    runs: Rc<RefCell<Vec<ID2D1Geometry>>>,
-}
-impl GlyphOutline {
-    unsafe fn new(context: &ID2D1DeviceContext) -> Result<(Self, Outlines)> {
-        let runs: Outlines = Rc::new(RefCell::new(Vec::new()));
-        Ok((
-            Self {
-                factory: context.GetFactory()?,
-                runs: runs.clone(),
-            },
-            runs,
-        ))
-    }
-}
-// The rendered traits are implemented for the companion type the attribute
-// generates; it dereferences to `GlyphOutline`, so the fields stay readable.
-impl IDWritePixelSnapping_Impl for GlyphOutline_Impl {
-    fn IsPixelSnappingDisabled(&self, _client: *const c_void) -> Result<BOOL> {
-        // Glyph geometry goes through the canvas transform, which does its own
-        // snapping; snapping here would only shift the outline off the fill.
-        Ok(TRUE)
-    }
-    fn GetCurrentTransform(
-        &self,
-        _client: *const c_void,
-        transform: *mut DWRITE_MATRIX,
-    ) -> Result<()> {
-        unsafe {
-            *transform = DWRITE_MATRIX {
-                m11: 1.0,
-                m12: 0.0,
-                m21: 0.0,
-                m22: 1.0,
-                dx: 0.0,
-                dy: 0.0,
-            }
-        };
-        Ok(())
-    }
-    fn GetPixelsPerDip(&self, _client: *const c_void) -> Result<f32> {
-        Ok(1.0)
-    }
-}
-impl IDWriteTextRenderer_Impl for GlyphOutline_Impl {
-    fn DrawGlyphRun(
-        &self,
-        _client: *const c_void,
-        baseline_x: f32,
-        baseline_y: f32,
-        _measuring: DWRITE_MEASURING_MODE,
-        run: *const DWRITE_GLYPH_RUN,
-        _description: *const DWRITE_GLYPH_RUN_DESCRIPTION,
-        _effect: Option<&IUnknown>,
-    ) -> Result<()> {
-        unsafe {
-            let run = &*run;
-            let face = run
-                .fontFace
-                .as_ref()
-                .ok_or_else(|| Error::new(E_UNEXPECTED, "glyph run without a font face"))?;
-            let geometry = self.factory.CreatePathGeometry()?;
-            let sink: ID2D1SimplifiedGeometrySink = geometry.Open()?.cast()?;
-            face.GetGlyphRunOutline(
-                run.fontEmSize,
-                run.glyphIndices,
-                Some(run.glyphAdvances),
-                (!run.glyphOffsets.is_null()).then_some(run.glyphOffsets),
-                run.glyphCount,
-                run.isSideways.as_bool(),
-                run.bidiLevel % 2 == 1,
-                &sink,
-            )?;
-            sink.Close()?;
-            // Moving the geometry keeps the canvas transform (zoom and pan) in
-            // force, which an absolute transform on the context would replace.
-            let moved = self.factory.CreateTransformedGeometry(
-                &geometry,
-                &Matrix3x2::translation(baseline_x, baseline_y),
-            )?;
-            self.runs.borrow_mut().push(moved.cast()?);
-        }
-        Ok(())
-    }
-    fn DrawUnderline(
-        &self,
-        _client: *const c_void,
-        _origin_x: f32,
-        _origin_y: f32,
-        _underline: *const DWRITE_UNDERLINE,
-        _effect: Option<&IUnknown>,
-    ) -> Result<()> {
-        Ok(())
-    }
-    fn DrawStrikethrough(
-        &self,
-        _client: *const c_void,
-        _origin_x: f32,
-        _origin_y: f32,
-        _strikethrough: *const DWRITE_STRIKETHROUGH,
-        _effect: Option<&IUnknown>,
-    ) -> Result<()> {
-        Ok(())
-    }
-    fn DrawInlineObject(
-        &self,
-        _client: *const c_void,
-        _origin_x: f32,
-        _origin_y: f32,
-        _object: Option<&IDWriteInlineObject>,
-        _sideways: BOOL,
-        _right_to_left: BOOL,
-        _effect: Option<&IUnknown>,
-    ) -> Result<()> {
-        Ok(())
-    }
-}
-fn properties(options: D2D1_BITMAP_OPTIONS, alpha: D2D1_ALPHA_MODE) -> D2D1_BITMAP_PROPERTIES1 {
-    D2D1_BITMAP_PROPERTIES1 {
-        pixelFormat: D2D1_PIXEL_FORMAT {
-            format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            alphaMode: alpha,
-        },
-        dpiX: 96.0,
-        dpiY: 96.0,
-        bitmapOptions: options,
-        ..Default::default()
-    }
-}
+
 unsafe fn hdr_to_sdr(
     dc: &ID2D1DeviceContext,
     bitmap: &ID2D1Bitmap1,
@@ -305,454 +141,6 @@ unsafe fn hdr_to_sdr(
     to_srgb.GetOutput()
 }
 
-#[derive(Clone)]
-pub struct Gpu {
-    pub device: ID3D11Device,
-    pub context: ID3D11DeviceContext,
-    pub d2d: ID2D1Device,
-    pub dxgi: IDXGIDevice,
-    pub factory: IDXGIFactory2,
-    pub write: IDWriteFactory,
-    pub software: bool,
-}
-impl Gpu {
-    pub fn frame_from_bgra(
-        &self,
-        image: ImageDescriptor,
-        pixels: &[u8],
-        screen: RECT,
-    ) -> Result<FrozenFrame> {
-        unsafe {
-            if image.byte_len().map_err(|e| Error::new(E_INVALIDARG, e))? != pixels.len() {
-                return Err(Error::new(E_INVALIDARG, "pixel length mismatch"));
-            }
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: image.width,
-                Height: image.height,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET).0 as u32,
-                ..Default::default()
-            };
-            let data = D3D11_SUBRESOURCE_DATA {
-                pSysMem: pixels.as_ptr().cast(),
-                SysMemPitch: image.stride,
-                ..Default::default()
-            };
-            let mut texture = None;
-            self.device
-                .CreateTexture2D(&desc, Some(&data), Some(&mut texture))?;
-            Ok(FrozenFrame {
-                gpu: self.clone(),
-                texture: texture.unwrap(),
-                screen,
-                rotation: DXGI_MODE_ROTATION_IDENTITY,
-                descriptor: image,
-                fallback: false,
-                hdr: None,
-            })
-        }
-    }
-    pub fn new(adapter: Option<&IDXGIAdapter1>) -> Result<Self> {
-        unsafe {
-            let mut device = None;
-            let mut context = None;
-            let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-            let base_adapter: Option<IDXGIAdapter> = adapter.map(|a| a.cast()).transpose()?;
-            let attempt = D3D11CreateDevice(
-                base_adapter.as_ref(),
-                D3D_DRIVER_TYPE(if adapter.is_some() {
-                    D3D_DRIVER_TYPE_UNKNOWN.0
-                } else {
-                    D3D_DRIVER_TYPE_HARDWARE.0
-                }),
-                HMODULE::default(),
-                flags,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            );
-            let software = attempt.is_err();
-            if software {
-                D3D11CreateDevice(
-                    None,
-                    D3D_DRIVER_TYPE_WARP,
-                    HMODULE::default(),
-                    flags,
-                    None,
-                    D3D11_SDK_VERSION,
-                    Some(&mut device),
-                    None,
-                    Some(&mut context),
-                )?;
-            }
-            let device = device.unwrap();
-            let context = context.unwrap();
-            let dxgi: IDXGIDevice = device.cast()?;
-            let d2d_factory: ID2D1Factory1 =
-                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let d2d = d2d_factory.CreateDevice(&dxgi)?;
-            let adapter = dxgi.GetAdapter()?;
-            let factory: IDXGIFactory2 = adapter.GetParent()?;
-            let write: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            Ok(Self {
-                device,
-                context,
-                d2d,
-                dxgi,
-                factory,
-                write,
-                software,
-            })
-        }
-    }
-    pub fn dc(&self) -> Result<ID2D1DeviceContext> {
-        unsafe {
-            self.d2d
-                .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)
-        }
-    }
-}
-pub struct FrozenFrame {
-    pub gpu: Gpu,
-    pub texture: ID3D11Texture2D,
-    pub screen: RECT,
-    pub rotation: DXGI_MODE_ROTATION,
-    pub descriptor: ImageDescriptor,
-    pub fallback: bool,
-    pub hdr: Option<(DXGI_COLOR_SPACE_TYPE, f32)>,
-}
-pub struct DesktopCapture;
-impl CaptureService for DesktopCapture {
-    type Frame = FrozenFrame;
-    type Error = Error;
-    fn capture(&mut self) -> Result<Vec<FrozenFrame>> {
-        unsafe {
-            let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-            let mut frames = vec![];
-            let mut ai = 0;
-            while let Ok(adapter) = factory.EnumAdapters1(ai) {
-                ai += 1;
-                let mut oi = 0;
-                let mut gpu = None;
-                while let Ok(output) = adapter.EnumOutputs(oi) {
-                    oi += 1;
-                    let desc = output.GetDesc()?;
-                    if !desc.AttachedToDesktop.as_bool() {
-                        continue;
-                    }
-                    let display_color = output
-                        .cast::<IDXGIOutput6>()
-                        .ok()
-                        .and_then(|o| o.GetDesc1().ok());
-                    let hdr_display = display_color.as_ref().is_some_and(|d| {
-                        d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
-                    });
-                    if gpu.is_none() {
-                        gpu = Some(Gpu::new(Some(&adapter))?);
-                    }
-                    let gpu = gpu.as_ref().unwrap().clone();
-                    let output1: IDXGIOutput1 = output.cast()?;
-                    let capture = (|| -> Result<(ID3D11Texture2D, DXGI_MODE_ROTATION)> {
-                        let duplication = if hdr_display {
-                            let output5: IDXGIOutput5 = output.cast()?;
-                            output5.DuplicateOutput1(
-                                &gpu.device,
-                                0,
-                                &[
-                                    DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                    DXGI_FORMAT_R10G10B10A2_UNORM,
-                                    DXGI_FORMAT_B8G8R8A8_UNORM,
-                                ],
-                            )?
-                        } else {
-                            output1.DuplicateOutput(&gpu.device)?
-                        };
-                        let texture = acquire_desktop_frame(&gpu, &duplication)?;
-                        Ok((texture, duplication.GetDesc().Rotation))
-                    })();
-                    let fallback = capture.is_err();
-                    let (texture, rotation) = match capture {
-                        Ok(v) => v,
-                        Err(e) if hdr_display => return Err(e),
-                        Err(_) => (
-                            capture_gdi(&gpu, desc.DesktopCoordinates)?,
-                            DXGI_MODE_ROTATION_IDENTITY,
-                        ),
-                    };
-                    let hdr = if hdr_display {
-                        let mut td = D3D11_TEXTURE2D_DESC::default();
-                        texture.GetDesc(&mut td);
-                        let color=match td.Format {DXGI_FORMAT_R16G16B16A16_FLOAT=>DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,DXGI_FORMAT_R10G10B10A2_UNORM=>DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,_=>return Err(Error::new(E_NOTIMPL,"HDR capture returned an 8-bit surface; full-range capture is unavailable on this display"))};
-                        let max = display_color
-                            .as_ref()
-                            .map(|d| d.MaxLuminance)
-                            .filter(|v| v.is_finite() && *v > 80.0)
-                            .unwrap_or(1000.0);
-                        Some((color, max))
-                    } else {
-                        None
-                    };
-                    let w = (desc.DesktopCoordinates.right - desc.DesktopCoordinates.left) as u32;
-                    let h = (desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top) as u32;
-                    frames.push(FrozenFrame {
-                        gpu,
-                        texture,
-                        screen: desc.DesktopCoordinates,
-                        rotation,
-                        descriptor: ImageDescriptor {
-                            id: ImageId(frames.len() as u64 + 1),
-                            width: w,
-                            height: h,
-                            stride: w * 4,
-                            format: PixelFormat::Bgra8,
-                            alpha: AlphaMode::Opaque,
-                            color_space: if hdr.is_some() {
-                                ColorSpace::HdrConvertedToSdr
-                            } else {
-                                ColorSpace::Srgb
-                            },
-                        },
-                        fallback,
-                        hdr,
-                    });
-                }
-            }
-            if frames.is_empty() {
-                return Err(Error::new(E_FAIL, "no active desktop displays"));
-            }
-            Ok(frames)
-        }
-    }
-}
-/// Acquires a frame that carries a desktop image.
-///
-/// The first frame returned after `DuplicateOutput` can report no desktop update
-/// (its `LastPresentTime` is zero) and hand back an uninitialized, black
-/// surface; copying it silently produces a black capture. Frames without a
-/// desktop update are therefore released and skipped until one arrives or the
-/// deadline passes, in which case the caller can use the GDI fallback.
-unsafe fn acquire_desktop_frame(
-    gpu: &Gpu,
-    duplication: &IDXGIOutputDuplication,
-) -> Result<ID3D11Texture2D> {
-    const DEADLINE: Duration = Duration::from_millis(1500);
-    const WAIT_MS: u32 = 500;
-    let started = Instant::now();
-    loop {
-        let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
-        let mut resource = None;
-        match duplication.AcquireNextFrame(WAIT_MS, &mut info, &mut resource) {
-            Ok(()) => {}
-            // A timeout means the desktop has not changed yet, which is normal on
-            // an idle screen; keep waiting instead of taking a slower path.
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT && started.elapsed() < DEADLINE => {
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-        let copied = if info.LastPresentTime == 0 {
-            Err(Error::new(
-                E_FAIL,
-                "desktop duplication frame carries no image update",
-            ))
-        } else {
-            (|| -> Result<ID3D11Texture2D> {
-                let source: ID3D11Texture2D = resource.unwrap().cast()?;
-                let mut td = D3D11_TEXTURE2D_DESC::default();
-                source.GetDesc(&mut td);
-                td.Usage = D3D11_USAGE_DEFAULT;
-                td.BindFlags =
-                    D3D11_BIND_SHADER_RESOURCE.0 as u32 | D3D11_BIND_RENDER_TARGET.0 as u32;
-                td.CPUAccessFlags = 0;
-                td.MiscFlags = 0;
-                let mut texture = None;
-                gpu.device.CreateTexture2D(&td, None, Some(&mut texture))?;
-                let texture = texture.unwrap();
-                gpu.context.CopyResource(&texture, &source);
-                Ok(texture)
-            })()
-        };
-        let released = duplication.ReleaseFrame();
-        match copied {
-            Ok(texture) => {
-                released?;
-                return Ok(texture);
-            }
-            Err(e) => {
-                released?;
-                if started.elapsed() >= DEADLINE {
-                    return Err(e);
-                }
-            }
-        }
-    }
-}
-/// Copies the desktop into a top-down BGRA8 buffer through GDI.
-unsafe fn gdi_bits(screen: RECT) -> Result<(u32, u32, Vec<u8>)> {
-    let w = screen.right - screen.left;
-    let h = screen.bottom - screen.top;
-    let desktop = GetDC(None);
-    let memory = CreateCompatibleDC(desktop);
-    let mut bits = std::ptr::null_mut();
-    let info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: 40,
-            biWidth: w,
-            biHeight: -h,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let bitmap_result = CreateDIBSection(desktop, &info, DIB_RGB_COLORS, &mut bits, None, 0);
-    let bitmap = match bitmap_result {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = DeleteDC(memory);
-            ReleaseDC(None, desktop);
-            return Err(e);
-        }
-    };
-    let old = SelectObject(memory, bitmap);
-    let copied = BitBlt(
-        memory,
-        0,
-        0,
-        w,
-        h,
-        desktop,
-        screen.left,
-        screen.top,
-        SRCCOPY | CAPTUREBLT,
-    );
-    let result = (|| {
-        copied?;
-        let len = w as usize * h as usize * 4;
-        let mut bytes = vec![0u8; len];
-        std::ptr::copy_nonoverlapping(bits.cast::<u8>(), bytes.as_mut_ptr(), len);
-        Ok((w as u32, h as u32, bytes))
-    })();
-    SelectObject(memory, old);
-    let _ = DeleteObject(bitmap);
-    let _ = DeleteDC(memory);
-    ReleaseDC(None, desktop);
-    result
-}
-/// Copies a desktop rectangle into a top-down BGRA8 buffer through GDI.
-///
-/// Long capture re-reads the scrolled region many times per session; GDI is the
-/// cheapest path that returns pixels for an arbitrary screen rectangle without a
-/// device round-trip. HDR displays go through the duplication path instead, so
-/// their content is tone mapped differently here.
-pub fn screen_pixels(screen: RECT) -> Result<(u32, u32, Vec<u8>)> {
-    unsafe { gdi_bits(screen) }
-}
-unsafe fn capture_gdi(gpu: &Gpu, screen: RECT) -> Result<ID3D11Texture2D> {
-    let (width, height, bytes) = gdi_bits(screen)?;
-    let td = D3D11_TEXTURE2D_DESC {
-        Width: width,
-        Height: height,
-        MipLevels: 1,
-        ArraySize: 1,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Usage: D3D11_USAGE_DEFAULT,
-        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-        ..Default::default()
-    };
-    let data = D3D11_SUBRESOURCE_DATA {
-        pSysMem: bytes.as_ptr().cast(),
-        SysMemPitch: width * 4,
-        ..Default::default()
-    };
-    let mut texture = None;
-    gpu.device
-        .CreateTexture2D(&td, Some(&data), Some(&mut texture))?;
-    Ok(texture.unwrap())
-}
-/// Cross-checks a captured frame against an independent GDI capture of the same
-/// screen and returns the fraction of sparse samples that agree.
-///
-/// `acquire_desktop_frame` skips duplication frames that carry no desktop image,
-/// but a driver can still hand back an empty surface, and an all-black capture is
-/// invisible to pixel checks that only cover a synthetic frame. Comparing against
-/// the GDI path catches that class of failure. Returns `None` for frames that
-/// cannot be compared this way: HDR output and rotated displays go through a
-/// different conversion than the GDI path.
-pub fn capture_agreement(frame: &FrozenFrame, bytes: &[u8]) -> Result<Option<f32>> {
-    const COLUMNS: u32 = 32;
-    const ROWS: u32 = 18;
-    const TOLERANCE: u8 = 32;
-    if frame.hdr.is_some() || frame.rotation != DXGI_MODE_ROTATION_IDENTITY {
-        return Ok(None);
-    }
-    let width = frame.descriptor.width;
-    let height = frame.descriptor.height;
-    let stride = frame.descriptor.stride;
-    unsafe {
-        let (w, h, reference) = gdi_bits(frame.screen)?;
-        if (w, h) != (width, height) {
-            return Err(Error::new(
-                E_FAIL,
-                format!("gdi capture is {w}x{h} but the frame is {width}x{height}"),
-            ));
-        }
-        let mut agreeing = 0u32;
-        let mut total = 0u32;
-        // GDI rows are `w * 4` bytes wide, like the frame's own stride.
-        let reference_stride = w * 4;
-        for row in 0..ROWS {
-            for column in 0..COLUMNS {
-                let x = column * width / COLUMNS + width / (COLUMNS * 2);
-                let y = row * height / ROWS + height / (ROWS * 2);
-                let a = &bytes[(y * stride + x * 4) as usize..][..3];
-                let b = &reference[(y * reference_stride + x * 4) as usize..][..3];
-                total += 1;
-                if a.iter().zip(b).all(|(p, q)| p.abs_diff(*q) <= TOLERANCE) {
-                    agreeing += 1;
-                }
-            }
-        }
-        Ok(Some(agreeing as f32 / total as f32))
-    }
-}
-
-struct Composition {
-    device: IDCompositionDevice,
-    _target: IDCompositionTarget,
-    visual: IDCompositionVisual,
-    opacity: IDCompositionEffectGroup,
-}
-impl Composition {
-    unsafe fn new(gpu: &Gpu, hwnd: HWND) -> Result<Self> {
-        let device: IDCompositionDevice = DCompositionCreateDevice(&gpu.dxgi)?;
-        let target = device.CreateTargetForHwnd(hwnd, true)?;
-        let visual = device.CreateVisual()?;
-        target.SetRoot(&visual)?;
-        let opacity = device.CreateEffectGroup()?;
-        visual.SetEffect(&opacity)?;
-        Ok(Self {
-            device,
-            _target: target,
-            visual,
-            opacity,
-        })
-    }
-}
 pub struct OverlayRenderer {
     hwnd: HWND,
     gpu: Gpu,
@@ -771,10 +159,10 @@ pub struct OverlayRenderer {
     // Size of the swap chain and of the window's client area, in view pixels.
     view_width: u32,
     view_height: u32,
-    pub frames: u64,
-    pub cpu_us: Vec<u64>,
-    pub present_us: Vec<u64>,
-    pub gpu_us: Vec<f64>,
+    frames: u64,
+    cpu_us: Vec<u64>,
+    present_us: Vec<u64>,
+    gpu_us: Vec<f64>,
     profiling: bool,
     queries: std::collections::VecDeque<TimestampQueries>,
     chip_format: Option<IDWriteTextFormat>,
@@ -799,7 +187,7 @@ impl TimestampQueries {
     unsafe fn new(gpu: &Gpu) -> Result<Self> {
         let make = |kind| -> Result<ID3D11Query> {
             let mut query = None;
-            gpu.device.CreateQuery(
+            gpu.device().CreateQuery(
                 &D3D11_QUERY_DESC {
                     Query: kind,
                     MiscFlags: 0,
@@ -858,17 +246,17 @@ struct Targets {
 /// differently shaped window than the image itself.
 fn create_targets(hwnd: HWND, frame: &FrozenFrame, view: (u32, u32)) -> Result<Targets> {
     unsafe {
-        let gpu = frame.gpu.clone();
+        let gpu = frame.gpu().clone();
         let dc = gpu.dc()?;
-        let width = frame.descriptor.width;
-        let height = frame.descriptor.height;
-        let surface: IDXGISurface = frame.texture.cast()?;
+        let width = frame.descriptor().width;
+        let height = frame.descriptor().height;
+        let surface: IDXGISurface = frame.texture().cast()?;
         let mut texture_desc = D3D11_TEXTURE2D_DESC::default();
-        frame.texture.GetDesc(&mut texture_desc);
+        frame.texture().GetDesc(&mut texture_desc);
         let mut raw_props = properties(D2D1_BITMAP_OPTIONS_NONE, D2D1_ALPHA_MODE_IGNORE);
         raw_props.pixelFormat.format = texture_desc.Format;
         let raw = dc.CreateBitmapFromDxgiSurface(&surface, Some(&raw_props))?;
-        let normalized = if let Some((color, max_luminance)) = frame.hdr {
+        let normalized = if let Some((color, max_luminance)) = frame.hdr() {
             Some(hdr_to_sdr(&dc, &raw, color, max_luminance)?)
         } else {
             None
@@ -887,7 +275,7 @@ fn create_targets(hwnd: HWND, frame: &FrozenFrame, view: (u32, u32)) -> Result<T
             b: 0.0,
             a: 1.0,
         }));
-        let t = match frame.rotation {
+        let t = match frame.rotation() {
             DXGI_MODE_ROTATION_ROTATE90 => Matrix3x2 {
                 M11: 0.0,
                 M12: 1.0,
@@ -952,9 +340,9 @@ fn create_targets(hwnd: HWND, frame: &FrozenFrame, view: (u32, u32)) -> Result<T
             ..Default::default()
         };
         let swap = gpu
-            .factory
-            .CreateSwapChainForComposition(&gpu.device, &desc, None)?;
-        if let Ok(device) = gpu.dxgi.cast::<IDXGIDevice1>() {
+            .factory()
+            .CreateSwapChainForComposition(gpu.device(), &desc, None)?;
+        if let Ok(device) = gpu.dxgi().cast::<IDXGIDevice1>() {
             device.SetMaximumFrameLatency(1)?;
         }
         let back: IDXGISurface = swap.GetBuffer(0)?;
@@ -966,8 +354,8 @@ fn create_targets(hwnd: HWND, frame: &FrozenFrame, view: (u32, u32)) -> Result<T
             )),
         )?;
         let composition = Composition::new(&gpu, hwnd)?;
-        composition.visual.SetContent(&swap)?;
-        composition.device.Commit()?;
+        composition.set_content(&swap)?;
+        composition.commit()?;
         Ok(Targets {
             gpu,
             dc,
@@ -990,8 +378,8 @@ impl OverlayRenderer {
     /// so the view size is the window and does not have to match the image.
     pub fn new(hwnd: HWND, frame: &FrozenFrame, view: (u32, u32)) -> Result<Self> {
         unsafe {
-            let width = frame.descriptor.width;
-            let height = frame.descriptor.height;
+            let width = frame.descriptor().width;
+            let height = frame.descriptor().height;
             let targets = create_targets(hwnd, frame, view)?;
             let annotations = targets.dc.CreateBitmap(
                 D2D_SIZE_U { width, height },
@@ -1075,13 +463,29 @@ impl OverlayRenderer {
     }
     /// True when the underlying D3D11 device has been removed or reset.
     pub fn device_lost(&self) -> bool {
-        unsafe { self.gpu.device.GetDeviceRemovedReason().is_err() }
+        unsafe { self.gpu.device().GetDeviceRemovedReason().is_err() }
     }
     pub fn invalidate_annotations(&mut self) {
         self.cache_dirty = true;
     }
     pub fn enable_profiling(&mut self) {
         self.profiling = true;
+    }
+    /// Number of frames presented so far.
+    pub fn frame_count(&self) -> u64 {
+        self.frames
+    }
+    /// Per-frame CPU submission durations in microseconds.
+    pub fn cpu_samples_us(&self) -> &[u64] {
+        &self.cpu_us
+    }
+    /// Per-frame blocking Present durations in microseconds.
+    pub fn present_samples_us(&self) -> &[u64] {
+        &self.present_us
+    }
+    /// Per-frame GPU timestamp durations in microseconds.
+    pub fn gpu_samples_us(&self) -> &[f64] {
+        &self.gpu_us
     }
     /// Selection chrome: a blue outline, eight round handles, and a chip that
     /// reports the origin and size in screen pixels.
@@ -1158,7 +562,7 @@ impl OverlayRenderer {
     ) -> Result<ImageRect> {
         let format = self.chip_text_format(CHROME_CHIP_FONT * scale)?;
         let utf16: Vec<u16> = text.encode_utf16().collect();
-        let layout = self.gpu.write.CreateTextLayout(
+        let layout = self.gpu.write().CreateTextLayout(
             &utf16,
             &format,
             self.view_width as f32,
@@ -1242,7 +646,7 @@ impl OverlayRenderer {
     /// Text format for the size chip, recreated when the DPI-scaled size changes.
     unsafe fn chip_text_format(&mut self, size: f32) -> Result<IDWriteTextFormat> {
         if self.chip_format.is_none() || (self.chip_font - size).abs() > 0.01 {
-            self.chip_format = Some(self.gpu.write.CreateTextFormat(
+            self.chip_format = Some(self.gpu.write().CreateTextFormat(
                 w!("Segoe UI"),
                 None,
                 DWRITE_FONT_WEIGHT_NORMAL,
@@ -1305,7 +709,7 @@ impl OverlayRenderer {
     pub fn collect_gpu_samples(&mut self) {
         unsafe {
             while let Some(query) = self.queries.front() {
-                let Some(sample) = query.sample(&self.gpu.context) else {
+                let Some(sample) = query.sample(self.gpu.context()) else {
                     break;
                 };
                 if sample.is_finite() {
@@ -1493,7 +897,7 @@ impl OverlayRenderer {
         text: &str,
         size: f32,
     ) -> Result<()> {
-        let format = self.gpu.write.CreateTextFormat(
+        let format = self.gpu.write().CreateTextFormat(
             w!("Segoe UI"),
             None,
             DWRITE_FONT_WEIGHT_NORMAL,
@@ -1505,16 +909,13 @@ impl OverlayRenderer {
         let utf16: Vec<u16> = text.encode_utf16().collect();
         // The layout box keeps the wrapping DrawText used to apply: an annotation
         // may not run past the captured image.
-        let layout = self.gpu.write.CreateTextLayout(
+        let layout = self.gpu.write().CreateTextLayout(
             &utf16,
             &format,
             (self.width as f32 - at.x).max(1.0),
             (self.height as f32 - at.y).max(1.0),
         )?;
-        let (outline, runs) = GlyphOutline::new(&self.dc)?;
-        let renderer: IDWriteTextRenderer = outline.into();
-        layout.Draw(None, &renderer, at.x, at.y)?;
-        let runs = runs.borrow();
+        let runs = super::text_outline::collect(&self.dc, &layout, at.x, at.y)?;
         if a.style.fill_on {
             let fill = self.brush(a.style.fill)?;
             for run in runs.iter() {
@@ -1666,8 +1067,8 @@ impl CanvasRenderer for OverlayRenderer {
             self.collect_gpu_samples();
             let timing = if self.profiling && self.queries.len() < 8 {
                 let q = TimestampQueries::new(&self.gpu)?;
-                self.gpu.context.Begin(&q.disjoint);
-                self.gpu.context.End(&q.start);
+                self.gpu.context().Begin(&q.disjoint);
+                self.gpu.context().End(&q.start);
                 Some(q)
             } else {
                 None
@@ -1848,8 +1249,8 @@ impl CanvasRenderer for OverlayRenderer {
                 self.composed = Some(self.copy_composed()?);
             }
             if let Some(q) = timing {
-                self.gpu.context.End(&q.end);
-                self.gpu.context.End(&q.disjoint);
+                self.gpu.context().End(&q.end);
+                self.gpu.context().End(&q.disjoint);
                 self.queries.push_back(q);
             }
             let cpu = started.elapsed().as_micros() as u64;
@@ -1858,8 +1259,7 @@ impl CanvasRenderer for OverlayRenderer {
             self.composition
                 .as_ref()
                 .ok_or_else(|| Error::new(E_FAIL, "renderer has no composition target"))?
-                .device
-                .Commit()?;
+                .commit()?;
             self.frames += 1;
             if self.cpu_us.len() < 10000 {
                 self.cpu_us.push(cpu);
@@ -1871,111 +1271,6 @@ impl CanvasRenderer for OverlayRenderer {
                 return Err(Error::new(DXGI_ERROR_DEVICE_REMOVED, "GPU device removed"));
             }
             Ok(())
-        }
-    }
-}
-
-pub struct StaticSurface {
-    _gpu: Gpu,
-    composition: Composition,
-    _surface: IDCompositionSurface,
-    pub width: u32,
-    pub height: u32,
-}
-
-impl StaticSurface {
-    pub fn new(gpu: &Gpu, hwnd: HWND, image: &ImageDescriptor, bytes: &[u8]) -> Result<Self> {
-        unsafe {
-            if image.byte_len().map_err(|e| Error::new(E_INVALIDARG, e))? != bytes.len() {
-                return Err(Error::new(E_INVALIDARG, "pixel length mismatch"));
-            }
-            let composition = Composition::new(gpu, hwnd)?;
-            let surface = composition.device.CreateSurface(
-                image.width,
-                image.height,
-                DXGI_FORMAT_B8G8R8A8_UNORM,
-                DXGI_ALPHA_MODE_PREMULTIPLIED,
-            )?;
-            let mut offset = POINT::default();
-            let dxgi: IDXGISurface = surface.BeginDraw(None, &mut offset)?;
-            let result = (|| -> Result<()> {
-                let dc = gpu.dc()?;
-                let target = dc.CreateBitmapFromDxgiSurface(
-                    &dxgi,
-                    Some(&properties(
-                        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                        D2D1_ALPHA_MODE_PREMULTIPLIED,
-                    )),
-                )?;
-                let source = dc.CreateBitmap(
-                    D2D_SIZE_U {
-                        width: image.width,
-                        height: image.height,
-                    },
-                    Some(bytes.as_ptr().cast()),
-                    image.stride,
-                    &properties(D2D1_BITMAP_OPTIONS_NONE, D2D1_ALPHA_MODE_PREMULTIPLIED),
-                )?;
-                dc.SetTarget(&target);
-                dc.SetTransform(&Matrix3x2 {
-                    M31: offset.x as f32,
-                    M32: offset.y as f32,
-                    ..identity()
-                });
-                dc.BeginDraw();
-                dc.PushAxisAlignedClip(
-                    &bounds(image.width, image.height),
-                    D2D1_ANTIALIAS_MODE_ALIASED,
-                );
-                dc.Clear(None);
-                dc.DrawBitmap(
-                    &source,
-                    None,
-                    1.0,
-                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-                    None,
-                    None,
-                );
-                dc.PopAxisAlignedClip();
-                dc.EndDraw(None, None)?;
-                dc.SetTarget(None);
-                Ok(())
-            })();
-            let ended = surface.EndDraw();
-            result?;
-            ended?;
-            composition.visual.SetContent(&surface)?;
-            composition.device.Commit()?;
-            Ok(Self {
-                _gpu: gpu.clone(),
-                composition,
-                _surface: surface,
-                width: image.width,
-                height: image.height,
-            })
-        }
-    }
-    pub fn opacity(&self, value: f32) -> Result<()> {
-        unsafe {
-            self.composition
-                .opacity
-                .SetOpacity2(value.clamp(0.1, 1.0))?;
-            self.composition.device.Commit()
-        }
-    }
-    pub fn scale(&self, value: f32) -> Result<()> {
-        unsafe {
-            let transform = self.composition.device.CreateScaleTransform()?;
-            transform.SetScaleX2(value)?;
-            transform.SetScaleY2(value)?;
-            self.composition.visual.SetTransform(&transform)?;
-            self.composition.device.Commit()
-        }
-    }
-    pub fn release_content(&self) -> Result<()> {
-        unsafe {
-            self.composition.visual.SetContent(None)?;
-            self.composition.device.Commit()
         }
     }
 }
