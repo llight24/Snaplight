@@ -13,8 +13,11 @@
 //! matches the reference menu; [`layout`] is a pure function so the geometry can
 //! be asserted without creating a window, and [`render`] exposes the pixels for
 //! automated checks.
+//!
+//! The card geometry, palette and font helpers are `pub(crate)` because
+//! [`crate::confirm`] draws the confirmation prompt with the same card, palette
+//! and modal message pump; the two must not drift apart.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use windows::{
     core::*,
     Win32::{
@@ -37,7 +40,7 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 
 // Logical (96 DPI) metrics, matched to the reference menu: white card with a
 // 12px corner radius, 28px rows, 12px card padding, 20px text padding.
-const RADIUS: f32 = 12.0;
+pub(crate) const CARD_RADIUS: f32 = 12.0;
 const PAD_Y: f32 = 12.0;
 const ROW_HEIGHT: f32 = 28.0;
 const PAD_X: f32 = 20.0;
@@ -46,27 +49,28 @@ const SEPARATOR_MARGIN: f32 = 8.0;
 const SEPARATOR_THICKNESS: f32 = 1.0;
 const MIN_WIDTH: f32 = 180.0;
 const HOVER_INSET: f32 = 4.0;
-const HOVER_RADIUS: f32 = 6.0;
+pub(crate) const HOVER_RADIUS: f32 = 6.0;
 /// Text size in logical pixels. The reference measures closer to 13px, but that
 /// reads too large next to the card, so the shipped size is a step smaller.
-const FONT_EM: f32 = 12.0;
-const FONT_FACE: PCWSTR = w!("Segoe UI");
+pub(crate) const FONT_EM: f32 = 12.0;
+pub(crate) const FONT_FACE: PCWSTR = w!("Segoe UI");
 /// Room reserved around the card for the drop shadow.
-const SHADOW_MARGIN: f32 = 14.0;
+pub(crate) const SHADOW_MARGIN: f32 = 14.0;
 const SHADOW_OFFSET_Y: f32 = 2.0;
 const SHADOW_BLUR: f32 = 10.0;
 const SHADOW_ALPHA: f32 = 0.13;
 
 // Colours sampled from the reference menu.
-const CARD: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
-const LABEL: (u8, u8, u8) = (0x1F, 0x1F, 0x1F);
-const SHORTCUT: (u8, u8, u8) = (0x47, 0x47, 0x47);
+pub(crate) const CARD: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
+pub(crate) const LABEL: (u8, u8, u8) = (0x1F, 0x1F, 0x1F);
+/// Muted text: shortcut hints here, the secondary line of the confirmation card.
+pub(crate) const MUTED: (u8, u8, u8) = (0x47, 0x47, 0x47);
 const SEPARATOR: (u8, u8, u8) = (0xD3, 0xE3, 0xFD);
-const HOVER: (u8, u8, u8) = (0xF2, 0xF2, 0xF2);
+pub(crate) const HOVER: (u8, u8, u8) = (0xF2, 0xF2, 0xF2);
 /// Destructive entries (closing every pin) are drawn red.
-const DANGER: (u8, u8, u8) = (0xD1, 0x34, 0x38);
+pub(crate) const DANGER: (u8, u8, u8) = (0xD1, 0x34, 0x38);
 
-const fn rgb(color: (u8, u8, u8)) -> COLORREF {
+pub(crate) const fn rgb(color: (u8, u8, u8)) -> COLORREF {
     COLORREF(color.0 as u32 | (color.1 as u32) << 8 | (color.2 as u32) << 16)
 }
 
@@ -74,7 +78,7 @@ const fn rgb(color: (u8, u8, u8)) -> COLORREF {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
     pub label: String,
-    /// Shortcut hint, drawn right-aligned in the shortcut colour.
+    /// Shortcut hint, drawn right-aligned in the muted colour.
     pub shortcut: Option<String>,
     /// Draws the label red for commands that destroy something.
     pub danger: bool,
@@ -89,6 +93,12 @@ impl Item {
     }
     pub fn with_shortcut(mut self, shortcut: impl Into<String>) -> Self {
         self.shortcut = Some(shortcut.into());
+        self
+    }
+    /// Appends a parenthesised explanation to the label. A row only carries one
+    /// right-aligned shortcut, so extra keys belong in the label text.
+    pub fn with_hint(mut self, hint: impl AsRef<str>) -> Self {
+        self.label = format!("{}（{}）", self.label, hint.as_ref());
         self
     }
     pub fn danger(mut self) -> Self {
@@ -152,7 +162,7 @@ pub struct Layout {
 pub fn layout(entries: &[Entry], scale: f32, text: &[(i32, i32)]) -> Layout {
     let scale = scale.clamp(0.5, 4.0);
     let px = |value: f32| (value * scale).round() as i32;
-    let radius = px(RADIUS).max(2);
+    let radius = px(CARD_RADIUS).max(2);
     let pad_x = px(PAD_X);
     let pad_y = px(PAD_Y);
     let row_height = px(ROW_HEIGHT);
@@ -294,18 +304,15 @@ pub fn render(entries: &[Entry], scale: f32, hover: Option<usize>) -> Result<Men
     }
 }
 
-unsafe fn render_into(
-    dc: HDC,
-    entries: &[Entry],
-    scale: f32,
-    hover: Option<usize>,
-) -> Result<MenuBitmap> {
+/// Creates the card face at `scale`. `weight` is a `FW_*` value; the menu uses
+/// `FW_NORMAL` and the confirmation card a semibold title from the same face.
+pub(crate) unsafe fn create_font(scale: f32, em: f32, weight: i32) -> Result<HFONT> {
     let font = CreateFontW(
-        -(FONT_EM * scale).round() as i32,
+        -(em * scale).round() as i32,
         0,
         0,
         0,
-        FW_NORMAL.0 as i32,
+        weight,
         0,
         0,
         0,
@@ -319,6 +326,16 @@ unsafe fn render_into(
     if font.is_invalid() {
         return Err(Error::from_win32());
     }
+    Ok(font)
+}
+
+unsafe fn render_into(
+    dc: HDC,
+    entries: &[Entry],
+    scale: f32,
+    hover: Option<usize>,
+) -> Result<MenuBitmap> {
+    let font = create_font(scale, FONT_EM, FW_NORMAL.0 as i32)?;
     let old_font = SelectObject(dc, font);
     let result = (|| -> Result<MenuBitmap> {
         let measured: Vec<(i32, i32)> = entries
@@ -449,7 +466,7 @@ unsafe fn draw(dc: HDC, entries: &[Entry], layout: &Layout, hover: Option<usize>
             DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX,
         );
         if let Some(shortcut) = &item.shortcut {
-            SetTextColor(dc, rgb(SHORTCUT));
+            SetTextColor(dc, rgb(MUTED));
             let mut text: Vec<u16> = shortcut.encode_utf16().collect();
             DrawTextW(
                 dc,
@@ -471,14 +488,37 @@ fn rounded_rect_distance(x: f32, y: f32, half_width: f32, half_height: f32, radi
 }
 
 fn apply_alpha(pixels: &mut [u8], width: i32, height: i32, layout: &Layout) {
-    let card = layout.card;
+    card_alpha(
+        pixels,
+        width,
+        height,
+        layout.card,
+        layout.radius,
+        layout.scale,
+    );
+}
+
+/// Derives the alpha channel of a card bitmap from its rounded-rectangle
+/// geometry: opaque inside `card`, the blurred drop shadow outside it.
+///
+/// GDI has no per-pixel alpha, so the coverage is computed here instead. Colours
+/// stay correct because the card is drawn on a white background and every opaque
+/// pixel keeps its drawn colour.
+pub(crate) fn card_alpha(
+    pixels: &mut [u8],
+    width: i32,
+    height: i32,
+    card: Rect,
+    radius: i32,
+    scale: f32,
+) {
     let half_width = card.width as f32 / 2.0;
     let half_height = card.height as f32 / 2.0;
     let center_x = card.x as f32 + half_width;
     let center_y = card.y as f32 + half_height;
-    let radius = layout.radius as f32;
-    let offset = SHADOW_OFFSET_Y * layout.scale;
-    let blur = SHADOW_BLUR * layout.scale;
+    let radius = radius as f32;
+    let offset = SHADOW_OFFSET_Y * scale;
+    let blur = SHADOW_BLUR * scale;
     for y in 0..height {
         for x in 0..width {
             let px = x as f32 + 0.5 - center_x;
@@ -500,7 +540,7 @@ fn apply_alpha(pixels: &mut [u8], width: i32, height: i32, layout: &Layout) {
     }
 }
 
-unsafe fn text_width(dc: HDC, text: &str) -> i32 {
+pub(crate) unsafe fn text_width(dc: HDC, text: &str) -> i32 {
     if text.is_empty() {
         return 0;
     }
@@ -522,75 +562,91 @@ struct MenuWindow {
     chosen: Option<usize>,
     closed: bool,
 }
+/// Presents premultiplied BGRA pixels as the whole client area of `hwnd`,
+/// keeping the window's current screen position.
+pub(crate) unsafe fn present_layered(
+    hwnd: HWND,
+    width: i32,
+    height: i32,
+    premultiplied_bgra: &[u8],
+) -> Result<()> {
+    let desktop = GetDC(None);
+    if desktop.is_invalid() {
+        return Err(Error::from_win32());
+    }
+    let memory = CreateCompatibleDC(desktop);
+    if memory.is_invalid() {
+        ReleaseDC(None, desktop);
+        return Err(Error::from_win32());
+    }
+    let result = (|| -> Result<()> {
+        let mut bits = std::ptr::null_mut();
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let target = CreateDIBSection(memory, &info, DIB_RGB_COLORS, &mut bits, None, 0)?;
+        if bits.is_null() {
+            let _ = DeleteObject(target);
+            return Err(Error::from_win32());
+        }
+        std::ptr::copy_nonoverlapping(
+            premultiplied_bgra.as_ptr(),
+            bits.cast::<u8>(),
+            premultiplied_bgra.len(),
+        );
+        let old = SelectObject(memory, target);
+        let mut window = RECT::default();
+        GetWindowRect(hwnd, &mut window)?;
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let presented = UpdateLayeredWindow(
+            hwnd,
+            desktop,
+            Some(&POINT {
+                x: window.left,
+                y: window.top,
+            }),
+            Some(&SIZE {
+                cx: width,
+                cy: height,
+            }),
+            memory,
+            Some(&POINT::default()),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+        SelectObject(memory, old);
+        let _ = DeleteObject(target);
+        presented
+    })();
+    let _ = DeleteDC(memory);
+    ReleaseDC(None, desktop);
+    result
+}
+
 impl MenuWindow {
     unsafe fn update_layered(&self, hwnd: HWND) -> Result<()> {
         let bitmap = render(&self.entries, self.scale, self.hover)?;
-        let desktop = GetDC(None);
-        if desktop.is_invalid() {
-            return Err(Error::from_win32());
-        }
-        let memory = CreateCompatibleDC(desktop);
-        if memory.is_invalid() {
-            ReleaseDC(None, desktop);
-            return Err(Error::from_win32());
-        }
-        let result = (|| -> Result<()> {
-            let mut bits = std::ptr::null_mut();
-            let info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: bitmap.width,
-                    biHeight: -bitmap.height,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let target = CreateDIBSection(memory, &info, DIB_RGB_COLORS, &mut bits, None, 0)?;
-            if bits.is_null() {
-                let _ = DeleteObject(target);
-                return Err(Error::from_win32());
-            }
-            std::ptr::copy_nonoverlapping(
-                bitmap.premultiplied_bgra.as_ptr(),
-                bits.cast::<u8>(),
-                bitmap.premultiplied_bgra.len(),
-            );
-            let old = SelectObject(memory, target);
-            let mut window = RECT::default();
-            GetWindowRect(hwnd, &mut window)?;
-            let blend = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as u8,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: AC_SRC_ALPHA as u8,
-            };
-            let presented = UpdateLayeredWindow(
-                hwnd,
-                desktop,
-                Some(&POINT {
-                    x: window.left,
-                    y: window.top,
-                }),
-                Some(&SIZE {
-                    cx: bitmap.width,
-                    cy: bitmap.height,
-                }),
-                memory,
-                Some(&POINT::default()),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
-            SelectObject(memory, old);
-            let _ = DeleteObject(target);
-            presented
-        })();
-        let _ = DeleteDC(memory);
-        ReleaseDC(None, desktop);
-        result
+        present_layered(
+            hwnd,
+            bitmap.width,
+            bitmap.height,
+            &bitmap.premultiplied_bgra,
+        )
     }
     fn hit(&self, x: i32, y: i32) -> Option<usize> {
         self.layout
@@ -702,31 +758,30 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
     DefWindowProcW(hwnd, msg, w, l)
 }
 
-unsafe fn register_class(instance: HINSTANCE) -> Result<()> {
-    static REGISTERED: AtomicBool = AtomicBool::new(false);
-    if REGISTERED.load(Ordering::Acquire) {
-        return Ok(());
-    }
+/// Registers `name` with `proc` for this process. Registering a class twice is
+/// not an error: both popups register their own class on first use.
+pub(crate) unsafe fn register_class(
+    name: PCWSTR,
+    proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+) -> Result<()> {
+    let instance = GetModuleHandleW(None)?;
     let class = WNDCLASSW {
-        hInstance: instance,
-        lpszClassName: w!("Snaplight.PopupMenu"),
-        lpfnWndProc: Some(menu_proc),
+        hInstance: instance.into(),
+        lpszClassName: name,
+        lpfnWndProc: Some(proc),
         ..Default::default()
     };
-    let atom = RegisterClassW(&class);
-    if atom == 0 {
-        // A second registration in the same process is not an error.
+    if RegisterClassW(&class) == 0 {
         let error = Error::from_win32();
         if error.code() != HRESULT::from_win32(ERROR_CLASS_ALREADY_EXISTS.0) {
             return Err(error);
         }
     }
-    REGISTERED.store(true, Ordering::Release);
     Ok(())
 }
 
 /// DPI scale of the monitor that owns `(x, y)`; 1.0 on failure.
-unsafe fn scale_at(x: i32, y: i32) -> f32 {
+pub(crate) unsafe fn scale_at(x: i32, y: i32) -> f32 {
     let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
     let mut dpi_x = 96;
     let mut dpi_y = 96;
@@ -771,7 +826,7 @@ pub fn show(entries: &[Entry], anchor: Option<(i32, i32)>) -> Option<usize> {
     }
     unsafe {
         let instance = GetModuleHandleW(None).ok()?;
-        register_class(HINSTANCE(instance.0)).ok()?;
+        register_class(w!("Snaplight.PopupMenu"), menu_proc).ok()?;
         let (anchor_x, anchor_y) = anchor.unwrap_or_else(|| {
             let mut point = POINT::default();
             let _ = GetCursorPos(&mut point);
@@ -797,7 +852,7 @@ pub fn show(entries: &[Entry], anchor: Option<(i32, i32)>) -> Option<usize> {
             chosen: None,
             closed: false,
         });
-        let state_ptr: *mut MenuWindow = &mut *state;
+        let state_ptr: *mut MenuWindow = std::ptr::addr_of_mut!(*state);
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             w!("Snaplight.PopupMenu"),
@@ -822,57 +877,87 @@ pub fn show(entries: &[Entry], anchor: Option<(i32, i32)>) -> Option<usize> {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let _ = SetForegroundWindow(hwnd);
         let _ = SetFocus(hwnd);
-        // Activation messages queued while the window was being created must not
-        // be mistaken for the user clicking away.
-        let mut queued = MSG::default();
-        while PeekMessageW(&mut queued, hwnd, WM_ACTIVATE, WM_KILLFOCUS, PM_REMOVE).as_bool() {}
-
-        let mut message = MSG::default();
-        while !state.closed {
-            let result = GetMessageW(&mut message, None, 0, 0);
-            if result.0 <= 0 {
-                break;
-            }
-            if message.message == WM_KEYDOWN || message.message == WM_SYSKEYDOWN {
-                match message.wParam.0 as u32 {
-                    key if key == VK_ESCAPE.0 as u32 => state.closed = true,
-                    key if key == VK_UP.0 as u32 => {
-                        state.move_selection(false);
-                        if let Err(error) = state.update_layered(hwnd) {
-                            eprintln!("menu repaint failed: {error}");
-                        }
-                    }
-                    key if key == VK_DOWN.0 as u32 => {
-                        state.move_selection(true);
-                        if let Err(error) = state.update_layered(hwnd) {
-                            eprintln!("menu repaint failed: {error}");
-                        }
-                    }
-                    key if key == VK_RETURN.0 as u32 => {
-                        state.chosen = state.hover;
-                        state.closed = true;
-                    }
-                    _ => {
-                        let _ = TranslateMessage(&message);
-                        DispatchMessageW(&message);
-                    }
+        pump_until_closed(
+            hwnd,
+            state_ptr,
+            |state: *const MenuWindow| (*state).closed,
+            |state: *mut MenuWindow, hwnd: HWND, key: u32| match key {
+                key if key == VK_ESCAPE.0 as u32 => {
+                    (*state).closed = true;
+                    true
                 }
-                continue;
-            }
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
+                key if key == VK_UP.0 as u32 => {
+                    (*state).move_selection(false);
+                    if let Err(error) = (*state).update_layered(hwnd) {
+                        eprintln!("menu repaint failed: {error}");
+                    }
+                    true
+                }
+                key if key == VK_DOWN.0 as u32 => {
+                    (*state).move_selection(true);
+                    if let Err(error) = (*state).update_layered(hwnd) {
+                        eprintln!("menu repaint failed: {error}");
+                    }
+                    true
+                }
+                key if key == VK_RETURN.0 as u32 => {
+                    (*state).chosen = (*state).hover;
+                    (*state).closed = true;
+                    true
+                }
+                _ => false,
+            },
+        );
         if IsWindow(hwnd).as_bool() {
             let _ = DestroyWindow(hwnd);
         }
         if !previous.is_invalid() && previous != hwnd {
             let _ = SetForegroundWindow(previous);
         }
-        state.chosen
+        (*state_ptr).chosen
     }
 }
 
-unsafe fn work_area(x: i32, y: i32) -> RECT {
+/// Pumps this thread's messages until `is_closed` reports true or the queue ends.
+///
+/// Both popups run their own modal loop while they are open, so the resident
+/// process still waits in `GetMessageW` instead of polling. Keyboard messages
+/// reach `on_key` first; returning `false` lets the default dispatch handle them.
+/// Messages queued while the window was being created (activation in particular)
+/// are dropped first, so they cannot be mistaken for the user clicking away.
+///
+/// The state is reached through a raw pointer on purpose: the window procedure
+/// the loop dispatches to owns the same object (handed over through
+/// `GWLP_USERDATA`) and writes the answer into it. A `&mut` here would let the
+/// optimiser assume the loop's exit condition cannot change and hoist it out of
+/// the loop — which is exactly what happened in release builds: the prompt came
+/// up, the answer arrived, and the loop never noticed it.
+pub(crate) unsafe fn pump_until_closed<T>(
+    hwnd: HWND,
+    state: *mut T,
+    is_closed: fn(*const T) -> bool,
+    on_key: fn(*mut T, HWND, u32) -> bool,
+) {
+    let mut queued = MSG::default();
+    while PeekMessageW(&mut queued, hwnd, WM_ACTIVATE, WM_KILLFOCUS, PM_REMOVE).as_bool() {}
+
+    let mut message = MSG::default();
+    while !is_closed(state) {
+        let result = GetMessageW(&mut message, None, 0, 0);
+        if result.0 <= 0 {
+            break;
+        }
+        if (message.message == WM_KEYDOWN || message.message == WM_SYSKEYDOWN)
+            && on_key(state, hwnd, message.wParam.0 as u32)
+        {
+            continue;
+        }
+        let _ = TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+}
+
+pub(crate) unsafe fn work_area(x: i32, y: i32) -> RECT {
     let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
     let mut info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,

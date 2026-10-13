@@ -1,6 +1,9 @@
+use core::ffi::c_void;
 use snaplight_domain::*;
 use snaplight_platform::CaptureService;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 use windows::{
     core::*,
@@ -68,6 +71,143 @@ fn to_view(r: ImageRect, viewport: &Viewport) -> ImageRect {
 }
 fn point(p: ImagePoint) -> D2D_POINT_2F {
     D2D_POINT_2F { x: p.x, y: p.y }
+}
+/// Glyph outlines of one text layout, in image pixels and ready to draw.
+type Outlines = Rc<RefCell<Vec<ID2D1Geometry>>>;
+/// Horizontal reference of a chip: `Left` from its left edge, `Centre` from its
+/// middle, so a chip can sit next to a selection or over the pointer.
+enum ChipAnchor {
+    Left(f32),
+    Centre(f32),
+}
+/// Collects the glyph outlines of a text layout instead of drawing the glyphs.
+///
+/// Text is rendered from its outlines so that one glyph shape serves both the
+/// fill and the outline: a stroke drawn from a separately shaped glyph run would
+/// drift away from the fill. The renderer is handed the runs DirectWrite already
+/// resolved, so text in fonts the requested family does not cover (CJK, emoji)
+/// keeps its fallback font instead of turning into boxes.
+#[windows::core::implement(IDWriteTextRenderer)]
+struct GlyphOutline {
+    factory: ID2D1Factory,
+    /// Shared with the caller: the object is moved into the interface that
+    /// `IDWriteTextLayout::Draw` consumes, so the outlines are read through
+    /// this handle afterwards.
+    runs: Rc<RefCell<Vec<ID2D1Geometry>>>,
+}
+impl GlyphOutline {
+    unsafe fn new(context: &ID2D1DeviceContext) -> Result<(Self, Outlines)> {
+        let runs: Outlines = Rc::new(RefCell::new(Vec::new()));
+        Ok((
+            Self {
+                factory: context.GetFactory()?,
+                runs: runs.clone(),
+            },
+            runs,
+        ))
+    }
+}
+// The rendered traits are implemented for the companion type the attribute
+// generates; it dereferences to `GlyphOutline`, so the fields stay readable.
+impl IDWritePixelSnapping_Impl for GlyphOutline_Impl {
+    fn IsPixelSnappingDisabled(&self, _client: *const c_void) -> Result<BOOL> {
+        // Glyph geometry goes through the canvas transform, which does its own
+        // snapping; snapping here would only shift the outline off the fill.
+        Ok(TRUE)
+    }
+    fn GetCurrentTransform(
+        &self,
+        _client: *const c_void,
+        transform: *mut DWRITE_MATRIX,
+    ) -> Result<()> {
+        unsafe {
+            *transform = DWRITE_MATRIX {
+                m11: 1.0,
+                m12: 0.0,
+                m21: 0.0,
+                m22: 1.0,
+                dx: 0.0,
+                dy: 0.0,
+            }
+        };
+        Ok(())
+    }
+    fn GetPixelsPerDip(&self, _client: *const c_void) -> Result<f32> {
+        Ok(1.0)
+    }
+}
+impl IDWriteTextRenderer_Impl for GlyphOutline_Impl {
+    fn DrawGlyphRun(
+        &self,
+        _client: *const c_void,
+        baseline_x: f32,
+        baseline_y: f32,
+        _measuring: DWRITE_MEASURING_MODE,
+        run: *const DWRITE_GLYPH_RUN,
+        _description: *const DWRITE_GLYPH_RUN_DESCRIPTION,
+        _effect: Option<&IUnknown>,
+    ) -> Result<()> {
+        unsafe {
+            let run = &*run;
+            let face = run
+                .fontFace
+                .as_ref()
+                .ok_or_else(|| Error::new(E_UNEXPECTED, "glyph run without a font face"))?;
+            let geometry = self.factory.CreatePathGeometry()?;
+            let sink: ID2D1SimplifiedGeometrySink = geometry.Open()?.cast()?;
+            face.GetGlyphRunOutline(
+                run.fontEmSize,
+                run.glyphIndices,
+                Some(run.glyphAdvances),
+                (!run.glyphOffsets.is_null()).then_some(run.glyphOffsets),
+                run.glyphCount,
+                run.isSideways.as_bool(),
+                run.bidiLevel % 2 == 1,
+                &sink,
+            )?;
+            sink.Close()?;
+            // Moving the geometry keeps the canvas transform (zoom and pan) in
+            // force, which an absolute transform on the context would replace.
+            let moved = self.factory.CreateTransformedGeometry(
+                &geometry,
+                &Matrix3x2::translation(baseline_x, baseline_y),
+            )?;
+            self.runs.borrow_mut().push(moved.cast()?);
+        }
+        Ok(())
+    }
+    fn DrawUnderline(
+        &self,
+        _client: *const c_void,
+        _origin_x: f32,
+        _origin_y: f32,
+        _underline: *const DWRITE_UNDERLINE,
+        _effect: Option<&IUnknown>,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn DrawStrikethrough(
+        &self,
+        _client: *const c_void,
+        _origin_x: f32,
+        _origin_y: f32,
+        _strikethrough: *const DWRITE_STRIKETHROUGH,
+        _effect: Option<&IUnknown>,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn DrawInlineObject(
+        &self,
+        _client: *const c_void,
+        _origin_x: f32,
+        _origin_y: f32,
+        _object: Option<&IDWriteInlineObject>,
+        _sideways: BOOL,
+        _right_to_left: BOOL,
+        _effect: Option<&IUnknown>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 fn properties(options: D2D1_BITMAP_OPTIONS, alpha: D2D1_ALPHA_MODE) -> D2D1_BITMAP_PROPERTIES1 {
     D2D1_BITMAP_PROPERTIES1 {
@@ -844,11 +984,15 @@ pub fn is_recoverable_device_error(error: &Error) -> bool {
     hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == D2DERR_RECREATE_TARGET
 }
 impl OverlayRenderer {
-    pub fn new(hwnd: HWND, frame: &FrozenFrame) -> Result<Self> {
+    /// Builds the renderer for `hwnd`. `view` is the swap chain size in view
+    /// pixels, normally the client area of the window: a session that shows a
+    /// pinned image at the pin's zoom draws the document through the viewport,
+    /// so the view size is the window and does not have to match the image.
+    pub fn new(hwnd: HWND, frame: &FrozenFrame, view: (u32, u32)) -> Result<Self> {
         unsafe {
             let width = frame.descriptor.width;
             let height = frame.descriptor.height;
-            let targets = create_targets(hwnd, frame, (width, height))?;
+            let targets = create_targets(hwnd, frame, view)?;
             let annotations = targets.dc.CreateBitmap(
                 D2D_SIZE_U { width, height },
                 None,
@@ -868,8 +1012,8 @@ impl OverlayRenderer {
                 mosaics: HashMap::new(),
                 width,
                 height,
-                view_width: width,
-                view_height: height,
+                view_width: view.0.max(1),
+                view_height: view.1.max(1),
                 frames: 0,
                 cpu_us: vec![],
                 present_us: vec![],
@@ -947,7 +1091,6 @@ impl OverlayRenderer {
         image: ImageRect,
         dpi: f32,
         origin: ScreenPoint,
-        view_width: f32,
     ) -> Result<()> {
         let scale = (dpi / 96.0).clamp(1.0, 4.0);
         let center = |p: D2D_POINT_2F, radius: f32| D2D1_ELLIPSE {
@@ -996,24 +1139,45 @@ impl OverlayRenderer {
             image.width.round().max(0.0) as u32,
             image.height.round().max(0.0) as u32
         );
+        self.draw_chip(
+            &text,
+            ChipAnchor::Left(r.x),
+            r.y - CHROME_CHIP_GAP * scale - CHROME_CHIP_HEIGHT * scale,
+            scale,
+        )?;
+        Ok(())
+    }
+    /// Dark rounded chip with centred white text, drawn in view pixels. The
+    /// anchor is clamped to the view, so a chip never leaves the window.
+    unsafe fn draw_chip(
+        &mut self,
+        text: &str,
+        anchor: ChipAnchor,
+        top: f32,
+        scale: f32,
+    ) -> Result<ImageRect> {
         let format = self.chip_text_format(CHROME_CHIP_FONT * scale)?;
         let utf16: Vec<u16> = text.encode_utf16().collect();
         let layout = self.gpu.write.CreateTextLayout(
             &utf16,
             &format,
-            view_width,
+            self.view_width as f32,
             CHROME_CHIP_HEIGHT * scale,
         )?;
         let mut metrics = DWRITE_TEXT_METRICS::default();
         layout.GetMetrics(&mut metrics)?;
         let width = metrics.widthIncludingTrailingWhitespace + 2.0 * CHROME_CHIP_PADDING * scale;
         let height = CHROME_CHIP_HEIGHT * scale;
+        let left = match anchor {
+            ChipAnchor::Left(x) => x,
+            ChipAnchor::Centre(x) => x - width / 2.0,
+        };
         let chip = ImageRect {
-            x: r.x.clamp(
+            x: left.clamp(
                 2.0 * scale,
-                (view_width - width - 2.0 * scale).max(2.0 * scale),
+                (self.view_width as f32 - width - 2.0 * scale).max(2.0 * scale),
             ),
-            y: (r.y - CHROME_CHIP_GAP * scale - height).max(2.0 * scale),
+            y: top.max(2.0 * scale),
             width,
             height,
         };
@@ -1025,6 +1189,15 @@ impl OverlayRenderer {
                 r: 0.157,
                 g: 0.192,
                 b: 0.22,
+                a: 1.0,
+            },
+            None,
+        )?;
+        let white = self.dc.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
                 a: 1.0,
             },
             None,
@@ -1046,7 +1219,7 @@ impl OverlayRenderer {
             &white,
             D2D1_DRAW_TEXT_OPTIONS_NONE,
         );
-        Ok(())
+        Ok(chip)
     }
     /// Preview chrome for the region detected under the cursor: the committed
     /// selection's outline without handles or the size chip, so a preview is
@@ -1207,59 +1380,81 @@ impl OverlayRenderer {
         self.mosaics.insert(block, bitmap);
         Ok(())
     }
-    unsafe fn draw_annotation(&self, a: &Annotation) -> Result<()> {
-        let c = a.style.rgba;
-        let brush = self.dc.CreateSolidColorBrush(
+    /// Solid brush for one colour. An annotation needs at most one brush per
+    /// paint, which is cheap next to the draw call that uses it.
+    unsafe fn brush(&self, rgba: [f32; 4]) -> Result<ID2D1SolidColorBrush> {
+        self.dc.CreateSolidColorBrush(
             &D2D1_COLOR_F {
-                r: c[0],
-                g: c[1],
-                b: c[2],
-                a: c[3],
+                r: rgba[0],
+                g: rgba[1],
+                b: rgba[2],
+                a: rgba[3],
             },
             None,
-        )?;
+        )
+    }
+    unsafe fn draw_annotation(&self, a: &Annotation) -> Result<()> {
+        let style = a.style;
         match &a.shape {
-            Shape::Rectangle(r) => self
-                .dc
-                .DrawRectangle(&rect(*r), &brush, a.style.width, None),
-            Shape::Ellipse(r) => self.dc.DrawEllipse(
-                &D2D1_ELLIPSE {
+            // Shapes paint a fill under their outline, so a translucent fill keeps
+            // the outline readable.
+            Shape::Rectangle(r) => {
+                if style.fill_on {
+                    let fill = self.brush(style.fill)?;
+                    self.dc.FillRectangle(&rect(*r), &fill);
+                }
+                if style.stroke_on {
+                    let stroke = self.brush(style.stroke)?;
+                    self.dc.DrawRectangle(&rect(*r), &stroke, style.width, None);
+                }
+            }
+            Shape::Ellipse(r) => {
+                let ellipse = D2D1_ELLIPSE {
                     point: D2D_POINT_2F {
                         x: r.x + r.width / 2.0,
                         y: r.y + r.height / 2.0,
                     },
                     radiusX: r.width / 2.0,
                     radiusY: r.height / 2.0,
-                },
-                &brush,
-                a.style.width,
-                None,
-            ),
+                };
+                if style.fill_on {
+                    let fill = self.brush(style.fill)?;
+                    self.dc.FillEllipse(&ellipse, &fill);
+                }
+                if style.stroke_on {
+                    let stroke = self.brush(style.stroke)?;
+                    self.dc.DrawEllipse(&ellipse, &stroke, style.width, None);
+                }
+            }
+            // The arrow head and the pen are line art: they have no interior to
+            // fill, so they always follow the outline colour.
             Shape::Arrow { from, to } => {
+                let brush = self.brush(style.stroke)?;
                 self.dc
-                    .DrawLine(point(*from), point(*to), &brush, a.style.width, None);
+                    .DrawLine(point(*from), point(*to), &brush, style.width, None);
                 let angle = (to.y - from.y).atan2(to.x - from.x);
-                let length = 12.0 + a.style.width * 2.0;
+                let length = 12.0 + style.width * 2.0;
                 for delta in [-0.45f32, 0.45] {
                     let p = ImagePoint {
                         x: to.x - length * (angle + delta).cos(),
                         y: to.y - length * (angle + delta).sin(),
                     };
                     self.dc
-                        .DrawLine(point(p), point(*to), &brush, a.style.width, None);
+                        .DrawLine(point(p), point(*to), &brush, style.width, None);
                 }
             }
             Shape::Pen(points) => {
+                let brush = self.brush(style.stroke)?;
                 for pair in points.windows(2) {
                     self.dc
-                        .DrawLine(point(pair[0]), point(pair[1]), &brush, a.style.width, None);
+                        .DrawLine(point(pair[0]), point(pair[1]), &brush, style.width, None);
                 }
                 if points.len() == 1 {
                     self.dc.FillEllipse(
                         &D2D1_ELLIPSE {
                             point: point(points[0]),
-                            radiusX: a.style.width / 2.0,
-                            radiusY: a.style.width / 2.0,
+                            radiusX: style.width / 2.0,
+                            radiusY: style.width / 2.0,
                         },
                         &brush,
                     );
@@ -1284,31 +1479,52 @@ impl OverlayRenderer {
                     );
                 }
             }
-            Shape::Text { at, text, size } => {
-                let format = self.gpu.write.CreateTextFormat(
-                    w!("Segoe UI"),
-                    None,
-                    DWRITE_FONT_WEIGHT_NORMAL,
-                    DWRITE_FONT_STYLE_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL,
-                    *size,
-                    w!(""),
-                )?;
-                let text: Vec<u16> = text.encode_utf16().collect();
-                let layout = D2D_RECT_F {
-                    left: at.x,
-                    top: at.y,
-                    right: self.width as f32,
-                    bottom: self.height as f32,
-                };
-                self.dc.DrawText(
-                    &text,
-                    &format,
-                    &layout,
-                    &brush,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
+            Shape::Text { at, text, size } => self.draw_text(a, *at, text, *size)?,
+        }
+        Ok(())
+    }
+    /// Text: fill the glyphs, then draw their outline over it. Both come from one
+    /// set of glyph outlines, so the outline hugs the letters exactly and a
+    /// half-transparent fill does not leak past it.
+    unsafe fn draw_text(
+        &self,
+        a: &Annotation,
+        at: ImagePoint,
+        text: &str,
+        size: f32,
+    ) -> Result<()> {
+        let format = self.gpu.write.CreateTextFormat(
+            w!("Segoe UI"),
+            None,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            size,
+            w!(""),
+        )?;
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        // The layout box keeps the wrapping DrawText used to apply: an annotation
+        // may not run past the captured image.
+        let layout = self.gpu.write.CreateTextLayout(
+            &utf16,
+            &format,
+            (self.width as f32 - at.x).max(1.0),
+            (self.height as f32 - at.y).max(1.0),
+        )?;
+        let (outline, runs) = GlyphOutline::new(&self.dc)?;
+        let renderer: IDWriteTextRenderer = outline.into();
+        layout.Draw(None, &renderer, at.x, at.y)?;
+        let runs = runs.borrow();
+        if a.style.fill_on {
+            let fill = self.brush(a.style.fill)?;
+            for run in runs.iter() {
+                self.dc.FillGeometry(run, &fill, None);
+            }
+        }
+        if a.style.stroke_on {
+            let stroke = self.brush(a.style.stroke)?;
+            for run in runs.iter() {
+                self.dc.DrawGeometry(run, &stroke, a.style.width, None);
             }
         }
         Ok(())
@@ -1494,11 +1710,16 @@ impl CanvasRenderer for OverlayRenderer {
                 },
                 None,
             )?;
-            let selection = interaction.selection_draft.or(doc.selection);
+            let selection = if interaction.fixed_image {
+                None
+            } else {
+                interaction.selection_draft.or(doc.selection)
+            };
             // The detected region is only a preview: it is shown while nothing is
             // committed and the user is not drawing, and it never reaches the
-            // document until a click adopts it.
-            let hover = if selection.is_none() && !interaction.dragging {
+            // document until a click adopts it. A fixed image never detects.
+            let hover = if selection.is_none() && !interaction.dragging && !interaction.fixed_image
+            {
                 interaction.hover
             } else {
                 None
@@ -1533,7 +1754,7 @@ impl CanvasRenderer for OverlayRenderer {
                 ] {
                     self.dc.FillRectangle(&zone, &dim);
                 }
-            } else {
+            } else if !interaction.fixed_image {
                 self.dc
                     .FillRectangle(&bounds(self.width, self.height), &dim);
             }
@@ -1555,7 +1776,6 @@ impl CanvasRenderer for OverlayRenderer {
                     r,
                     viewport.dpi,
                     viewport.origin,
-                    self.view_width as f32,
                 )?;
             } else if let Some(r) = hover {
                 self.draw_hover_chrome(to_view(r, &viewport), viewport.dpi)?;
@@ -1608,6 +1828,20 @@ impl CanvasRenderer for OverlayRenderer {
                     1.0,
                     None,
                 );
+            }
+            // The scrub readout belongs to the pointer that is adjusting it, so
+            // it is drawn last and follows the cursor.
+            if let Some(hud) = &interaction.hud {
+                let scale = (viewport.dpi / 96.0).clamp(1.0, 4.0);
+                let (anchor, pointer_y) = match interaction.cursor {
+                    Some(p) => {
+                        let (x, y) = viewport.to_view(p.x, p.y);
+                        (ChipAnchor::Centre(x), y)
+                    }
+                    None => (ChipAnchor::Centre(self.view_width as f32 / 2.0), 0.0),
+                };
+                let top = pointer_y - (CHROME_CHIP_HEIGHT + 2.0 * CHROME_CHIP_GAP) * scale;
+                self.draw_chip(hud, anchor, top, scale)?;
             }
             self.dc.EndDraw(None, None)?;
             if self.record_composed {

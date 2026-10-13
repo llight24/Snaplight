@@ -4,6 +4,23 @@ export struct ToolItem { id:int, label:string }
 // `capture` marks the commands that stay live while a long capture runs.
 export struct CommandItem { id:int, glyph:int, label:string, capture:bool }
 export struct CaptureItem { id:string, label:string }
+// Snapshot of everything the tool options panel can edit, sent to the editor as
+// one payload so a change is applied as a whole.
+export struct ToolPaint {
+    tool: int,
+    stroke-width: int,
+    fill-opacity: int,
+    font-size: int,
+    block: int,
+    stroke-color: color,
+    fill-color: color,
+    stroke-on: bool,
+    fill-on: bool,
+    text: string,
+}
+// One row of the settings page: which tool, and whether it paints an outline or
+// a fill by default.
+export struct ToolPaintRow { tool: int, label: string, stroke: bool, fill: bool }
 
 // Icons are paths so the toolbar ships no image assets; the ink colour comes
 // from the button that owns them.
@@ -178,20 +195,140 @@ component Divider inherits Rectangle {
     background: transparent;
     Rectangle { x: 6px; y: 8px; width: 1px; height: 24px; background: #e4e7ec; }
 }
-component Swatch inherits Rectangle {
-    in property <color> dot: #ffffff;
-    in property <bool> selected: false;
-    in property <string> label: "颜色";
+// Colour swatch that opens the picker. The size stays a parameter so the
+// presets in the picker can shrink it below the options-bar default.
+component ColorButton inherits Rectangle {
+    in property <color> swatch: #ffffff;
+    in property <string> label: "";
+    in property <length> size: 26px;
     callback picked();
-    width: 24px; height: 24px;
-    border-radius: 12px;
-    background: root.dot;
-    border-width: root.selected ? 2px : 1px;
-    border-color: root.selected ? #3388ff : #d3d7dd;
+    width: root.size; height: root.size;
+    border-radius: 6px;
+    background: root.swatch;
+    border-width: 1px;
+    border-color: #d3d7dd;
     TouchArea {
         accessible-role: button;
         accessible-label: root.label;
         clicked => { root.picked(); }
+    }
+}
+// Outline/fill switch. Its state is a read-only binding (`on`) driven by the
+// model, so it stays correct inside a `for` loop; a std-widgets CheckBox keeps
+// its own writable `checked` binding and would drift from the model.
+component PaintToggle inherits Rectangle {
+    in property <string> label: "";
+    in property <bool> on: false;
+    callback toggled();
+    width: 56px; height: 24px;
+    border-radius: 12px;
+    background: root.on ? #e8f0fe : #f2f4f7;
+    border-width: 1px;
+    border-color: root.on ? #3388ff : #d3d7dd;
+    Text {
+        width: 100%; height: 100%;
+        text: root.label;
+        font-size: 12px;
+        color: root.on ? #1668dc : #4b5563;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    TouchArea {
+        accessible-role: checkbox;
+        accessible-label: root.label;
+        accessible-checked: root.on;
+        clicked => { root.toggled(); }
+    }
+}
+// Shared paint controls: the tool options panel and the persistent paint bar
+// show the same values, so the row lives here once.
+component PaintControls inherits Rectangle {
+    in-out property <int> tool: 1;
+    in-out property <int> stroke-width: 3;
+    in-out property <int> block: 12;
+    in-out property <string> text-value: "";
+    in-out property <int> fill-opacity: 100;
+    in-out property <int> font-size: 32;
+    in-out property <color> stroke-color: #f23340;
+    in-out property <color> fill-color: #f23340;
+    in-out property <bool> stroke-on: true;
+    in-out property <bool> fill-on: false;
+    // Aggregates the editable values so every change sends one consistent
+    // snapshot instead of a hand-built argument list.
+    out property <ToolPaint> paint: {
+        tool: root.tool,
+        stroke-width: root.stroke-width,
+        fill-opacity: root.fill-opacity,
+        font-size: root.font-size,
+        block: root.block,
+        stroke-color: root.stroke-color,
+        fill-color: root.fill-color,
+        stroke-on: root.stroke-on,
+        fill-on: root.fill-on,
+        text: root.text-value,
+    };
+    callback changed(ToolPaint);
+    // 0 asks for the outline colour, 1 for the fill colour.
+    callback pick(int);
+    background: transparent;
+    HorizontalLayout {
+        // Conditional elements rather than `visible: false`: a hidden element
+        // still occupies its slot in a layout, which pushed the colours and the
+        // close button out of the panel.
+        padding: 0px; spacing: 10px; alignment: start;
+        // Outline group: shape tools, the pen and text.
+        if root.tool == 1 || root.tool == 2 || root.tool == 3 || root.tool == 4 || root.tool == 6: PaintToggle {
+            label: "描边"; on: root.stroke-on;
+            toggled => { root.stroke-on = !root.stroke-on; root.changed(root.paint); }
+        }
+        if root.tool == 1 || root.tool == 2 || root.tool == 3 || root.tool == 4 || root.tool == 6: ColorButton {
+            swatch: root.stroke-color; label: "描边色";
+            picked => { root.pick(0); }
+        }
+        if root.tool == 1 || root.tool == 2 || root.tool == 3 || root.tool == 4 || root.tool == 6: SpinBox {
+            accessible-label: "描边宽度";
+            // Wide enough for two digits plus the arrow column, which is drawn
+            // outside the box when the value needs more room than it has.
+            width: 92px;
+            minimum: 1; maximum: 64; value <=> root.stroke-width;
+            edited => { root.changed(root.paint); }
+        }
+        // Fill group: rectangles, ellipses and text.
+        if root.tool == 1 || root.tool == 2 || root.tool == 6: PaintToggle {
+            label: "填充"; on: root.fill-on;
+            toggled => { root.fill-on = !root.fill-on; root.changed(root.paint); }
+        }
+        if root.tool == 1 || root.tool == 2 || root.tool == 6: ColorButton {
+            swatch: root.fill-color; label: "填充色";
+            picked => { root.pick(1); }
+        }
+        if root.tool == 1 || root.tool == 2 || root.tool == 6: SpinBox {
+            accessible-label: "填充不透明度";
+            width: 92px;
+            minimum: 0; maximum: 100; value <=> root.fill-opacity;
+            edited => { root.changed(root.paint); }
+        }
+        if root.tool == 6: Text { text: "字号"; color: #4b5563; font-size: 13px; vertical-alignment: center; }
+        if root.tool == 6: SpinBox {
+            accessible-label: "字号";
+            width: 72px;
+            minimum: 12; maximum: 200; value <=> root.font-size;
+            edited => { root.changed(root.paint); }
+        }
+        if root.tool == 6: LineEdit {
+            accessible-label: "标注文字";
+            text <=> root.text-value;
+            placeholder-text: "文字";
+            horizontal-stretch: 1;
+            edited => { root.changed(root.paint); }
+        }
+        if root.tool == 5: Text { text: "马赛克块"; color: #4b5563; font-size: 13px; vertical-alignment: center; }
+        if root.tool == 5: SpinBox {
+            accessible-label: "马赛克块";
+            width: 96px;
+            minimum: 2; maximum: 128; value <=> root.block;
+            edited => { root.changed(root.paint); }
+        }
     }
 }
 
@@ -212,15 +349,21 @@ export component Toolbar inherits Window {
     // the pill stops being draggable so it cannot be moved over the region.
     in-out property <bool> long-capture: false;
     in-out property <int> active: 0;
-    in-out property <int> stroke: 3;
+    in-out property <int> stroke-width: 3;
     in-out property <int> block: 12;
     in-out property <string> text-value: "";
-    in-out property <int> swatch: 0;
+    in-out property <int> fill-opacity: 100;
+    in-out property <int> font-size: 32;
+    in-out property <color> stroke-color: #f23340;
+    in-out property <color> fill-color: #f23340;
+    // One entry per stable tool id (0..6), so the editor can map a tool to its
+    // default paint without a second lookup table.
+    in-out property <[bool]> stroke-tools: [false, true, true, true, true, false, false];
+    in-out property <[bool]> fill-tools: [false, false, false, false, false, false, true];
     in-out property <string> status: "";
     in-out property <bool> can-undo: false;
     in-out property <bool> can-redo: false;
     callback command(int);
-    callback properties-changed(int,int,string,int);
     callback options-toggled(int);
     Rectangle {
         width: 100%; height: 100%;
@@ -273,19 +416,42 @@ export component OptionsPanel inherits Window {
     title: "Snaplight Tool Options";
     no-frame: true;
     always-on-top: true;
-    // Wide enough for the longest label ("马赛克块"), a value, four swatches and
-    // the close button; OPTIONS_LOGICAL_SIZE in lib.rs must match.
-    width: 400px;
+    // The row is only as wide as the active tool needs, so a tool that paints
+    // fewer values gets a shorter panel instead of a wide one with empty space.
+    // `snaplight_ui::paint_logical_size` supplies the width and must agree.
+    in property <length> row-width: 460px;
+    width: root.row-width;
     height: 52px;
     background: #ffffff;
     default-font-family: "Segoe UI";
-    in property <int> tool: 1;
-    in-out property <int> stroke: 3;
+    in-out property <int> tool: 1;
+    in-out property <int> stroke-width: 3;
     in-out property <int> block: 12;
     in-out property <string> text-value: "";
-    in-out property <int> swatch: 0;
-    callback properties-changed(int,int,string,int);
+    in-out property <int> fill-opacity: 100;
+    in-out property <int> font-size: 32;
+    in-out property <color> stroke-color: #f23340;
+    in-out property <color> fill-color: #f23340;
+    in-out property <bool> stroke-on: true;
+    in-out property <bool> fill-on: false;
+    callback properties-changed(ToolPaint);
+    // 0 asks for the outline colour, 1 for the fill colour.
+    callback pick-color(int);
     callback dismissed();
+    // Aggregates the editable values so every change sends one consistent
+    // snapshot instead of a hand-built argument list.
+    out property <ToolPaint> paint: {
+        tool: root.tool,
+        stroke-width: root.stroke-width,
+        fill-opacity: root.fill-opacity,
+        font-size: root.font-size,
+        block: root.block,
+        stroke-color: root.stroke-color,
+        fill-color: root.fill-color,
+        stroke-on: root.stroke-on,
+        fill-on: root.fill-on,
+        text: root.text-value,
+    };
     Rectangle {
         width: 100%; height: 100%;
         background: #ffffff;
@@ -294,39 +460,208 @@ export component OptionsPanel inherits Window {
         border-color: #e8eaee;
         clip: true;
         HorizontalLayout {
-            // Conditional elements rather than `visible: false`: a hidden
-            // element still occupies its slot in a layout, which pushed the
-            // swatches and the close button out of the panel.
             padding-left: 14px; padding-right: 8px; spacing: 10px;
-            if root.tool != 5 && root.tool != 6: Text { text: "线宽"; color: #4b5563; font-size: 13px; vertical-alignment: center; }
-            if root.tool != 5 && root.tool != 6: SpinBox {
-                accessible-label: "线宽";
-                width: 96px;
-                minimum: 1; maximum: 64; value <=> root.stroke;
-                edited => { root.properties-changed(root.stroke, root.block, root.text-value, root.swatch); }
-            }
-            if root.tool == 5: Text { text: "马赛克块"; color: #4b5563; font-size: 13px; vertical-alignment: center; }
-            if root.tool == 5: SpinBox {
-                accessible-label: "马赛克块";
-                width: 96px;
-                minimum: 2; maximum: 128; value <=> root.block;
-                edited => { root.properties-changed(root.stroke, root.block, root.text-value, root.swatch); }
-            }
-            Swatch { dot: #f23340; selected: root.swatch == 0; label: "红色"; picked => { root.swatch = 0; root.properties-changed(root.stroke, root.block, root.text-value, 0); } }
-            Swatch { dot: #35c9a0; selected: root.swatch == 1; label: "绿色"; picked => { root.swatch = 1; root.properties-changed(root.stroke, root.block, root.text-value, 1); } }
-            Swatch { dot: #ffc94a; selected: root.swatch == 2; label: "黄色"; picked => { root.swatch = 2; root.properties-changed(root.stroke, root.block, root.text-value, 2); } }
-            Swatch { dot: #ffffff; selected: root.swatch == 3; label: "白色"; picked => { root.swatch = 3; root.properties-changed(root.stroke, root.block, root.text-value, 3); } }
-            if root.tool == 6: LineEdit {
-                accessible-label: "标注文字";
-                text <=> root.text-value;
-                placeholder-text: "文字";
-                horizontal-stretch: 1;
-                edited => { root.properties-changed(root.stroke, root.block, root.text-value, root.swatch); }
+            // The panel is as wide as the longest tool needs, so a shorter tool
+            // is centred between the spacer and the close button instead of
+            // leaving its gap on one side.
+            Rectangle { horizontal-stretch: 1; }
+            ctl := PaintControls {
+                tool <=> root.tool;
+                stroke-width <=> root.stroke-width;
+                block <=> root.block;
+                text-value <=> root.text-value;
+                fill-opacity <=> root.fill-opacity;
+                font-size <=> root.font-size;
+                stroke-color <=> root.stroke-color;
+                fill-color <=> root.fill-color;
+                stroke-on <=> root.stroke-on;
+                fill-on <=> root.fill-on;
+                changed(paint) => { root.properties-changed(paint); }
+                pick(target) => { root.pick-color(target); }
             }
             Rectangle { horizontal-stretch: 1; }
             BarButton {
                 glyph: 6; label: "关闭选项";
                 activated => { root.dismissed(); }
+            }
+        }
+    }
+}
+
+// Persistent paint bar at the bottom of the editor. It carries the same paint
+// controls as the tool options panel but has no close button. PAINT_BAR_TITLE
+// in lib.rs must match, and its width comes from `paint_logical_size` so the bar
+// never shows a row of empty space.
+export component PaintBar inherits Window {
+    title: "Snaplight Paint";
+    no-frame: true;
+    always-on-top: true;
+    in property <length> row-width: 460px;
+    width: root.row-width;
+    height: 52px;
+    background: #ffffff;
+    default-font-family: "Segoe UI";
+    in-out property <int> tool: 1;
+    in-out property <int> stroke-width: 3;
+    in-out property <int> block: 12;
+    in-out property <string> text-value: "";
+    in-out property <int> fill-opacity: 100;
+    in-out property <int> font-size: 32;
+    in-out property <color> stroke-color: #f23340;
+    in-out property <color> fill-color: #f23340;
+    in-out property <bool> stroke-on: true;
+    in-out property <bool> fill-on: false;
+    // Same aggregate as the options panel, so the editor can treat both windows
+    // the same way.
+    out property <ToolPaint> paint: {
+        tool: root.tool,
+        stroke-width: root.stroke-width,
+        fill-opacity: root.fill-opacity,
+        font-size: root.font-size,
+        block: root.block,
+        stroke-color: root.stroke-color,
+        fill-color: root.fill-color,
+        stroke-on: root.stroke-on,
+        fill-on: root.fill-on,
+        text: root.text-value,
+    };
+    callback properties-changed(ToolPaint);
+    // 0 asks for the outline colour, 1 for the fill colour.
+    callback pick-color(int);
+    Rectangle {
+        width: 100%; height: 100%;
+        background: #ffffff;
+        border-radius: self.height / 2;
+        border-width: 1px;
+        border-color: #e8eaee;
+        clip: true;
+        HorizontalLayout {
+            padding-left: 14px; padding-right: 14px; spacing: 10px;
+            ctl := PaintControls {
+                tool <=> root.tool;
+                stroke-width <=> root.stroke-width;
+                block <=> root.block;
+                text-value <=> root.text-value;
+                fill-opacity <=> root.fill-opacity;
+                font-size <=> root.font-size;
+                stroke-color <=> root.stroke-color;
+                fill-color <=> root.fill-color;
+                stroke-on <=> root.stroke-on;
+                fill-on <=> root.fill-on;
+                horizontal-stretch: 1;
+                changed(paint) => { root.properties-changed(paint); }
+                pick(target) => { root.pick-color(target); }
+            }
+        }
+    }
+}
+
+// Colour picker. All colour arithmetic (hex parsing, HSV conversion, the hue
+// base) lives in Rust; this window only reports pointer positions and text and
+// renders what Rust writes back. PICKER_LOGICAL_SIZE and PICKER_TITLE in
+// lib.rs must match the size and title below.
+export component ColorPicker inherits Window {
+    title: "Snaplight Color";
+    no-frame: true;
+    always-on-top: true;
+    width: 280px;
+    height: 256px;
+    default-font-family: "Segoe UI";
+    in property <string> target-label: "描边色";
+    // Fully saturated, fully bright colour of the current hue.
+    in property <color> sv-base: #ff0000;
+    in property <color> color-value: #f23340;
+    in-out property <float> hue: 0.0;
+    in-out property <float> saturation: 1.0;
+    // Named brightness rather than value to avoid clashing with the `value`
+    // used by widgets.
+    in-out property <float> brightness: 0.95;
+    in-out property <string> hex-text: "#F23340";
+    callback hue-picked(float);
+    callback sv-picked(float, float);
+    callback hex-edited(string);
+    callback preset-picked(color);
+    callback dismissed();
+    Rectangle {
+        width: 100%; height: 100%;
+        background: #ffffff;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: #e8eaee;
+        clip: true;
+        Text {
+            x: 16px; y: 8px; width: 248px; height: 18px;
+            text: "拾色器 · " + root.target-label;
+            font-size: 13px; color: #111827;
+            vertical-alignment: center;
+        }
+        // Standard HSV square: hue underneath, white towards the right, black
+        // towards the bottom.
+        Rectangle {
+            x: 16px; y: 32px; width: 248px; height: 128px;
+            border-radius: 4px; clip: true;
+            Rectangle { background: root.sv-base; }
+            Rectangle { background: @linear-gradient(90deg, white 0%, transparent 100%); }
+            Rectangle { background: @linear-gradient(180deg, transparent 0%, black 100%); }
+        }
+        sv := TouchArea {
+            x: 16px; y: 32px; width: 248px; height: 128px;
+            accessible-role: button;
+            accessible-label: "饱和度和明度";
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down) {
+                    root.sv-picked(clamp(self.mouse-x / self.width, 0, 1), clamp(1 - self.mouse-y / self.height, 0, 1));
+                }
+            }
+            moved => {
+                if self.pressed {
+                    root.sv-picked(clamp(self.mouse-x / self.width, 0, 1), clamp(1 - self.mouse-y / self.height, 0, 1));
+                }
+            }
+        }
+        Rectangle {
+            x: 16px; y: 168px; width: 248px; height: 14px;
+            border-radius: 7px; clip: true;
+            background: @linear-gradient(90deg, #ff0000 0%, #ffff00 17%, #00ff00 33%, #00ffff 50%, #0000ff 67%, #ff00ff 83%, #ff0000 100%);
+        }
+        hue-bar := TouchArea {
+            x: 16px; y: 168px; width: 248px; height: 14px;
+            accessible-role: button;
+            accessible-label: "色相";
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down) {
+                    root.hue-picked(clamp(self.mouse-x / self.width, 0, 1));
+                }
+            }
+            moved => {
+                if self.pressed { root.hue-picked(clamp(self.mouse-x / self.width, 0, 1)); }
+            }
+        }
+        HorizontalLayout {
+            x: 16px; y: 190px; width: 248px; height: 30px;
+            spacing: 8px; alignment: center;
+            Text { text: "十六进制"; color: #4b5563; font-size: 13px; vertical-alignment: center; }
+            LineEdit {
+                accessible-label: "十六进制颜色";
+                text <=> root.hex-text;
+                horizontal-stretch: 1;
+                edited => { root.hex-edited(root.hex-text); }
+            }
+            // Preview only; clicking it has no effect.
+            ColorButton { swatch: root.color-value; label: "当前颜色"; picked => { } }
+            Button {
+                text: "完成"; accessible-label: "完成取色";
+                clicked => { root.dismissed(); }
+            }
+        }
+        HorizontalLayout {
+            x: 16px; y: 224px; width: 248px; height: 22px;
+            spacing: 10px; alignment: center;
+            for preset[index] in [#f23340, #ff8c1a, #ffc94a, #35c9a0, #3388ff, #a855f7, #ffffff, #202124]: ColorButton {
+                size: 22px;
+                swatch: preset;
+                label: "预设颜色 " + (index + 1);
+                picked => { root.preset-picked(preset); }
             }
         }
     }
@@ -381,8 +716,18 @@ export component Settings inherits Window {
     in-out property <[CaptureItem]> captures;
     in-out property <string> pending-delete:"";
     in-out property <bool> gpu-pins:false;
+    in-out property <bool> pin-close-confirm:true;
+    in-out property <bool> pin-shadow:true;
+    in-out property <int> pin-shadow-blur:8;
+    in-out property <int> pin-shadow-offset:2;
+    in-out property <int> pin-shadow-opacity:20;
     in-out property <int> stroke:3;
     in-out property <int> block:12;
+    in-out property <int> fill-opacity:100;
+    in-out property <int> font-size:32;
+    in-out property <string> stroke-color-value:"#F23340";
+    in-out property <string> fill-color-value:"#F23340";
+    in-out property <[ToolPaintRow]> paint-tools;
     in-out property <string> background-value:"#202124";
     in-out property <string> foreground-value:"#f4f5f6";
     in-out property <string> accent-value:"#36c9a0";
@@ -408,6 +753,8 @@ export component Settings inherits Window {
     callback open-capture(string);
     callback delete-capture(string);
     callback open-data-dir();
+    // Tool id, paint slot (0 stroke / 1 fill) and the requested state.
+    callback paint-toggled(int, int, bool);
     VerticalBox {padding:0px; spacing:0px;
         HorizontalBox {vertical-stretch:1; spacing:0px;
             // Function navigation.
@@ -441,6 +788,8 @@ export component Settings inherits Window {
                                 SectionTitle {text:"贴图";}
                                 CheckBox {text:"GPU 贴图";checked<=>root.gpu-pins;}
                                 Hint {text:"用常驻 DirectComposition 表面渲染贴图，仅对新贴图生效；默认的 layered 后端私有内存更低。";}
+                                CheckBox {text:"关闭贴图前确认";checked<=>root.pin-close-confirm;}
+                                Hint {text:"双击贴图关闭它之前先弹出确认窗口；在窗口里勾选「下次不再提醒」会把这里改成关闭。";}
                                 Rule {}
                                 SectionTitle {text:"工具栏";}
                                 Hint {text:"标注工具，按悬浮条上显示的顺序排列。";}
@@ -455,6 +804,13 @@ export component Settings inherits Window {
                                 HorizontalBox {Text {text:"前景色";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"主题前景色";text<=>root.foreground-value;}}
                                 HorizontalBox {Text {text:"强调色";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"主题强调色";text<=>root.accent-value;}}
                                 Hint {text:"截图界面的选区、工具栏与贴图的配色；输入的十六进制颜色在保存后生效。";}
+                                Rule {}
+                                SectionTitle {text:"贴图阴影";}
+                                CheckBox {text:"贴图默认带阴影";checked<=>root.pin-shadow;}
+                                HorizontalBox {Text {text:"模糊";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"阴影模糊";minimum:0;maximum:48;value<=>root.pin-shadow-blur;}}
+                                HorizontalBox {Text {text:"垂直偏移";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"阴影垂直偏移";minimum:0;maximum:24;value<=>root.pin-shadow-offset;}}
+                                HorizontalBox {Text {text:"不透明度";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"阴影不透明度";minimum:0;maximum:100;value<=>root.pin-shadow-opacity;}}
+                                Hint {text:"贴图贴在桌面上时在四周投下阴影，看起来是浮起来的。模糊和垂直偏移是 100% 缩放下的逻辑像素，不透明度是贴图边缘处的浓度；保存后立即生效，对已打开的贴图同样有效。右键某一张贴图可以单独关闭它的阴影。";}
                             }
                             if root.page-index == 2: VerticalLayout {alignment:start; spacing:8px;
                                 SectionTitle {text:"全局快捷键";}
@@ -470,6 +826,17 @@ export component Settings inherits Window {
                                 SectionTitle {text:"绘制默认值";}
                                 HorizontalBox {Text {text:"线宽";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"线宽";minimum:1;maximum:64;value<=>root.stroke;}}
                                 HorizontalBox {Text {text:"马赛克块";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"马赛克块";minimum:2;maximum:128;value<=>root.block;}}
+                                HorizontalBox {Text {text:"描边颜色";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"描边颜色";text<=>root.stroke-color-value;}}
+                                HorizontalBox {Text {text:"填充颜色";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"填充颜色";text<=>root.fill-color-value;}}
+                                HorizontalBox {Text {text:"填充不透明度";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"填充不透明度";minimum:0;maximum:100;value<=>root.fill-opacity;}}
+                                HorizontalBox {Text {text:"字号";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"字号";minimum:12;maximum:200;value<=>root.font-size;}}
+                                SectionTitle {text:"按工具的颜色";}
+                                Hint {text:"选择每种工具默认画描边还是填充；文字默认只画填充（字色），可另行打开描边。";}
+                                for row in root.paint-tools: HorizontalBox {
+                                    Text {text:row.label;vertical-alignment:center;horizontal-stretch:1;}
+                                    PaintToggle {label:"描边";on:row.stroke;toggled=>{root.paint-toggled(row.tool, 0, !row.stroke);}}
+                                    PaintToggle {label:"填充";on:row.fill;toggled=>{root.paint-toggled(row.tool, 1, !row.fill);}}
+                                }
                                 Rule {}
                                 SectionTitle {text:"窗口识别";}
                                 HorizontalBox {Text {text:"模式";vertical-alignment:center;horizontal-stretch:1;} ComboBox {accessible-label:"窗口识别模式";model:["关闭","光标下的界面元素"];current-index<=>root.detect-mode;}}

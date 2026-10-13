@@ -9,6 +9,10 @@ use std::{
 #[cfg(windows)]
 pub mod popup_menu;
 
+/// Owner-drawn confirmation prompt with an opt-out checkbox.
+#[cfg(windows)]
+pub mod confirm;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Capabilities {
     pub capture: bool,
