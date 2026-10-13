@@ -124,7 +124,7 @@ The settings window is a left navigation pane plus right-hand options, with seve
 ### Configuration and data directory
 
 - Configuration and captures live in `%LOCALAPPDATA%\Snaplight` by default; set `SNAPLIGHT_DATA_DIR` to override.
-- `config.json` stores theme colours, stroke width, mosaic block size, tool order, window detection mode, the GPU pin switch, the close-pin confirmation switch, the pin shadow (`pin_shadow` default switch, `pin_shadow_blur`, `pin_shadow_offset`, `pin_shadow_opacity`), the capture folder, both global hotkeys and the pin held-interaction key; a configuration written before the held-interaction key existed falls back to `Ctrl`, one written before the confirmation switch falls back to asking, and one written before the shadow falls back to a shadow of blur 12, offset 4 and opacity 40. `ui-state.json` stores window positions.
+- `config.json` stores theme colours, stroke width, mosaic block size, tool order, window detection mode, the GPU pin switch, the close-pin confirmation switch, the pin shadow (`pin_shadow` default switch, `pin_shadow_blur`, `pin_shadow_offset`, `pin_shadow_opacity`), the capture folder, both global hotkeys and the pin held-interaction key; a configuration written before the held-interaction key existed falls back to `Ctrl`, one written before the confirmation switch falls back to asking, and one written before the shadow falls back to a shadow of blur 8, offset 2 and opacity 20. `ui-state.json` stores window positions.
 - Captures default to `<data dir>\captures` and can be changed in settings.
 - The 翻译 and 屏幕录制 pages are placeholders: **an unimplemented feature never gets a setting that pretends to work**.
 

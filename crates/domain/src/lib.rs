@@ -29,10 +29,10 @@ pub const DEFAULT_FONT_SIZE: u16 = 32;
 /// cards do, and the shadow is what says so. Its metrics are logical pixels at
 /// 96 DPI, so the pin scales them for the monitor it opens on.
 pub const DEFAULT_PIN_SHADOW: bool = true;
-pub const DEFAULT_PIN_SHADOW_BLUR: u32 = 12;
-pub const DEFAULT_PIN_SHADOW_OFFSET: u32 = 4;
+pub const DEFAULT_PIN_SHADOW_BLUR: u32 = 8;
+pub const DEFAULT_PIN_SHADOW_OFFSET: u32 = 2;
 /// Default shadow opacity, in percent.
-pub const DEFAULT_PIN_SHADOW_OPACITY: u8 = 40;
+pub const DEFAULT_PIN_SHADOW_OPACITY: u8 = 20;
 pub const MAX_PIN_SHADOW_BLUR: u32 = 48;
 pub const MAX_PIN_SHADOW_OFFSET: u32 = 24;
 
@@ -1297,9 +1297,14 @@ mod tests {
         assert!(Config::default().pin_shadow);
         let config: Config = serde_json::from_str("{\"version\":1}").unwrap();
         assert!(config.pin_shadow);
-        assert_eq!(config.pin_shadow_blur, DEFAULT_PIN_SHADOW_BLUR);
-        assert_eq!(config.pin_shadow_offset, DEFAULT_PIN_SHADOW_OFFSET);
-        assert_eq!(config.pin_shadow_opacity, DEFAULT_PIN_SHADOW_OPACITY);
+        // The metrics are a product decision, so they are pinned by value here
+        // rather than compared against the constants they come from.
+        assert_eq!(config.pin_shadow_blur, 8);
+        assert_eq!(config.pin_shadow_offset, 2);
+        assert_eq!(config.pin_shadow_opacity, 20);
+        assert_eq!(DEFAULT_PIN_SHADOW_BLUR, 8);
+        assert_eq!(DEFAULT_PIN_SHADOW_OFFSET, 2);
+        assert_eq!(DEFAULT_PIN_SHADOW_OPACITY, 20);
         assert!(config.validate().is_ok());
         // Every metric has a range the pin process sizes its window by, so a
         // hand-edited value outside it must not reach the pin.
