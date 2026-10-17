@@ -5,6 +5,8 @@
 //! so the overlap search, the budget rules, and the stop conditions are unit
 //! tested without a screen.
 
+use core::cmp::Ordering;
+
 use crate::{AlphaMode, ColorSpace, ImageDescriptor, ImageId, PixelFormat};
 
 /// Hard cap on the stitched height in physical pixels. Every image path in the
@@ -26,13 +28,6 @@ const CANDIDATE_ROW_RATIO: f32 = 0.6;
 /// frame that shares fewer rows than this cannot be stitched without a visible
 /// gap, so the caller stops instead of inventing content.
 const MIN_OVERLAP: u32 = 8;
-/// Weight of the "close to the previous scroll delta" bonus. A constant wheel
-/// delta scrolls by a nearly constant number of rows, which disambiguates
-/// repeating content (stripes, tables, code) that matches at several offsets.
-const DELTA_WEIGHT: f32 = 0.5;
-/// Bonus for the direction the content already moved in, so a close call keeps
-/// scrolling the same way instead of flipping the stitched image around.
-const KEEP_DIRECTION_BONUS: f32 = 0.1;
 
 /// One captured screen region: BGRA8, top-down, `stride` bytes per row.
 #[derive(Clone, Copy)]
@@ -72,12 +67,83 @@ fn sample_indices(end: u32, count: u32) -> Vec<u32> {
     (0..count).map(|i| i * end / count).collect()
 }
 
+/// One candidate overlap and the evidence that ranks it.
+#[derive(Clone, Copy)]
+struct Overlap {
+    overlap: u32,
+    /// Sampled rows that matched, the numerator of the match share. This is the
+    /// primary evidence: two frames at the right offset agree pixel for pixel, a
+    /// wrong offset only agrees where the page repeats.
+    matched: u32,
+    /// Sampled rows that carried detail and so were allowed to vote, the
+    /// denominator of the match share. Compared with `matched` by
+    /// cross-multiplying, so two candidates rank equal only when their shares are
+    /// exactly equal -- a near-tie is never rounded into a band a prior could
+    /// reorder.
+    voting: u32,
+    /// `1 - |delta - expected| / expected`, or `0` when there is no previous
+    /// delta to compare against. Breaks a tie only between candidates whose pixel
+    /// evidence is exactly equal.
+    prior: f32,
+}
+
+/// Exact comparison of two candidates' pixel evidence: the sign of
+/// `a.matched/a.voting - b.matched/b.voting`, computed by cross-multiplying so
+/// only exactly equal shares compare equal. The share is evidence, not a
+/// tolerance band, so the order between candidates is strict and transitive.
+fn evidence(a: &Overlap, b: &Overlap) -> Ordering {
+    (u64::from(a.matched) * u64::from(b.voting)).cmp(&(u64::from(b.matched) * u64::from(a.voting)))
+}
+
+/// Whether `a` outranks `b`: exact pixel evidence first, then the delta prior,
+/// then the larger overlap. Every key is exact, so the winner does not depend on
+/// the order the candidates were visited in.
+fn outranks(a: &Overlap, b: &Overlap) -> bool {
+    evidence(a, b)
+        .then_with(|| a.prior.total_cmp(&b.prior))
+        .then_with(|| a.overlap.cmp(&b.overlap))
+        == Ordering::Greater
+}
+
+/// [`outranks`] for candidates from both directions of travel. The pixel
+/// evidence and the delta prior come first; when both are exactly equal the
+/// direction the content already moved is the last tie-breaker, then the larger
+/// overlap. `previous` is the direction of the last accepted step, when there was
+/// one.
+fn outranks_with_direction(
+    a: &Overlap,
+    a_direction: Direction,
+    b: &Overlap,
+    b_direction: Direction,
+    previous: Option<Direction>,
+) -> bool {
+    match evidence(a, b) {
+        Ordering::Greater => return true,
+        Ordering::Less => return false,
+        Ordering::Equal => {}
+    }
+    match a.prior.total_cmp(&b.prior) {
+        Ordering::Greater => return true,
+        Ordering::Less => return false,
+        Ordering::Equal => {}
+    }
+    if a_direction != b_direction {
+        let a_moving = Some(a_direction) == previous;
+        let b_moving = Some(b_direction) == previous;
+        if a_moving != b_moving {
+            return a_moving;
+        }
+    }
+    a.overlap > b.overlap
+}
+
 /// Largest overlap `k` such that the bottom `k` rows of the previous image match
 /// the top `k` rows of `next`.
 ///
-/// `expected_rows` is the scroll delta of the previous step, when there was one;
-/// candidates that scroll by a similar amount are preferred, which keeps
-/// repeating content from anchoring the search on the wrong offset.
+/// Pixel agreement picks the overlap. `expected_rows` -- the scroll delta of the
+/// previous step, when there was one -- only breaks a tie between overlaps whose
+/// pixel evidence is exactly equal, so repeating content cannot anchor the search
+/// on a wrong offset merely because it fits the previous delta better.
 pub fn matching_overlap(
     previous: Frame<'_>,
     next: Frame<'_>,
@@ -86,20 +152,20 @@ pub fn matching_overlap(
     search_overlap(previous, next, expected_rows, |overlap| {
         next.height - overlap
     })
-    .map(|(_, overlap)| overlap)
+    .map(|best| best.overlap)
 }
 
 /// Shared search behind [`matching_overlap`], returning the best overlap together
-/// with its score so a caller can compare candidates from both directions of
-/// travel. `delta` turns a candidate overlap into the number of new rows it would
-/// add, which is what the previous step's delta is compared against; the two
-/// directions count it differently.
+/// with the evidence that ranked it, so a caller can compare candidates from both
+/// directions of travel. `delta` turns a candidate overlap into the number of new
+/// rows it would add, which is what the previous step's delta is compared against;
+/// the two directions count it differently.
 fn search_overlap(
     previous: Frame<'_>,
     next: Frame<'_>,
     expected_rows: Option<u32>,
     delta: impl Fn(u32) -> u32,
-) -> Option<(f32, u32)> {
+) -> Option<Overlap> {
     let width = previous.width;
     let previous_height = previous.height;
     let previous_stride = previous.stride;
@@ -112,7 +178,7 @@ fn search_overlap(
         return None;
     }
     let columns = sample_indices(width, SAMPLE_COLUMNS);
-    let mut best: Option<(f32, u32)> = None;
+    let mut best: Option<Overlap> = None;
     let mut any_detail = false;
     for overlap in (MIN_OVERLAP..=max).rev() {
         let rows = sample_indices(overlap, SAMPLE_ROWS);
@@ -156,20 +222,31 @@ fn search_overlap(
             continue;
         }
         let added = delta(overlap);
-        let score = match expected_rows {
+        let prior = match expected_rows {
             Some(expected) if expected > 0 => {
-                ratio - DELTA_WEIGHT * (added as f32 - expected as f32).abs() / expected as f32
+                1.0 - (added as f32 - expected as f32).abs() / expected as f32
             }
-            _ => ratio,
+            _ => 0.0,
         };
-        if best.is_none_or(|(best_score, _)| score > best_score) {
-            best = Some((score, overlap));
+        let candidate = Overlap {
+            overlap,
+            matched,
+            voting,
+            prior,
+        };
+        if best.as_ref().is_none_or(|best| outranks(&candidate, best)) {
+            best = Some(candidate);
         }
     }
     // A frame of one flat colour carries no offset at all. Reporting the largest
     // overlap leaves the caller's image untouched instead of guessing at rows.
     if !any_detail {
-        return Some((0.0, max));
+        return Some(Overlap {
+            overlap: max,
+            matched: 0,
+            voting: 0,
+            prior: 0.0,
+        });
     }
     best
 }
@@ -295,32 +372,32 @@ impl LongCapture {
         self.advance(frame, Some(Direction::Down))
     }
     /// Stitches one frame in whichever direction the content moved. Both
-    /// directions are searched and the better candidate wins, so a scroll that
-    /// reverses direction keeps working; `previous` breaks a close call in favour
-    /// of the direction the user was already scrolling.
+    /// directions are searched and the better pixel evidence wins, so a scroll
+    /// that reverses direction keeps working; the previous scroll delta and
+    /// direction only break a tie when the pixel evidence is exactly equal.
     pub fn advance(&mut self, frame: &Frame<'_>, previous: Option<Direction>) -> Step {
         if !self.accepts(frame) {
             return Step::Jumped;
         }
-        let mut best: Option<(f32, Direction, u32)> = None;
+        let mut best: Option<(Overlap, Direction)> = None;
         for direction in [Direction::Down, Direction::Up] {
-            let Some((score, overlap)) = self.candidate(frame, direction) else {
+            let Some(candidate) = self.candidate(frame, direction) else {
                 continue;
             };
-            let score = score
-                + if Some(direction) == previous {
-                    KEEP_DIRECTION_BONUS
-                } else {
-                    0.0
-                };
-            if best.is_none_or(|(best_score, _, _)| score > best_score) {
-                best = Some((score, direction, overlap));
+            let better = match &best {
+                None => true,
+                Some((best, best_direction)) => {
+                    outranks_with_direction(&candidate, direction, best, *best_direction, previous)
+                }
+            };
+            if better {
+                best = Some((candidate, direction));
             }
         }
-        let Some((_, direction, overlap)) = best else {
+        let Some((candidate, direction)) = best else {
             return Step::Jumped;
         };
-        self.apply(frame, direction, overlap)
+        self.apply(frame, direction, candidate.overlap)
     }
     /// Whether `frame` can be stitched onto this capture: same width, non-empty,
     /// dense BGRA8 rows of the declared height, and no size overflow.
@@ -348,11 +425,11 @@ impl LongCapture {
             bytes: &self.bytes[start..end],
         }
     }
-    /// Best overlap for `frame` assuming the content moved `direction`, with its
-    /// score. Only the last accepted frame is searched, which is what makes
-    /// adjacent motion reliable: a constant wheel delta also scrolls by a nearly
-    /// constant number of rows.
-    fn candidate(&self, frame: &Frame<'_>, direction: Direction) -> Option<(f32, u32)> {
+    /// Best overlap for `frame` assuming the content moved `direction`, with the
+    /// evidence that ranked it. Only the last accepted frame is searched, which is
+    /// what makes adjacent motion reliable: a constant wheel delta also scrolls by
+    /// a nearly constant number of rows.
+    fn candidate(&self, frame: &Frame<'_>, direction: Direction) -> Option<Overlap> {
         let last = self.last_frame();
         match direction {
             Direction::Down => search_overlap(last, *frame, self.last_rows, |overlap| {
@@ -526,6 +603,31 @@ mod tests {
             bytes,
         }
     }
+    /// A page that repeats every 100 rows, with a unique 30-row anchor band at
+    /// the start of each period. Tables, logs and code blocks look like this:
+    /// most rows repeat, a few cells differ. The repeated rows match at any offset
+    /// that is a multiple of the period, so only the anchors tell the right offset
+    /// from a wrong one, and the wrong one still matches most sampled rows.
+    fn repeated_page(height: u32) -> Vec<u8> {
+        const PERIOD: u32 = 100;
+        const ANCHORS: u32 = 30;
+        let mut bytes = vec![0u8; stride() * height as usize];
+        for y in 0..height {
+            let slot = y % PERIOD;
+            // Anchor rows are unique to their repetition; the rest repeat exactly.
+            let seed = if slot < ANCHORS { y } else { slot };
+            for x in 0..WIDTH {
+                let i = y as usize * stride() + x as usize * 4;
+                let h = seed.wrapping_mul(2_654_435_761) ^ x.wrapping_mul(40_503);
+                bytes[i] = (h >> 24) as u8;
+                bytes[i + 1] = (h >> 16) as u8;
+                bytes[i + 2] = (h >> 8) as u8;
+                bytes[i + 3] = 255;
+            }
+        }
+        bytes
+    }
+
     /// Adds a per-frame noise floor, as a live screen has.
     fn noisy(bytes: &[u8], seed: u8) -> Vec<u8> {
         let mut out = bytes.to_vec();
@@ -563,6 +665,177 @@ mod tests {
         let mut capture = LongCapture::new(frame(&first), MAX_BYTES).unwrap();
         assert_eq!(capture.push(&frame(&first)), Step::Unchanged);
         assert_eq!(capture.height(), FRAME_HEIGHT);
+    }
+
+    #[test]
+    fn repeated_rows_do_not_outvote_a_closer_scroll() {
+        // Page: rows repeat every 100, anchors every 100. After a 120-row scroll
+        // the next screen moves only 20 rows. The repeating offset (moved 120)
+        // matches 30 of the 40 sampled rows; the true offset (moved 20) matches
+        // all 40. The delta prior must not lift the repeating offset over the
+        // better pixel match it was only meant to break a tie with.
+        let source = repeated_page(600);
+        let mut capture =
+            LongCapture::new(frame(&crop(&source, 0, FRAME_HEIGHT)), MAX_BYTES).unwrap();
+        assert_eq!(
+            capture.push(&frame(&crop(&source, 120, FRAME_HEIGHT))),
+            Step::Scrolled {
+                overlap: 180,
+                rows: 120
+            }
+        );
+        assert_eq!(
+            capture.push(&frame(&crop(&source, 140, FRAME_HEIGHT))),
+            Step::Scrolled {
+                overlap: 280,
+                rows: 20
+            }
+        );
+        assert_eq!(capture.height(), 440);
+        assert_eq!(capture.bytes(), &source[..440 * stride()]);
+    }
+
+    #[test]
+    fn a_weak_candidate_chain_never_outranks_the_strongest_evidence() {
+        // The rejected first cut treated ratios within a `RATIO_EPSILON` band as
+        // equal evidence and let the delta prior reorder them. That relation was
+        // not transitive: a strong match (ratio 1.00, prior 0.0) lost to a 0.96
+        // neighbour, which lost to a 0.92 one, so walking the candidate list in
+        // the wrong order ended more than 0.05 away from the best pixel evidence.
+        // This pins the fixed contract: the share of matched rows is exact
+        // evidence and always wins, the prior only separates exactly equal
+        // evidence, and the winner does not depend on the visit order.
+        let candidates = [
+            Overlap {
+                overlap: 280,
+                matched: 40,
+                voting: 40,
+                prior: 0.0,
+            }, // 1.00 of the sampled rows
+            Overlap {
+                overlap: 180,
+                matched: 24,
+                voting: 25,
+                prior: 0.5,
+            }, // 0.96
+            Overlap {
+                overlap: 80,
+                matched: 23,
+                voting: 25,
+                prior: 1.0,
+            }, // 0.92
+        ];
+        // The strongest evidence outranks every weaker candidate, and never the
+        // other way round.
+        assert!(outranks(&candidates[0], &candidates[1]));
+        assert!(outranks(&candidates[0], &candidates[2]));
+        assert!(outranks(&candidates[1], &candidates[2]));
+        assert!(!outranks(&candidates[2], &candidates[0]));
+        assert!(!outranks(&candidates[1], &candidates[0]));
+        // Every permutation of the candidate list picks the same winner, using
+        // the same "keep unless strictly outranked" reduction the search uses.
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let winner = order
+                .into_iter()
+                .map(|i| candidates[i])
+                .reduce(|best, candidate| {
+                    if outranks(&candidate, &best) {
+                        candidate
+                    } else {
+                        best
+                    }
+                })
+                .unwrap();
+            assert_eq!(winner.overlap, candidates[0].overlap, "order {order:?}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_page_that_did_not_move_is_unchanged() {
+        let source = repeated_page(600);
+        let mut capture =
+            LongCapture::new(frame(&crop(&source, 120, FRAME_HEIGHT)), MAX_BYTES).unwrap();
+        assert_eq!(
+            capture.push(&frame(&crop(&source, 120, FRAME_HEIGHT))),
+            Step::Unchanged
+        );
+        assert_eq!(capture.height(), FRAME_HEIGHT);
+        // The stationary frame still became the anchor, so the next small scroll
+        // is located exactly.
+        assert_eq!(
+            capture.push(&frame(&crop(&source, 140, FRAME_HEIGHT))),
+            Step::Scrolled {
+                overlap: 280,
+                rows: 20
+            }
+        );
+        assert_eq!(capture.height(), 320);
+        assert_eq!(capture.bytes(), &source[120 * stride()..440 * stride()]);
+    }
+
+    #[test]
+    fn reversing_on_a_repeated_page_keeps_the_right_offset() {
+        let source = repeated_page(600);
+        let mut capture =
+            LongCapture::new(frame(&crop(&source, 200, FRAME_HEIGHT)), MAX_BYTES).unwrap();
+        // Scroll up 20 rows: the repeated rows also match 100 rows away, but the
+        // true offset matches better and wins.
+        assert_eq!(
+            capture.advance(
+                &frame(&crop(&source, 180, FRAME_HEIGHT)),
+                Some(Direction::Up)
+            ),
+            Step::Prepended {
+                overlap: 280,
+                rows: 20
+            }
+        );
+        assert_eq!(capture.height(), 320);
+        assert_eq!(capture.bytes(), &source[180 * stride()..500 * stride()]);
+        // Back down over the same rows: no duplicate content.
+        assert_eq!(
+            capture.advance(
+                &frame(&crop(&source, 200, FRAME_HEIGHT)),
+                Some(Direction::Down)
+            ),
+            Step::Unchanged
+        );
+        assert_eq!(capture.height(), 320);
+        assert_eq!(capture.bytes(), &source[180 * stride()..500 * stride()]);
+    }
+
+    #[test]
+    fn a_different_repeated_page_leaves_the_stitch_alone() {
+        let source = repeated_page(600);
+        let other = repeated_page(600)
+            .iter()
+            .map(|value| value.wrapping_add(17))
+            .collect::<Vec<u8>>();
+        let mut capture =
+            LongCapture::new(frame(&crop(&source, 120, FRAME_HEIGHT)), MAX_BYTES).unwrap();
+        let kept = capture.bytes().to_vec();
+        assert_eq!(
+            capture.push(&frame(&crop(&other, 240, FRAME_HEIGHT))),
+            Step::Jumped
+        );
+        assert_eq!(capture.height(), FRAME_HEIGHT);
+        assert_eq!(capture.bytes(), &kept[..]);
+        // The rejected frame did not move the anchor.
+        assert_eq!(
+            capture.push(&frame(&crop(&source, 140, FRAME_HEIGHT))),
+            Step::Scrolled {
+                overlap: 280,
+                rows: 20
+            }
+        );
+        assert_eq!(capture.height(), 320);
     }
 
     #[test]

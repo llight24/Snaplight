@@ -68,13 +68,62 @@ pub(super) struct LongCaptureSession {
     /// Key states, so a held key fires once.
     escape: bool,
     enter: bool,
-    /// Why the stitch stopped growing on its own.
-    note: Option<String>,
+    /// Why the stitch stopped growing on its own, kept by kind so a later match
+    /// clears the warning that scrolling back fixes and leaves a stop it cannot.
+    halt: Option<Halt>,
     /// Whether the overlay was on screen when the session started, so it is only
     /// restored when it was.
     overlay_was_visible: bool,
     ring: HWND,
     panel_window: HWND,
+}
+
+/// Why the stitch stopped growing on its own. Kept as a type instead of a
+/// sentence so a match that arrives later clears the warning scrolling back
+/// fixes, and never the stop it cannot.
+enum Halt {
+    /// The newest frame shared no usable overlap with the stitch, so rows
+    /// between the stitched image and the live screen may be missing. Scrolling
+    /// back onto stitched rows re-anchors the stitch; only the screens that then
+    /// really extend it add the skipped rows and clear this warning.
+    Gap,
+    /// A cap stopped the capture. Scrolling back does not undo it.
+    Budget(&'static str),
+    /// The region could not be read at all; the session ends here.
+    Failed(String),
+}
+
+impl Halt {
+    /// The line the panel shows while the session runs. Short enough for the
+    /// narrow hint row beside the bird's eye, where a longer sentence would be
+    /// cut off. It only says what is wrong and how to recover; it does not
+    /// promise the rows will be filled in, because that depends on the scroll
+    /// that follows.
+    fn hint(&self) -> &str {
+        match self {
+            Halt::Gap => "重叠不足：回滚后分段重滚",
+            Halt::Budget(why) => why,
+            Halt::Failed(why) => why,
+        }
+    }
+
+    /// The note the closing report carries. The session is over here, so a gap
+    /// can no longer be filled: this states what was kept instead of telling the
+    /// user to scroll back through a session that has already ended.
+    fn note(&self) -> String {
+        match self {
+            Halt::Gap => "拼接存在缺口：只保留已成功拼接的部分，开头或末尾可能缺少内容".to_string(),
+            Halt::Budget(why) => (*why).to_string(),
+            Halt::Failed(why) => why.clone(),
+        }
+    }
+
+    /// Whether a later gap or match must leave this stop alone. A cap and a
+    /// failed read are not things scrolling back undoes, so they outrank the gap
+    /// warning, which a new overlap is entitled to clear.
+    fn outranks_gap(&self) -> bool {
+        matches!(self, Halt::Budget(_) | Halt::Failed(_))
+    }
 }
 
 /// Outcome of one long capture, phrased for the notice and the demo.
@@ -87,6 +136,9 @@ struct Report {
     image: Option<PathBuf>,
     /// Why the stitch stopped early, or why it could not be saved.
     note: Option<String>,
+    /// False when the result may be missing rows: a gap was never filled, or the
+    /// last scroll had not come to rest before the session ended.
+    complete: bool,
     cancelled: bool,
 }
 
@@ -94,9 +146,14 @@ impl Report {
     fn message(&self) -> String {
         let mut text = if self.cancelled {
             format!("长截图已取消：已拼 {} 屏，未保存。", self.screens)
-        } else {
+        } else if self.complete {
             format!(
                 "长截图完成：{} 屏 → {} × {} 像素",
+                self.screens, self.width, self.height
+            )
+        } else {
+            format!(
+                "长截图结束：{} 屏 → {} × {} 像素，结果可能不完整",
                 self.screens, self.width, self.height
             )
         };
@@ -189,7 +246,7 @@ impl Canvas {
             drag: None,
             escape: false,
             enter: false,
-            note: None,
+            halt: None,
             overlay_was_visible,
             ring,
             panel_window,
@@ -230,7 +287,7 @@ impl Canvas {
             Ok(sample) => sample,
             Err(error) => {
                 if let Some(session) = self.long_capture.as_mut() {
-                    session.note = Some(error.to_string());
+                    session.halt = Some(Halt::Failed(error.to_string()));
                 }
                 self.cancel_long_capture();
                 return;
@@ -267,15 +324,8 @@ impl Canvas {
         // only now is it worth stitching: a scrolling window paints in place, and
         // a frame caught mid-repaint still holds rows from the older position, so
         // stitching it would splice content that runs backwards.
-        let demo = self.demo;
         if let Some(session) = self.long_capture.as_mut() {
-            let step = stitch_sample(session, width, height, &bytes);
-            if demo {
-                eprintln!(
-                    "long capture: step {step:?} screens {} settled {}",
-                    session.screens, session.settled
-                );
-            }
+            stitch_sample(session, width, height, &bytes);
         }
         self.repaint_long_capture();
     }
@@ -288,7 +338,13 @@ impl Canvas {
         if let Some(stitch) = stitch {
             match self.save_long_capture(&stitch.image, &stitch.bytes, stitch.key) {
                 Ok(path) => report.image = Some(path),
-                Err(error) => report.note = Some(format!("保存失败：{error}")),
+                Err(error) => {
+                    let failure = format!("保存失败：{error}");
+                    report.note = Some(match report.note.take() {
+                        Some(note) => format!("{note}；{failure}"),
+                        None => failure,
+                    });
+                }
             }
             if let Err(error) = self.open_document(stitch.image, stitch.bytes) {
                 self.error = Some(error.to_string());
@@ -377,27 +433,18 @@ impl Canvas {
                     height: 0,
                     image: None,
                     note: Some("没有正在进行的长截图".to_string()),
+                    complete: false,
                     cancelled: true,
                 },
             );
         };
         session.teardown(self);
-        // Finishing before the last screen came to rest must not drop that
-        // scroll, so the newest sample is stitched here. The helper windows are
-        // already gone, and `source` never covered them anyway.
-        if !session.settled {
-            if let Some(bytes) = session.last.clone() {
-                let width = (session.source.right - session.source.left).max(1) as u32;
-                let height = (session.source.bottom - session.source.top).max(1) as u32;
-                let step = stitch_sample(&mut session, width, height, &bytes);
-                if self.demo {
-                    eprintln!(
-                        "long capture: finish step {step:?} screens {}",
-                        session.screens
-                    );
-                }
-            }
-        }
+        // The newest sample is stitched only when the content had come to rest on
+        // it: a frame caught mid-paint still holds rows from the older position,
+        // so splicing it would put content that runs backwards into the result.
+        // The result therefore holds the frames that were accepted, and what that
+        // range may be missing is reported instead of being papered over.
+        let (complete, note) = session.close_stitching();
         let Some(engine) = &session.engine else {
             session.restore_overlay(self);
             return (
@@ -409,6 +456,7 @@ impl Canvas {
                     height: 0,
                     image: None,
                     note: Some("没有读到任何画面".to_string()),
+                    complete: false,
                     cancelled: true,
                 },
             );
@@ -425,7 +473,8 @@ impl Canvas {
             width: image.width,
             height: image.height,
             image: None,
-            note: session.note.clone(),
+            note,
+            complete,
             cancelled: false,
         };
         if restore {
@@ -449,7 +498,8 @@ impl Canvas {
             width: 0,
             height: 0,
             image: None,
-            note: session.note.clone(),
+            note: session.halt.as_ref().map(Halt::note),
+            complete: false,
             cancelled: true,
         });
     }
@@ -610,6 +660,34 @@ impl LongCaptureSession {
             }
         }
     }
+
+    /// Ends the sampling without touching the stitch. The newest sample is never
+    /// stitched here: a scrolling window paints in place, so a frame the content
+    /// had not come to rest on holds rows from the older position as well, and
+    /// splicing it would put content that runs backwards into the result. The
+    /// stitch keeps every frame that was accepted, and this returns whether that
+    /// is the whole page the session saw plus the note that says what its range
+    /// may be missing.
+    fn close_stitching(&mut self) -> (bool, Option<String>) {
+        let mut notes = Vec::new();
+        if let Some(halt) = &self.halt {
+            notes.push(halt.note());
+        }
+        if self.engine.is_some() && !self.settled {
+            // The direction the last sample was moving in does not say which end
+            // is short: the user may have reversed just before finishing, so both
+            // ends are named as possibly incomplete instead of guessing one.
+            notes.push(
+                "结束前最后一屏未停稳，未加入结果，只保留已成功拼接的部分，开头或末尾可能缺少内容"
+                    .to_string(),
+            );
+        }
+        if notes.is_empty() {
+            (true, None)
+        } else {
+            (false, Some(notes.join("；")))
+        }
+    }
 }
 
 /// Adds one sample to the stitch, starting it when this is the first frame.
@@ -643,6 +721,15 @@ fn advance_stitch(
 /// session counters. A jump or a full budget is recorded but does not end the
 /// session: the stitch so far stays usable, so the user can still trim it and
 /// finish.
+///
+/// A jump leaves the engine's anchor and every stitched byte alone, so scrolling
+/// back until the frames overlap again re-anchors the stitch and the rows that
+/// were skipped are appended as the user scrolls down again. Only an appended or
+/// prepended screen clears the gap warning: `Unchanged` adds no rows, so it
+/// cannot prove the skipped rows were repaired -- a frame with no detail of its
+/// own is reported as `Unchanged` too. A cap or a failed read is not something
+/// scrolling back fixes, so a jump never downgrades one of those to a gap, and a
+/// later match never clears it.
 fn stitch_sample(session: &mut LongCaptureSession, width: u32, height: u32, bytes: &[u8]) -> Step {
     let (step, started) =
         advance_stitch(&mut session.engine, session.direction, width, height, bytes);
@@ -659,11 +746,26 @@ fn stitch_sample(session: &mut LongCaptureSession, width: u32, height: u32, byte
             session.direction = Some(Direction::Up);
         }
         Step::Unchanged => {}
+        // A jump raises the gap warning, but only if no cap or failure is already
+        // set: those are the stops scrolling back cannot undo, and a jump that
+        // overwrote one with a gap would let the next match clear the real reason
+        // the stitch stopped.
         Step::Jumped => {
-            session.note =
-                Some("滚动跳变：新一屏与上一屏没有足够重叠，为避免漏行已停止".to_string())
+            if !session.halt.as_ref().is_some_and(Halt::outranks_gap) {
+                session.halt = Some(Halt::Gap);
+            }
         }
-        Step::Budget(why) => session.note = Some(why.to_string()),
+        Step::Budget(why) => session.halt = Some(Halt::Budget(why)),
+    }
+    // Only the gap warning is cleared, and only by a screen that really extends
+    // the stitch: `Unchanged` adds no rows, so it cannot repair the skipped ones
+    // and must leave the warning standing. The kinds are matched by variant, not
+    // by the text they carry, so a reworded message can never keep a warning
+    // alive.
+    if matches!(step, Step::Scrolled { .. } | Step::Prepended { .. })
+        && matches!(session.halt, Some(Halt::Gap))
+    {
+        session.halt = None;
     }
     step
 }
@@ -1016,10 +1118,10 @@ unsafe fn paint_panel(hdc: HDC, canvas: &Canvas, hwnd: HWND) {
                 .saturating_sub(session.trim_start + session.trim_end)
         ),
     };
-    // A note from the engine (a jump, a full budget) outranks the usual hint: it
-    // explains why the stitch stopped growing.
-    let (hint, hint_colour) = match (&session.note, session.settled) {
-        (Some(note), _) => (note.as_str(), PANEL_WARN),
+    // A halt from the engine (a jump, a cap, a failed read) outranks the usual
+    // hint: it explains why the stitch stopped growing.
+    let (hint, hint_colour) = match (&session.halt, session.settled) {
+        (Some(halt), _) => (halt.hint(), PANEL_WARN),
         (None, true) => ("画面已停下：拖边线微调，用工具条保存或贴图", PANEL_HINT),
         (None, false) => ("把鼠标放进选区滚动，画面停下后自动拼接", PANEL_HINT),
     };
@@ -1119,6 +1221,7 @@ fn print_demo(report: &Report) {
                 "height": report.height,
                 "image": report.image.as_ref().map(|p| p.display().to_string()),
                 "note": report.note,
+                "complete": report.complete,
                 "cancelled": report.cancelled,
                 "message": report.message(),
             }
@@ -1395,5 +1498,305 @@ mod tests {
         assert_eq!(trim_after_drag(1, 500, 0, 900, 300, 0, 0), (0, 300));
         // The two ends can never overlap, so the top stops where the bottom is.
         assert_eq!(trim_after_drag(0, 0, 400, 900, 300, 0, 750), (149, 750));
+    }
+
+    /// A session with no windows: these tests exercise the stitching fields, and
+    /// `teardown` -- the only part that touches the handles -- is never called.
+    fn bare_session() -> LongCaptureSession {
+        LongCaptureSession {
+            region: rect(0, 0, FakePage::WIDTH as i32, FakePage::HEIGHT as i32),
+            source: rect(0, 0, FakePage::WIDTH as i32, FakePage::HEIGHT as i32),
+            engine: None,
+            direction: None,
+            screens: 0,
+            last: None,
+            stills: 0,
+            settled: true,
+            trim_start: 0,
+            trim_end: 0,
+            drag: None,
+            escape: false,
+            enter: false,
+            halt: None,
+            overlay_was_visible: false,
+            ring: HWND(std::ptr::null_mut()),
+            panel_window: HWND(std::ptr::null_mut()),
+        }
+    }
+
+    #[test]
+    fn a_jump_keeps_the_anchor_and_scrolling_back_fills_the_gap() {
+        let mut session = bare_session();
+        let stitch = |session: &mut LongCaptureSession, scroll: u32| {
+            let bytes = FakePage::view(scroll);
+            stitch_sample(session, FakePage::WIDTH, FakePage::HEIGHT, &bytes)
+        };
+        // Two whole screens: the first starts the stitch, the second extends it.
+        assert!(matches!(stitch(&mut session, 0), Step::Unchanged));
+        assert!(matches!(stitch(&mut session, 90), Step::Scrolled { .. }));
+        assert_eq!(session.screens, 2);
+        let settled = session.engine.as_ref().unwrap().height();
+        let pixels = session.engine.as_ref().unwrap().bytes().to_vec();
+        assert_eq!(settled, 390);
+
+        // A scroll of ten screens at once leaves no overlap with the last
+        // accepted frame: it is refused, and the anchor and every stitched byte
+        // must stay where they were.
+        assert_eq!(stitch(&mut session, 900), Step::Jumped);
+        assert_eq!(session.screens, 2);
+        let engine = session.engine.as_ref().unwrap();
+        assert_eq!(engine.height(), settled);
+        assert_eq!(engine.bytes(), pixels.as_slice());
+        assert!(matches!(session.halt, Some(Halt::Gap)));
+
+        // Scrolling back onto rows the stitch already holds re-anchors the
+        // stitch, but on its own it appends nothing. The warning stays until the
+        // rows the jump skipped are really stitched, since `Unchanged` cannot
+        // prove they were.
+        assert_eq!(stitch(&mut session, 90), Step::Unchanged);
+        assert_eq!(session.screens, 2);
+        assert!(matches!(session.halt, Some(Halt::Gap)));
+        assert_eq!(session.engine.as_ref().unwrap().height(), settled);
+
+        // Scrolling down again appends the rows the jump skipped, one screen at a
+        // time, until the stitch covers the page the user saw.
+        for scroll in [180, 270, 360, 450, 540, 630, 720, 810, 900] {
+            assert!(
+                matches!(stitch(&mut session, scroll), Step::Scrolled { .. }),
+                "scroll {scroll} should extend the stitch"
+            );
+        }
+        // The first appended screen repaired the gap, so the warning is already
+        // gone by the time the page is fully covered.
+        assert!(session.halt.is_none());
+        assert_eq!(session.screens, 11);
+        let engine = session.engine.as_ref().unwrap();
+        assert_eq!(engine.height(), 1200);
+        // Every page row has to land in its own place: a missing or duplicated
+        // row would shift every row below it.
+        let stride = engine.stride();
+        let bytes = engine.bytes();
+        let colour_at = |y: u32| {
+            let at = y as usize * stride + 100 * 4;
+            &bytes[at..at + 4]
+        };
+        for y in 0..FakePage::HEADER {
+            assert_eq!(colour_at(y), FakePage::header_colour(y), "header row {y}");
+        }
+        for y in FakePage::HEADER..1200 {
+            assert_eq!(
+                colour_at(y),
+                FakePage::content_colour(y - FakePage::HEADER),
+                "row {y} is out of place"
+            );
+        }
+    }
+
+    /// A screen of one flat colour: the engine has no detail to locate the
+    /// offset with, so it reports `Unchanged` however far the content moved.
+    /// Clearing the gap warning on such a frame would claim the skipped rows were
+    /// stitched when they were not, so the warning has to stand.
+    #[test]
+    fn an_unchanged_frame_without_detail_keeps_the_gap() {
+        let mut session = bare_session();
+        let flat = vec![0x40u8; (FakePage::WIDTH * FakePage::HEIGHT * 4) as usize];
+        assert!(matches!(
+            stitch_sample(&mut session, FakePage::WIDTH, FakePage::HEIGHT, &flat),
+            Step::Unchanged
+        ));
+        session.halt = Some(Halt::Gap);
+        assert!(matches!(
+            stitch_sample(&mut session, FakePage::WIDTH, FakePage::HEIGHT, &flat),
+            Step::Unchanged
+        ));
+        assert!(matches!(session.halt, Some(Halt::Gap)));
+        assert_eq!(session.screens, 1);
+    }
+
+    /// A screen with no row in common with `FakePage`, so a frame the page never
+    /// contains shares no overlap and is reported as a jump.
+    fn unrelated_view() -> Vec<u8> {
+        let mut bytes = vec![0u8; (FakePage::WIDTH * FakePage::HEIGHT * 4) as usize];
+        for y in 0..FakePage::HEIGHT {
+            for x in 0..FakePage::WIDTH {
+                let at = ((y * FakePage::WIDTH + x) * 4) as usize;
+                let h = y.wrapping_mul(2_654_435_761) ^ x.wrapping_mul(40_503);
+                bytes[at..at + 4].copy_from_slice(&[
+                    (h >> 24) as u8,
+                    (h >> 16) as u8,
+                    (h >> 8) as u8,
+                    255,
+                ]);
+            }
+        }
+        bytes
+    }
+
+    /// Starts a stitch from `FakePage`'s first screen under a real, small byte
+    /// budget: one more screen fits, two do not. Exercises the budget rule
+    /// through `LongCapture::new` instead of a synthetic `Step::Budget` value.
+    fn budgeted_session() -> LongCaptureSession {
+        let first = FakePage::view(0);
+        let frame = Frame {
+            width: FakePage::WIDTH,
+            height: FakePage::HEIGHT,
+            stride: FakePage::WIDTH as usize * 4,
+            bytes: &first,
+        };
+        let row = FakePage::WIDTH as usize * 4;
+        let budget = row * (FakePage::HEIGHT + FakePage::SCROLL) as usize + row / 2;
+        let mut session = bare_session();
+        session.engine =
+            Some(LongCapture::new(frame, budget).expect("the first screen fits the budget"));
+        session.screens = 1;
+        session
+    }
+
+    #[test]
+    fn a_cap_is_not_cleared_by_a_later_match() {
+        let mut session = budgeted_session();
+        let screen = |session: &mut LongCaptureSession, scroll: u32| {
+            let bytes = FakePage::view(scroll);
+            stitch_sample(session, FakePage::WIDTH, FakePage::HEIGHT, &bytes)
+        };
+        let settled = FakePage::HEIGHT + FakePage::SCROLL;
+
+        // One more screen still fits the budget and extends the stitch.
+        assert!(matches!(
+            screen(&mut session, FakePage::SCROLL),
+            Step::Scrolled { .. }
+        ));
+        assert_eq!(session.engine.as_ref().unwrap().height(), settled);
+        assert!(session.halt.is_none());
+
+        // The next one would exceed the budget: the cap fires and the stitch
+        // keeps every row it already has.
+        assert!(matches!(
+            screen(&mut session, FakePage::SCROLL * 2),
+            Step::Budget(_)
+        ));
+        assert!(matches!(session.halt, Some(Halt::Budget(_))));
+        assert_eq!(session.engine.as_ref().unwrap().height(), settled);
+
+        // A frame with no overlap is a jump. A jump is the one stop scrolling
+        // back fixes, so it must not downgrade the cap to a gap.
+        assert_eq!(
+            stitch_sample(
+                &mut session,
+                FakePage::WIDTH,
+                FakePage::HEIGHT,
+                &unrelated_view()
+            ),
+            Step::Jumped
+        );
+        assert!(
+            matches!(session.halt, Some(Halt::Budget(_))),
+            "a jump must not replace the cap with a gap"
+        );
+
+        // A frame that fits is a match, but a cap is not something scrolling back
+        // undoes, so the warning must survive it.
+        assert_eq!(screen(&mut session, FakePage::SCROLL), Step::Unchanged);
+        assert!(
+            matches!(session.halt, Some(Halt::Budget(_))),
+            "a match must not clear the cap"
+        );
+    }
+
+    #[test]
+    fn ending_before_the_last_screen_is_settled_leaves_it_out() {
+        let mut session = bare_session();
+        let first = FakePage::view(0);
+        stitch_sample(&mut session, FakePage::WIDTH, FakePage::HEIGHT, &first);
+        assert_eq!(session.engine.as_ref().unwrap().height(), 300);
+        // Nothing stopped the stitch and the content was at rest: the result is
+        // the whole page and there is nothing to explain.
+        assert_eq!(session.close_stitching(), (true, None));
+
+        // The user scrolled on and pressed Enter before the content came to rest.
+        // That sample is not a whole scroll position, so it is left out and the
+        // report says content may be missing. The last direction is not a reliable
+        // pointer to which end is short: the user may have reversed before
+        // stopping, so the note names neither end.
+        session.settled = false;
+        session.direction = Some(Direction::Down);
+        session.last = Some(FakePage::view(90));
+        let (complete, note) = session.close_stitching();
+        assert!(!complete);
+        let note = note.unwrap_or_default();
+        assert!(note.contains("未停稳"), "{note}");
+        assert!(note.contains("已成功拼接"), "{note}");
+        assert!(note.contains("可能缺少内容"), "{note}");
+        assert!(
+            note.contains("开头或末尾"),
+            "{note} must name both ends instead of pinning the short one"
+        );
+        assert_eq!(
+            session.engine.as_ref().unwrap().height(),
+            300,
+            "an unsettled sample must not be stitched"
+        );
+
+        // ...and an upward scroll reads the same: the note is neutral, because the
+        // direction the last sample moved in does not say which end is short.
+        session.direction = Some(Direction::Up);
+        let (_, up_note) = session.close_stitching();
+        assert_eq!(up_note.as_deref(), Some(note.as_str()));
+    }
+
+    #[test]
+    fn a_gap_left_open_ends_the_report_incomplete() {
+        let mut session = bare_session();
+        let first = FakePage::view(0);
+        stitch_sample(&mut session, FakePage::WIDTH, FakePage::HEIGHT, &first);
+        session.halt = Some(Halt::Gap);
+        let (complete, note) = session.close_stitching();
+        assert!(!complete);
+        // The session is over, so the note states what was kept and what may be
+        // missing instead of telling the user to scroll back through a finished
+        // session.
+        let note = note.unwrap_or_default();
+        assert!(note.contains("缺口"), "{note}");
+        assert!(note.contains("已成功拼接"), "{note}");
+        assert!(!note.contains("往回滚"), "{note}");
+
+        // The notice must not call a result with a gap complete.
+        let report = Report {
+            region: RECT::default(),
+            screens: session.screens,
+            width: 200,
+            height: 900,
+            image: None,
+            note: None,
+            complete,
+            cancelled: false,
+        };
+        let message = report.message();
+        assert!(message.contains("结果可能不完整"), "{message}");
+        assert!(!message.contains("完成"), "{message}");
+        let whole = Report {
+            complete: true,
+            ..report
+        };
+        assert!(whole.message().contains("长截图完成"));
+    }
+
+    #[test]
+    fn the_gap_hint_is_short_and_says_what_to_do() {
+        // The hint is one line with end ellipsis in a row `PANEL_WIDTH` wide minus
+        // its 8-pixel margins. The default GUI font draws a Chinese character in
+        // about 12 pixels, so past ~24 characters it is cut off before the user
+        // can read it.
+        let hint = Halt::Gap.hint();
+        assert!(
+            hint.chars().count() <= 24,
+            "{hint:?} is too long for the panel row"
+        );
+        assert!(hint.contains("回滚"), "{hint:?} must say how to recover");
+
+        // The live hint says how to recover; the closing note must not, because
+        // the session it would send the user back into has already ended.
+        let note = Halt::Gap.note();
+        assert!(!note.contains("往回滚"), "{note}");
     }
 }

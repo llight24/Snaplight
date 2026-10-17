@@ -153,6 +153,85 @@ component ToolButton inherits Rectangle {
         clicked => { root.options-activated(); }
     }
 }
+// Rectangles and ellipses share one configurable shape entry. The main half
+// uses the most recently used shape, and the arrow asks the editor to toggle
+// the shape switch menu, which is its own window: the winit backend draws a
+// `PopupWindow` inside the toolbar's own 52px window, where a drop-down cannot
+// leave the pill. The editor owns that window and its placement.
+component ShapeToolButton inherits Rectangle {
+    in property <[ToolItem]> shapes;
+    in property <int> shape-tool: 1;
+    in property <bool> selected: false;
+    in property <bool> enabled: true;
+    callback activated();
+    callback menu-toggled();
+    width: root.shapes.length > 1 ? 50px : 40px;
+    height: 40px;
+    border-radius: 8px;
+    background: !root.enabled ? transparent : (root.selected ? #e8f0fe : (main-hit.has-hover || arrow-hit.has-hover ? #f2f4f7 : transparent));
+    ToolGlyph {
+        tool-id: root.shape-tool;
+        ink: !root.enabled ? #c9ced5 : (root.selected ? #1668dc : #252a31);
+        x: root.shapes.length > 1 ? 7px : 9px;
+        y: 9px;
+    }
+    // A single configured shape has nothing to switch to, so no arrow.
+    if root.shapes.length > 1: IconChevron {
+        ink: root.enabled ? #6b7280 : #c9ced5;
+        x: root.width - 16px;
+        y: 17px;
+    }
+    main-hit := TouchArea {
+        enabled: root.enabled;
+        width: root.shapes.length > 1 ? root.width - 19px : root.width;
+        height: root.height;
+        accessible-role: button;
+        accessible-label: "形状：" + (root.shape-tool == 1 ? "矩形" : "椭圆");
+        clicked => { root.activated(); }
+    }
+    arrow-hit := TouchArea {
+        enabled: root.enabled && root.shapes.length > 1;
+        x: root.shapes.length > 1 ? root.width - 19px : root.width;
+        width: root.shapes.length > 1 ? 19px : 0px;
+        height: root.height;
+        accessible-role: button;
+        accessible-label: "选择形状";
+        clicked => { root.menu-toggled(); }
+    }
+}
+// One toolbar tool slot. Shape tools render the merged shape entry, so the
+// configured tool list only carries one of them (at the first shape's slot).
+component ToolbarEntry inherits Rectangle {
+    in property <int> tool-id: 0;
+    in property <string> label: "";
+    in property <int> active-tool: 0;
+    in property <int> shape-tool: 1;
+    in property <[ToolItem]> shapes;
+    in property <bool> enabled: true;
+    callback activated(int);
+    callback options-activated();
+    callback menu-toggled();
+    width: root.tool-id == 1 || root.tool-id == 2 ? (root.shapes.length > 1 ? 50px : 40px) : (root.tool-id == 0 ? 40px : 50px);
+    height: 40px;
+    background: transparent;
+    if root.tool-id == 1 || root.tool-id == 2: ShapeToolButton {
+        shapes: root.shapes;
+        shape-tool: root.shape-tool;
+        selected: root.active-tool == 1 || root.active-tool == 2;
+        enabled: root.enabled;
+        activated => { root.activated(root.shape-tool); }
+        menu-toggled => { root.menu-toggled(); }
+    }
+    if root.tool-id != 1 && root.tool-id != 2: ToolButton {
+        tool-id: root.tool-id;
+        label: root.label;
+        selected: root.active-tool == root.tool-id;
+        has-options: root.tool-id != 0;
+        enabled: root.enabled;
+        activated => { root.activated(root.tool-id); }
+        options-activated => { root.options-activated(); }
+    }
+}
 // History and command icons, selected by number.
 component CommandGlyph inherits Rectangle {
     in property <int> glyph: 0;
@@ -219,8 +298,10 @@ component ColorButton inherits Rectangle {
 component PaintToggle inherits Rectangle {
     in property <string> label: "";
     in property <bool> on: false;
+    // The shape row is the compact one; the other tools keep the 56px default.
+    in property <length> box-width: 56px;
     callback toggled();
-    width: 56px; height: 24px;
+    width: root.box-width; height: 24px;
     border-radius: 12px;
     background: root.on ? #e8f0fe : #f2f4f7;
     border-width: 1px;
@@ -240,6 +321,116 @@ component PaintToggle inherits Rectangle {
         clicked => { root.toggled(); }
     }
 }
+// Narrow rule between the groups of the shape row, so the row reads as
+// outline | fill | colour without a box around every value.
+component PaintDivider inherits Rectangle {
+    width: 1px; height: 22px;
+    background: #e4e7ec;
+}
+// Chooses which colour the swatches and the picker below edit: the outline or
+// the fill. Each half carries a dot in the colour that target currently holds,
+// so the row always shows both colours even when neither is a preset.
+component PaintTargetSwitch inherits Rectangle {
+    in property <int> target: 0;
+    in property <color> stroke-color: #f23340;
+    in property <color> fill-color: #f23340;
+    callback selected(int);
+    width: 120px; height: 24px;
+    border-radius: 12px;
+    background: #f2f4f7;
+    Rectangle {
+        x: 0px; y: 0px; width: 60px; height: 24px;
+        border-radius: 12px;
+        background: root.target == 0 ? #e8f0fe : transparent;
+        border-width: 1px;
+        border-color: root.target == 0 ? #3388ff : transparent;
+        Rectangle {
+            x: 7px; y: 8px; width: 8px; height: 8px;
+            border-radius: 4px;
+            background: root.stroke-color;
+            border-width: 1px; border-color: #d3d7dd;
+        }
+        Text {
+            x: 19px; width: 38px; height: 100%;
+            text: "描边色";
+            font-size: 12px;
+            color: root.target == 0 ? #1668dc : #4b5563;
+            vertical-alignment: center;
+        }
+        TouchArea {
+            accessible-role: radio-button;
+            accessible-label: "描边色";
+            accessible-checked: root.target == 0;
+            clicked => { root.selected(0); }
+        }
+    }
+    Rectangle {
+        x: 60px; y: 0px; width: 60px; height: 24px;
+        border-radius: 12px;
+        background: root.target == 1 ? #e8f0fe : transparent;
+        border-width: 1px;
+        border-color: root.target == 1 ? #3388ff : transparent;
+        Rectangle {
+            x: 7px; y: 8px; width: 8px; height: 8px;
+            border-radius: 4px;
+            background: root.fill-color;
+            border-width: 1px; border-color: #d3d7dd;
+        }
+        Text {
+            x: 19px; width: 38px; height: 100%;
+            text: "填充色";
+            font-size: 12px;
+            color: root.target == 1 ? #1668dc : #4b5563;
+            vertical-alignment: center;
+        }
+        TouchArea {
+            accessible-role: radio-button;
+            accessible-label: "填充色";
+            accessible-checked: root.target == 1;
+            clicked => { root.selected(1); }
+        }
+    }
+}
+// One preset colour. The ring marks the preset the selected target currently
+// holds, so the swatch row doubles as the current-colour readout.
+component ColorSwatch inherits Rectangle {
+    in property <color> swatch: #000000;
+    in property <bool> active: false;
+    in property <string> label: "";
+    callback picked();
+    width: 20px; height: 20px;
+    border-radius: 10px;
+    background: root.swatch;
+    border-width: root.active ? 2px : 1px;
+    border-color: root.active ? #1668dc : #d3d7dd;
+    TouchArea {
+        accessible-role: button;
+        accessible-label: root.label;
+        accessible-checked: root.active;
+        clicked => { root.picked(); }
+    }
+}
+// Opens the colour picker for the selected target. The gradient marks it as the
+// entry that is not a preset, the dot in the middle is the current colour.
+component CustomColorButton inherits Rectangle {
+    in property <color> swatch: #ffffff;
+    callback picked();
+    width: 26px; height: 26px;
+    border-radius: 8px;
+    background: @linear-gradient(135deg, #ff5f6d 0%, #ffc371 25%, #47d16c 50%, #2f80ed 75%, #9b51e0 100%);
+    border-width: 1px; border-color: #d3d7dd;
+    Rectangle {
+        x: 6px; y: 6px; width: 12px; height: 12px;
+        border-radius: 6px;
+        background: root.swatch;
+        border-width: 1px; border-color: #ffffff;
+    }
+    TouchArea {
+        accessible-role: button;
+        accessible-label: "自定义颜色";
+        clicked => { root.picked(); }
+    }
+}
 // Shared paint controls: the tool options panel and the persistent paint bar
 // show the same values, so the row lives here once.
 component PaintControls inherits Rectangle {
@@ -253,6 +444,9 @@ component PaintControls inherits Rectangle {
     in-out property <color> fill-color: #f23340;
     in-out property <bool> stroke-on: true;
     in-out property <bool> fill-on: false;
+    // Which colour the swatches and the picker edit on the shape row: 0 is the
+    // outline, 1 the fill. It is local to the window and survives tool switches.
+    in-out property <int> target: 0;
     // Aggregates the editable values so every change sends one consistent
     // snapshot instead of a hand-built argument list.
     out property <ToolPaint> paint: {
@@ -271,21 +465,95 @@ component PaintControls inherits Rectangle {
     // 0 asks for the outline colour, 1 for the fill colour.
     callback pick(int);
     background: transparent;
-    HorizontalLayout {
+    // Shape row: a compact, vertically centred pill. Toggling, the width, fill
+    // opacity and the two colours are the same contract as the generic rows
+    // below; the row is only laid out shorter so it reads as one bar instead of
+    // controls pinned to the top edge of the 52px window.
+    if root.tool == 1 || root.tool == 2: HorizontalLayout {
+        // Centre the 30px row inside the 52px bar/panel; the non-shape rows keep
+        // the full-height layout below.
+        y: (root.height - self.height) / 2;
+        height: 30px;
+        // `center` keeps the fixed-height controls (toggles, swatches, switch)
+        // on the row's vertical axis instead of the top edge.
+        padding: 0px; spacing: 10px; alignment: center;
+        PaintToggle {
+            label: "描边"; on: root.stroke-on; box-width: 48px;
+            toggled => { root.stroke-on = !root.stroke-on; root.changed(root.paint); }
+        }
+        SpinBox {
+            accessible-label: "描边宽度";
+            // Wide enough for two digits plus the arrow column, which is drawn
+            // outside the box when the value needs more room than it has, and no
+            // taller than the row it sits in.
+            width: 92px; height: 28px;
+            minimum: 1; maximum: 64; value <=> root.stroke-width;
+            edited => { root.changed(root.paint); }
+        }
+        PaintDivider { }
+        PaintToggle {
+            label: "填充"; on: root.fill-on; box-width: 48px;
+            toggled => { root.fill-on = !root.fill-on; root.changed(root.paint); }
+        }
+        SpinBox {
+            accessible-label: "填充不透明度";
+            width: 92px; height: 28px;
+            minimum: 0; maximum: 100; value <=> root.fill-opacity;
+            edited => { root.changed(root.paint); }
+        }
+        PaintDivider { }
+        PaintTargetSwitch {
+            target: root.target;
+            stroke-color: root.stroke-color;
+            fill-color: root.fill-color;
+            selected(target) => { root.target = target; }
+        }
+        HorizontalLayout {
+            spacing: 4px; alignment: start;
+            // Preset colours carry their own name so the swatch row doubles as a
+            // readable palette for screen readers instead of eight identical
+            // labels.
+            for preset in [
+                { shade: #000000, name: "黑" },
+                { shade: #ffffff, name: "白" },
+                { shade: #f23340, name: "红" },
+                { shade: #f2994a, name: "橙" },
+                { shade: #f2c94c, name: "黄" },
+                { shade: #27ae60, name: "绿" },
+                { shade: #2f80ed, name: "蓝" },
+                { shade: #9b51e0, name: "紫" },
+            ]: ColorSwatch {
+                swatch: preset.shade;
+                label: preset.name;
+                active: root.target == 0 ? preset.shade == root.stroke-color : preset.shade == root.fill-color;
+                picked => {
+                    if (root.target == 0) { root.stroke-color = preset.shade; }
+                    else { root.fill-color = preset.shade; }
+                    root.changed(root.paint);
+                }
+            }
+        }
+        CustomColorButton {
+            swatch: root.target == 0 ? root.stroke-color : root.fill-color;
+            picked => { root.pick(root.target); }
+        }
+    }
+    // The generic rows are unchanged: they keep the full-height layout.
+    if root.tool != 1 && root.tool != 2: HorizontalLayout {
         // Conditional elements rather than `visible: false`: a hidden element
         // still occupies its slot in a layout, which pushed the colours and the
         // close button out of the panel.
         padding: 0px; spacing: 10px; alignment: start;
-        // Outline group: shape tools, the pen and text.
-        if root.tool == 1 || root.tool == 2 || root.tool == 3 || root.tool == 4 || root.tool == 6: PaintToggle {
+        // Outline group: the arrow, the pen and text.
+        if root.tool == 3 || root.tool == 4 || root.tool == 6: PaintToggle {
             label: "描边"; on: root.stroke-on;
             toggled => { root.stroke-on = !root.stroke-on; root.changed(root.paint); }
         }
-        if root.tool == 1 || root.tool == 2 || root.tool == 3 || root.tool == 4 || root.tool == 6: ColorButton {
+        if root.tool == 3 || root.tool == 4 || root.tool == 6: ColorButton {
             swatch: root.stroke-color; label: "描边色";
             picked => { root.pick(0); }
         }
-        if root.tool == 1 || root.tool == 2 || root.tool == 3 || root.tool == 4 || root.tool == 6: SpinBox {
+        if root.tool == 3 || root.tool == 4 || root.tool == 6: SpinBox {
             accessible-label: "描边宽度";
             // Wide enough for two digits plus the arrow column, which is drawn
             // outside the box when the value needs more room than it has.
@@ -293,16 +561,16 @@ component PaintControls inherits Rectangle {
             minimum: 1; maximum: 64; value <=> root.stroke-width;
             edited => { root.changed(root.paint); }
         }
-        // Fill group: rectangles, ellipses and text.
-        if root.tool == 1 || root.tool == 2 || root.tool == 6: PaintToggle {
+        // Fill group: text only; the shapes use the swatch row above.
+        if root.tool == 6: PaintToggle {
             label: "填充"; on: root.fill-on;
             toggled => { root.fill-on = !root.fill-on; root.changed(root.paint); }
         }
-        if root.tool == 1 || root.tool == 2 || root.tool == 6: ColorButton {
+        if root.tool == 6: ColorButton {
             swatch: root.fill-color; label: "填充色";
             picked => { root.pick(1); }
         }
-        if root.tool == 1 || root.tool == 2 || root.tool == 6: SpinBox {
+        if root.tool == 6: SpinBox {
             accessible-label: "填充不透明度";
             width: 92px;
             minimum: 0; maximum: 100; value <=> root.fill-opacity;
@@ -336,19 +604,43 @@ export component Toolbar inherits Window {
     title: "Snaplight Tools";
     no-frame: true;
     always-on-top: true;
-    in property <length> bar-width: 758px;
+    in property <length> bar-width: 706px;
     width: root.bar-width;
     height: 52px;
     in-out property <bool> repaint: false;
     background: root.repaint ? #ffffff : #fefefe;
     default-font-family: "Segoe UI";
     in property <[ToolItem]> tools;
+    // Shapes present in the configuration, in configured order. The merged
+    // entry only offers these, and the main button remembers the last one used.
+    in property <[ToolItem]> shapes;
     in property <[CommandItem]> actions;
     // True while a long capture runs: the drawing tools, the history and the tool
     // options step aside, only the action buttons marked `capture` stay live, and
     // the pill stops being draggable so it cannot be moved over the region.
     in-out property <bool> long-capture: false;
     in-out property <int> active: 0;
+    // Most recently used shape, kept while another tool is active and updated
+    // when the editor (or this toolbar) selects a shape. Only a *configured*
+    // shape is remembered: a tool list without one of them must never leave the
+    // merged button showing a shape the user cannot draw with.
+    in-out property <int> last-shape: 1;
+    // Slint has no `contains` for arrays, and the merged entry can offer at most
+    // the two shapes, so membership is the list length plus the stable tool ids
+    // (1 rectangle, 2 ellipse). The list never carries duplicates.
+    pure function configured-shape(id: int) -> bool {
+        if (root.shapes.length == 2) { return id == 1 || id == 2; }
+        if (root.shapes.length == 1) { return root.shapes[0].id == id; }
+        return false;
+    }
+    changed active => {
+        if (root.configured-shape(root.active)) { root.last-shape = root.active; }
+    }
+    // A long capture owns the pill: the menu cannot stay open over the region it
+    // is stitching, so the toolbar asks the editor to close it.
+    changed long-capture => {
+        if (root.long-capture) { root.shape-menu-dismissed(); }
+    }
     in-out property <int> stroke-width: 3;
     in-out property <int> block: 12;
     in-out property <string> text-value: "";
@@ -365,6 +657,13 @@ export component Toolbar inherits Window {
     in-out property <bool> can-redo: false;
     callback command(int);
     callback options-toggled(int);
+    // The shape entry's arrow asks for the shape switch menu; the editor owns
+    // that window, so the toolbar only reports the click.
+    callback shape-menu-toggled();
+    // The toolbar reports that the menu it owns must be closed: a long capture
+    // took the pill over, or the toolbar itself is being hidden. The editor
+    // hides the transient menu without giving the toolbar back the focus.
+    callback shape-menu-dismissed();
     Rectangle {
         width: 100%; height: 100%;
         background: root.background;
@@ -379,14 +678,19 @@ export component Toolbar inherits Window {
                 width: 18px; height: 40px;
                 IconGrip { x: 4px; y: 12px; }
             }
-            for tool in root.tools: ToolButton {
+            for tool in root.tools: ToolbarEntry {
                 tool-id: tool.id;
                 label: tool.label;
-                selected: root.active == tool.id;
-                has-options: tool.id != 0;
+                active-tool: root.active;
+                shape-tool: root.last-shape;
+                shapes: root.shapes;
                 enabled: !root.long-capture;
-                activated => { root.active = tool.id; root.command(tool.id); }
+                activated(id) => {
+                    root.active = id;
+                    root.command(id);
+                }
                 options-activated => { root.options-toggled(tool.id); }
+                menu-toggled => { root.shape-menu-toggled(); }
             }
             Divider { }
             BarButton {
@@ -410,6 +714,71 @@ export component Toolbar inherits Window {
     }
 }
 
+// The shape switch menu: rectangle and ellipse live behind one toolbar entry,
+// and its arrow opens this window above the toolbar. It is a window of its own
+// because an embedded `PopupWindow` would be drawn inside the toolbar's 52px
+// pill. The editor creates it, places it above the toolbar, and hides it again
+// on a pick, a second click on the arrow, Escape, focus loss, a long capture or
+// the end of the session, so it never outlives the toolbar it belongs to.
+export component ShapeMenu inherits Window {
+    // Keep in sync with SHAPE_MENU_TITLE in lib.rs, which the editor uses to
+    // find this window for placement, rounding and dismissal.
+    title: "Snaplight Shape Menu";
+    no-frame: true;
+    always-on-top: true;
+    default-font-family: "Segoe UI";
+    // Configured shapes, in configured order; `shape_menu_logical_size` in
+    // lib.rs supplies the matching window size.
+    in property <[ToolItem]> shapes;
+    in property <int> shape-tool: 1;
+    width: 100px;
+    height: root.shapes.length * 24px + 4px;
+    callback picked(int);
+    Rectangle {
+        width: 100%; height: 100%;
+        background: #ffffff;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: #e4e7ec;
+        clip: true;
+        VerticalLayout {
+            padding: 2px;
+            spacing: 0px;
+            for item in root.shapes: Rectangle {
+                height: 24px;
+                border-radius: 6px;
+                // The shape the main button currently draws with stays
+                // highlighted, so the menu shows the selection as well.
+                background: item.id == root.shape-tool ? #e8f0fe : (entry-hit.has-hover ? #f2f4f7 : transparent);
+                ToolGlyph {
+                    tool-id: item.id;
+                    ink: item.id == root.shape-tool ? #1668dc : #252a31;
+                    x: 6px; y: 1px;
+                }
+                Text {
+                    x: 32px; width: parent.width - 38px; height: 100%;
+                    text: item.label;
+                    font-size: 12px;
+                    color: item.id == root.shape-tool ? #1668dc : #252a31;
+                    vertical-alignment: center;
+                }
+                entry-hit := TouchArea {
+                    accessible-role: button;
+                    accessible-label: item.label;
+                    accessible-checked: item.id == root.shape-tool;
+                    clicked => {
+                        // Report the pick before the editor hides the window:
+                        // the handler runs while the menu component is still
+                        // alive, so a callback that reaches back into this
+                        // window is delivered instead of being dropped.
+                        root.picked(item.id);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Quick settings for the tool whose drop-down was clicked; the same values are
 // editable in the settings window.
 export component OptionsPanel inherits Window {
@@ -418,8 +787,10 @@ export component OptionsPanel inherits Window {
     always-on-top: true;
     // The row is only as wide as the active tool needs, so a tool that paints
     // fewer values gets a shorter panel instead of a wide one with empty space.
-    // `snaplight_ui::paint_logical_size` supplies the width and must agree.
-    in property <length> row-width: 460px;
+    // `snaplight_ui::paint_logical_size` supplies the width and must agree; the
+    // window opens on the shape tool, so the default is that row plus the close
+    // button.
+    in property <length> row-width: 780px;
     width: root.row-width;
     height: 52px;
     background: #ffffff;
@@ -461,11 +832,12 @@ export component OptionsPanel inherits Window {
         clip: true;
         HorizontalLayout {
             padding-left: 14px; padding-right: 8px; spacing: 10px;
-            // The panel is as wide as the longest tool needs, so a shorter tool
-            // is centred between the spacer and the close button instead of
-            // leaving its gap on one side.
-            Rectangle { horizontal-stretch: 1; }
+            // The controls always take the width left over from the close
+            // button, exactly like the paint bar. That keeps every tool's row
+            // inside the panel and lets the text tool's flexible text field
+            // absorb the slack instead of clipping the fixed controls.
             ctl := PaintControls {
+                horizontal-stretch: 1;
                 tool <=> root.tool;
                 stroke-width <=> root.stroke-width;
                 block <=> root.block;
@@ -479,7 +851,6 @@ export component OptionsPanel inherits Window {
                 changed(paint) => { root.properties-changed(paint); }
                 pick(target) => { root.pick-color(target); }
             }
-            Rectangle { horizontal-stretch: 1; }
             BarButton {
                 glyph: 6; label: "关闭选项";
                 activated => { root.dismissed(); }
@@ -490,13 +861,14 @@ export component OptionsPanel inherits Window {
 
 // Persistent paint bar at the bottom of the editor. It carries the same paint
 // controls as the tool options panel but has no close button. PAINT_BAR_TITLE
-// in lib.rs must match, and its width comes from `paint_logical_size` so the bar
-// never shows a row of empty space.
+// in lib.rs must match, and its width comes from `paint_bar_logical_size` so the
+// bar never shows a row of empty space. The window opens on the shape tool, so
+// the default is that row.
 export component PaintBar inherits Window {
     title: "Snaplight Paint";
     no-frame: true;
     always-on-top: true;
-    in property <length> row-width: 460px;
+    in property <length> row-width: 730px;
     width: root.row-width;
     height: 52px;
     background: #ffffff;

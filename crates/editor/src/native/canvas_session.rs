@@ -42,10 +42,10 @@ use super::selection::{
 };
 use super::smoke::{stress_annotations, FILL, FILLED, OUTLINED, SMOKE_TEXT, STRESS_FRAMES};
 use super::tool_windows::{
-    follow_position, monitor_work_area, paint_bar_position, parked_position,
-    pin_floating_positions, raise_floating_windows, reshape_and_raise, reshape_when_sized,
+    follow_position, monitor_work_area, parked_position, pin_floating_positions,
+    raise_floating_windows, reshape_and_raise, reshape_when_sized,
 };
-use super::ui_bridge::{UiCommand, UiSlots};
+use super::ui_bridge::{apply_column, style_column, UiCommand, UiSlots};
 
 pub(super) const COMMAND: u32 = WM_APP + 42;
 /// Posted to the overlay window when a hover query should run.
@@ -2048,40 +2048,46 @@ fn publish_paint(canvas: &Canvas) {
     }
     publish_paint_bar(canvas, &paint);
 }
-/// Shows the bottom paint bar for every tool that paints and takes it away for
-/// the select tool, which has nothing to paint. The bar is only as wide as the
-/// active tool's row and sits at the bottom centre of the capture, except in a
-/// pinned session where it forms a pair with the toolbar.
+/// Shows the paint bar for every tool that paints and takes it away for the
+/// select tool, which has nothing to paint. The bar is only as wide as the
+/// active tool's row, and it hangs off the toolbar: `toolbar_column` stacks it
+/// (and the options panel, when it is open) under the pill and moves the pill
+/// the few pixels that keep the column on the monitor work area. A pinned image
+/// reaches the same result, because its pair already stacks the bar under the
+/// toolbar.
 fn publish_paint_bar(canvas: &Canvas, paint: &snaplight_ui::ToolPaint) {
     let Some(weak) = canvas.ui_slots.paint_bar() else {
         return;
     };
     if canvas.tool == Tool::Select || canvas.long_capture.is_some() {
+        canvas.ui_slots.set_bar_size(None);
         snaplight_ui::hide_paint_bar(weak);
         return;
     }
     snaplight_ui::set_paint_bar(weak, paint);
     let size = snaplight_ui::paint_bar_logical_size(paint.tool);
     let physical = snaplight_ui::scale_to_physical(size, canvas.dpi);
-    // A pinned image places the bar as part of the floating pair, so it never
-    // overlaps the toolbar; a capture keeps it at the bottom centre.
-    let (x, y) = if canvas.fixed_image() {
-        pin_pair_positions(canvas, physical).1
-    } else {
-        paint_bar_position(canvas.screen, physical)
-    };
+    canvas.ui_slots.set_bar_size(Some(physical));
     // The row changes width with the tool, so the window is reshaped when the
     // tool changes rather than on every update.
     let reshaped = canvas.ui_slots.paint_tool_changed(paint.tool);
+    let column = style_column(
+        &canvas.ui_slots,
+        canvas.dpi,
+        monitor_work_area(canvas.screen),
+    );
+    let slots = canvas.ui_slots.clone();
     let weak = weak.clone();
     let dpi = canvas.dpi;
     snaplight_ui::invoke(move || {
+        if let Some(column) = &column {
+            apply_column(&slots, column);
+        }
         if let Some(bar) = weak.upgrade() {
             if reshaped {
                 bar.set_row_width(size.0 as f32);
             }
             if reshaped || !bar.window().is_visible() {
-                bar.window().set_position(PhysicalPosition::new(x, y));
                 let _ = bar.show();
             }
         }
@@ -2090,14 +2096,20 @@ fn publish_paint_bar(canvas: &Canvas, paint: &snaplight_ui::ToolPaint) {
         }
     });
 }
-/// Hides the windows that hang off the toolbar. Quick settings and the picker
-/// never outlive the selection they were opened against.
+/// Hides the windows that hang off the toolbar. Quick settings, the picker and
+/// the shape switch menu never outlive the selection they were opened against.
 fn hide_overlays(canvas: &Canvas) {
     if let Some(panel) = canvas.ui_slots.panel() {
+        // The panel leaves the toolbar column when it is hidden, so the paint
+        // bar closes up under the toolbar instead of keeping its slot.
+        canvas.ui_slots.set_panel_size(None);
         snaplight_ui::hide_panel(panel);
     }
     if let Some(picker) = canvas.ui_slots.picker() {
         snaplight_ui::hide_picker(picker);
+    }
+    if let Some(menu) = canvas.ui_slots.shape_menu() {
+        snaplight_ui::hide_shape_menu(menu);
     }
 }
 fn park_toolbar(canvas: &Canvas) {
@@ -2212,6 +2224,18 @@ fn place_toolbar_for_pin(canvas: &Canvas) {
     // The pair is laid out against the pin: the toolbar may reach beyond a small
     // pin, but it starts where the picture does and stays clear of the bar.
     let (x, y) = pin_pair_positions(canvas, pin_paint_size(canvas)).0;
+    // A pinned image has no selection, so the pair position is the only anchor
+    // the toolbar column gets; publishing it lets the paint bar and the options
+    // panel stack under the pill exactly as they do after a capture selection.
+    if let Some(logical) = canvas.ui_slots.toolbar_size() {
+        let size = snaplight_ui::scale_to_physical(logical, canvas.dpi);
+        canvas.ui_slots.set_toolbar_rect(Some(RECT {
+            left: x,
+            top: y,
+            right: x + size.0,
+            bottom: y + size.1,
+        }));
+    }
     snaplight_ui::move_toolbar(weak, PhysicalPosition::new(x, y));
     let logical_size = canvas.ui_slots.toolbar_size().unwrap();
     snaplight_ui::invoke(move || reshape_and_raise(snaplight_ui::TOOLBAR_TITLE, logical_size));

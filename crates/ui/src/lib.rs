@@ -4,8 +4,13 @@ pub use color_picker::{
     color_picker, picker_set_color, picker_set_hex, picker_set_hue, picker_set_sv,
 };
 pub use slint::{
-    Color, ComponentHandle, Model, ModelRc, PhysicalPosition, SharedString, VecModel, Window,
+    Color, ComponentHandle, LogicalPosition, Model, ModelRc, PhysicalPosition, SharedString,
+    VecModel, Window,
 };
+// Pointer events are re-exported so the editor's smoke can drive the toolbar's
+// real hit-testing through `Window::dispatch_event` instead of calling the
+// generated callbacks directly.
+pub use slint::platform::{PointerEventButton, WindowEvent};
 use snaplight_domain::{
     parse_hex_color, Config, Tool, WindowDetect, DEFAULT_STROKE_COLOR, MAX_PIN_SHADOW_BLUR,
     MAX_PIN_SHADOW_OFFSET,
@@ -31,6 +36,45 @@ fn tool_items(tools: &[Tool]) -> Vec<ToolItem> {
             label: tool_label(*tool).into(),
         })
         .collect()
+}
+/// The two tools that share the merged shape button on the toolbar.
+fn is_shape(tool: Tool) -> bool {
+    matches!(tool, Tool::Rectangle | Tool::Ellipse)
+}
+/// Shapes that are actually configured, in configured order and without
+/// duplicates. The toolbar's drop-down only offers these entries.
+fn shape_tools(tools: &[Tool]) -> Vec<Tool> {
+    let mut shapes = Vec::new();
+    for &tool in tools {
+        if is_shape(tool) && !shapes.contains(&tool) {
+            shapes.push(tool);
+        }
+    }
+    shapes
+}
+/// Toolbar entries. Rectangle and ellipse collapse into one entry that keeps
+/// the slot of the first configured shape; the settings model is untouched, so
+/// its order list still shows both tools separately.
+fn toolbar_tools(tools: &[Tool]) -> Vec<ToolItem> {
+    let mut items = Vec::new();
+    let mut shape_seen = false;
+    for &tool in tools {
+        if is_shape(tool) {
+            if !shape_seen {
+                shape_seen = true;
+                items.push(ToolItem {
+                    id: tool.id(),
+                    label: "形状".into(),
+                });
+            }
+        } else {
+            items.push(ToolItem {
+                id: tool.id(),
+                label: tool_label(tool).into(),
+            });
+        }
+    }
+    items
 }
 /// Tool ids in the order the toolbar displays them, as sent back to the editor.
 pub fn tool_order(model: &ModelRc<ToolItem>) -> Vec<i32> {
@@ -88,9 +132,18 @@ pub fn paint_tools(rows: &ModelRc<ToolPaintRow>) -> (Vec<Tool>, Vec<Tool>) {
 }
 pub fn toolbar(config: &Config) -> Result<Toolbar, slint::PlatformError> {
     let ui = Toolbar::new()?;
+    let shapes = shape_tools(&config.tools);
     ui.set_actions(ModelRc::new(VecModel::from(toolbar_actions())));
     ui.set_bar_width(toolbar_logical_size(&config.tools).0 as f32);
-    ui.set_tools(ModelRc::new(VecModel::from(tool_items(&config.tools))));
+    ui.set_tools(ModelRc::new(VecModel::from(toolbar_tools(&config.tools))));
+    ui.set_shapes(ModelRc::new(VecModel::from(tool_items(&shapes))));
+    // No shape has been used yet, so the main button starts with the first
+    // configured shape (rectangle when it is available first).
+    ui.set_last_shape(
+        shapes
+            .first()
+            .map_or(Tool::Rectangle.id(), |tool| tool.id()),
+    );
     ui.set_stroke_width(config.stroke_width as i32);
     ui.set_block(config.mosaic_block as i32);
     ui.set_fill_opacity(config.fill_opacity as i32);
@@ -98,6 +151,45 @@ pub fn toolbar(config: &Config) -> Result<Toolbar, slint::PlatformError> {
     ui.set_stroke_color(config_color(&config.stroke_color));
     ui.set_fill_color(config_color(&config.fill_color));
     Ok(ui)
+}
+/// The shape switch menu of the toolbar: rectangle and ellipse share one
+/// toolbar entry, and this window is the drop-down that switches between them.
+/// It is a window of its own because an embedded `PopupWindow` would be drawn
+/// inside the toolbar's 52px pill; the editor places it above the toolbar.
+pub fn shape_menu(config: &Config) -> Result<ShapeMenu, slint::PlatformError> {
+    let ui = ShapeMenu::new()?;
+    let shapes = shape_tools(&config.tools);
+    ui.set_shapes(ModelRc::new(VecModel::from(tool_items(&shapes))));
+    ui.set_shape_tool(
+        shapes
+            .first()
+            .map_or(Tool::Rectangle.id(), |tool| tool.id()),
+    );
+    Ok(ui)
+}
+/// Logical size of the shape switch menu: one 24px row per configured shape
+/// between 2px of padding. Keep in sync with `toolbar.slint`.
+pub fn shape_menu_logical_size(shapes: usize) -> (u32, u32) {
+    (100, shapes as u32 * 24 + 4)
+}
+/// Logical size of the shape switch menu for a configuration: one row per
+/// configured shape, so the editor sizes the window without reading the model.
+pub fn shape_menu_size(config: &Config) -> (u32, u32) {
+    shape_menu_logical_size(shape_tools(&config.tools).len())
+}
+/// Horizontal offset of the merged shape entry inside the toolbar, in logical
+/// pixels, so the editor can anchor the drop-down to the shape button. Mirrors
+/// the toolbar layout: 10px padding, the 18px grip, then each entry plus the
+/// 2px gap.
+pub fn shape_entry_x(tools: &[Tool]) -> u32 {
+    let mut x = 10 + 18 + 2;
+    for item in toolbar_tools(tools) {
+        if item.id == Tool::Rectangle.id() || item.id == Tool::Ellipse.id() {
+            return x;
+        }
+        x += if item.id == Tool::Select.id() { 40 } else { 50 } + 2;
+    }
+    x
 }
 /// Quick-settings window shown when a tool's drop-down arrow is clicked.
 pub fn options_panel(config: &Config) -> Result<OptionsPanel, slint::PlatformError> {
@@ -228,15 +320,31 @@ fn toolbar_actions() -> Vec<CommandItem> {
         .collect()
 }
 pub fn toolbar_logical_size(tools: &[Tool]) -> (u32, u32) {
-    // Padding + grip + two dividers + eight commands + inter-item gaps.
-    let tools_width: u32 = tools
+    // Padding + grip + two dividers + six commands + inter-item gaps. Both
+    // shapes share one entry; the arrow only exists when both are configured,
+    // which is also how `ShapeToolButton` sizes itself in `toolbar.slint`.
+    let entries = toolbar_tools(tools);
+    let has_arrow = shape_tools(tools).len() > 1;
+    let tools_width: u32 = entries
         .iter()
-        .map(|tool| if *tool == Tool::Select { 40 } else { 50 })
+        .map(|item| {
+            if item.id == Tool::Rectangle.id() || item.id == Tool::Ellipse.id() {
+                if has_arrow {
+                    50
+                } else {
+                    40
+                }
+            } else if item.id == Tool::Select.id() {
+                40
+            } else {
+                50
+            }
+        })
         .sum();
     (
         144 + 40 * TOOLBAR_ACTIONS.len() as u32
             + tools_width
-            + 2 * (tools.len() as u32 + TOOLBAR_ACTIONS.len() as u32 + 4),
+            + 2 * (entries.len() as u32 + TOOLBAR_ACTIONS.len() as u32 + 4),
         52,
     )
 }
@@ -256,13 +364,14 @@ pub fn paint_bar_logical_size(tool: i32) -> (u32, u32) {
 /// and the bottom paint bar show the same row, so both size themselves to it and
 /// a tool with fewer controls gets a shorter window instead of a wide one with
 /// empty space. The widths come from what the smoke measures for the row at its
-/// preferred size, plus that row's own padding and a little slack: the two shape
-/// groups need 423, text adds the size and text fields (711), a single outline
-/// group 219 and the mosaic row 186.
+/// preferred size, plus that row's own padding and a little slack: the shape row
+/// (outline, width, fill, opacity, target switch, eight presets and the picker)
+/// and the text row (which adds the size field and the text box) are the widest,
+/// a single outline group 245 and the mosaic row 205.
 fn paint_row_size(tool: i32) -> (u32, u32) {
     const ROW_HEIGHT: u32 = 52;
     let width = match tool {
-        1 | 2 => 430,
+        1 | 2 => 730,
         6 => 730,
         // Mosaic shows one label and one spin box, the pen and arrow a single
         // outline group.
@@ -279,6 +388,7 @@ pub const TOOLBAR_TITLE: &str = "Snaplight Tools";
 pub const OPTIONS_TITLE: &str = "Snaplight Tool Options";
 pub const PICKER_TITLE: &str = "Snaplight Color";
 pub const PAINT_BAR_TITLE: &str = "Snaplight Paint";
+pub const SHAPE_MENU_TITLE: &str = "Snaplight Shape Menu";
 /// The settings window keeps its system frame, so it is the one Slint window
 /// that also needs the application icon applied to it.
 pub const SETTINGS_TITLE: &str = "Snaplight 设置";
@@ -297,6 +407,8 @@ pub type PanelWeak = slint::Weak<OptionsPanel>;
 pub type PickerWeak = slint::Weak<ColorPicker>;
 /// Handle to the persistent paint bar that other threads may use.
 pub type PaintBarWeak = slint::Weak<PaintBar>;
+/// Handle to the shape switch menu that other threads may use.
+pub type ShapeMenuWeak = slint::Weak<ShapeMenu>;
 /// Paint values of the toolbar for one tool id, so the editor can seed the
 /// options panel and the paint bar before showing them. `stroke-tools` and
 /// `fill-tools` are indexed by stable tool id; an out-of-range id reads false.
@@ -334,6 +446,16 @@ pub fn hide_panel(weak: &PanelWeak) {
 }
 /// Hides the paint bar from another thread.
 pub fn hide_paint_bar(weak: &PaintBarWeak) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            let _ = ui.hide();
+        }
+    });
+}
+/// Hides the shape switch menu. It is transient: it must not outlive the
+/// toolbar it was opened from, a long capture or the end of the session.
+pub fn hide_shape_menu(weak: &ShapeMenuWeak) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = weak.upgrade() {
@@ -430,6 +552,19 @@ pub fn move_toolbar(weak: &ToolbarWeak, position: PhysicalPosition) {
             // invalidates its backing pixels, so refresh the entire opaque surface.
             ui.set_repaint(!ui.get_repaint());
             ui.window().request_redraw();
+        }
+    });
+}
+/// Hides the toolbar from another thread. The toolbar reports the menu
+/// dismissal before it goes, so the transient shape menu never outlives the
+/// pill it was opened from; the editor closes that window without giving the
+/// toolbar the focus back.
+pub fn hide_toolbar(weak: &ToolbarWeak) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.invoke_shape_menu_dismissed();
+            let _ = ui.hide();
         }
     });
 }
@@ -540,28 +675,107 @@ mod tests {
     fn logical_sizes_scale_to_monitor_dpi() {
         assert_eq!(
             scale_to_physical(toolbar_logical_size(&Config::default().tools), 96),
-            (758, 52)
+            (706, 52)
         );
         assert_eq!(
             scale_to_physical(toolbar_logical_size(&Config::default().tools), 144),
-            (1137, 78)
+            (1059, 78)
         );
-        // The paint rows are sized per tool: the text tool is the widest, the two
-        // shape groups come next and a single group is the shortest.
+        // The paint rows are sized per tool: the shape and text rows are the
+        // widest, a single outline group comes next and mosaic is the shortest.
         assert_eq!(scale_to_physical(paint_logical_size(6), 96), (780, 52));
         assert_eq!(scale_to_physical(paint_logical_size(6), 144), (1170, 78));
-        assert_eq!(scale_to_physical(paint_logical_size(1), 96), (480, 52));
+        assert_eq!(scale_to_physical(paint_logical_size(1), 96), (780, 52));
         assert_eq!(scale_to_physical(paint_logical_size(5), 96), (255, 52));
         assert_eq!(scale_to_physical(paint_bar_logical_size(6), 96), (730, 52));
-        assert_eq!(scale_to_physical(paint_bar_logical_size(1), 96), (430, 52));
+        assert_eq!(scale_to_physical(paint_bar_logical_size(1), 96), (730, 52));
+        // Both shape tools share the one row.
+        assert_eq!(paint_bar_logical_size(2), paint_bar_logical_size(1));
         // The panel is the row plus its close button, the bar is the row alone.
         assert_eq!(paint_logical_size(4).0 - paint_bar_logical_size(4).0, 50);
         assert_eq!(
             scale_to_physical(toolbar_logical_size(&Config::default().tools), 192),
-            (1516, 104)
+            (1412, 104)
         );
         // Rounded to the nearest physical pixel.
         assert_eq!(scale_to_physical((1, 1), 144), (2, 2));
+    }
+    #[test]
+    fn toolbar_merges_configured_shapes_into_one_entry() {
+        // Reversing the two shapes moves the merged entry to the slot of the
+        // first shape while keeping both entries in the drop-down model.
+        let mut reversed = Config::default().tools;
+        let rectangle = reversed.iter().position(|tool| *tool == Tool::Rectangle);
+        let ellipse = reversed.iter().position(|tool| *tool == Tool::Ellipse);
+        reversed.swap(rectangle.unwrap(), ellipse.unwrap());
+        assert_eq!(
+            toolbar_tools(&reversed)
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(shape_tools(&reversed), vec![Tool::Ellipse, Tool::Rectangle]);
+        assert_eq!(toolbar_logical_size(&reversed), (706, 52));
+
+        // A single configured shape keeps the merged slot but loses the arrow,
+        // so its button and the window are one arrow width narrower.
+        let only_rectangle: Vec<Tool> = reversed
+            .iter()
+            .copied()
+            .filter(|tool| *tool != Tool::Ellipse)
+            .collect();
+        assert_eq!(
+            toolbar_tools(&only_rectangle)
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 3, 4, 5, 6]
+        );
+        assert_eq!(shape_tools(&only_rectangle), vec![Tool::Rectangle]);
+        assert_eq!(toolbar_logical_size(&only_rectangle), (696, 52));
+
+        // No shape configured: no merged entry and an empty drop-down model.
+        let no_shapes: Vec<Tool> = [Tool::Select, Tool::Arrow, Tool::Text].to_vec();
+        assert_eq!(
+            toolbar_tools(&no_shapes)
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![0, 3, 6]
+        );
+        assert!(shape_tools(&no_shapes).is_empty());
+        assert_eq!(toolbar_logical_size(&no_shapes), (550, 52));
+
+        // Duplicates cannot add a second merged slot.
+        assert_eq!(
+            toolbar_tools(&[Tool::Rectangle, Tool::Rectangle, Tool::Ellipse])
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            shape_tools(&[Tool::Rectangle, Tool::Rectangle, Tool::Ellipse]),
+            vec![Tool::Rectangle, Tool::Ellipse]
+        );
+        // The menu window is one 24px row per configured shape plus padding, and
+        // the merged entry sits after the padding, the grip and the select tool:
+        // 10 + 18 + 2 + (40 + 2). Shapes stay in the configured order.
+        let config = Config::default();
+        assert_eq!(shape_menu_size(&config), (100, 52));
+        assert_eq!(shape_menu_logical_size(1), (100, 28));
+        assert_eq!(shape_entry_x(&config.tools), 72);
+        let mut ellipse_first = config.tools.clone();
+        ellipse_first.swap(1, 2);
+        assert_eq!(shape_entry_x(&ellipse_first), 72);
+        assert_eq!(
+            shape_menu_size(&Config {
+                tools: only_rectangle.clone(),
+                ..config
+            }),
+            (100, 28)
+        );
     }
     #[test]
     fn long_capture_sits_left_of_the_pin_command() {
