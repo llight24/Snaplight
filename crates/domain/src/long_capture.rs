@@ -191,29 +191,61 @@ fn carries_detail(row: &[u8], columns: &[u32]) -> bool {
 }
 
 /// Accumulates scroll frames into one tall image.
+///
+/// The engine works in *page* coordinates: row 0 of the stitched image is page
+/// position `origin`, which turns negative once the content scrolls up past the
+/// first captured row, and the covered range is the image's own height. The most
+/// recently accepted frame is remembered by its page position and height instead
+/// of a second pixel buffer: its pixels are the image rows that window covers,
+/// which is possible because that window is always inside the covered range.
+///
+/// Every new frame is matched against that window, so a scroll that comes back
+/// into rows the stitch already holds is located exactly instead of being
+/// compared against the two ends of an ever-growing image. Only rows outside the
+/// covered range extend the image; the rest is dropped. A frame inside the range
+/// therefore returns [`Step::Unchanged`] while still becoming the anchor for the
+/// next scroll, and crossing an end again adds exactly the new rows.
 pub struct LongCapture {
     width: u32,
     height: u32,
     stride: usize,
     bytes: Vec<u8>,
     budget: usize,
+    /// Page position of the stitched image's first row.
+    origin: i64,
+    /// Page position of the most recently accepted frame's first row.
+    last_top: i64,
+    /// Height of the most recently accepted frame.
+    last_height: u32,
+    /// Rows the content moved between the last two accepted frames, used as the
+    /// expected scroll for the next one.
     last_rows: Option<u32>,
 }
 impl LongCapture {
     /// Starts a capture from the first frame. Fails when that frame alone does
-    /// not fit the memory budget.
+    /// not fit the memory budget or already exceeds the height cap.
     pub fn new(frame: Frame<'_>, budget: usize) -> Result<Self, &'static str> {
         if frame.width == 0 || frame.height == 0 {
             return Err("抓取区域为空");
         }
-        if frame.stride != frame.width as usize * 4
-            || frame.bytes.len() < frame.stride * frame.height as usize
-        {
+        if frame.height > MAX_HEIGHT {
+            return Err("已达最大高度");
+        }
+        // Dense BGRA8 rows only: a padded stride or a truncated buffer cannot be
+        // stitched, and a size that does not fit `usize` cannot be addressed.
+        let Some(stride) = row_stride(frame.width) else {
+            return Err("抓取数据与区域尺寸不符");
+        };
+        let Some(source_len) = frame.stride.checked_mul(frame.height as usize) else {
+            return Err("抓取数据与区域尺寸不符");
+        };
+        if frame.stride != stride || frame.bytes.len() < source_len {
             return Err("抓取数据与区域尺寸不符");
         }
+        let Some(len) = stride.checked_mul(frame.height as usize) else {
+            return Err("拼接内存预算不足");
+        };
         let budget = budget.min(MAX_BYTES);
-        let stride = frame.width as usize * 4;
-        let len = stride * frame.height as usize;
         if len > budget {
             return Err("拼接内存预算不足");
         }
@@ -228,6 +260,9 @@ impl LongCapture {
             stride,
             bytes,
             budget,
+            origin: 0,
+            last_top: 0,
+            last_height: frame.height,
             last_rows: None,
         })
     }
@@ -264,11 +299,7 @@ impl LongCapture {
     /// reverses direction keeps working; `previous` breaks a close call in favour
     /// of the direction the user was already scrolling.
     pub fn advance(&mut self, frame: &Frame<'_>, previous: Option<Direction>) -> Step {
-        if frame.width != self.width
-            || frame.height == 0
-            || frame.stride != frame.width as usize * 4
-            || frame.bytes.len() < frame.stride * frame.height as usize
-        {
+        if !self.accepts(frame) {
             return Step::Jumped;
         }
         let mut best: Option<(f32, Direction, u32)> = None;
@@ -289,61 +320,124 @@ impl LongCapture {
         let Some((_, direction, overlap)) = best else {
             return Step::Jumped;
         };
-        self.stitch(frame, direction, overlap)
+        self.apply(frame, direction, overlap)
+    }
+    /// Whether `frame` can be stitched onto this capture: same width, non-empty,
+    /// dense BGRA8 rows of the declared height, and no size overflow.
+    fn accepts(&self, frame: &Frame<'_>) -> bool {
+        if frame.width != self.width || frame.height == 0 {
+            return false;
+        }
+        let Some(stride) = row_stride(frame.width) else {
+            return false;
+        };
+        frame.stride == stride
+            && stride
+                .checked_mul(frame.height as usize)
+                .is_some_and(|len| frame.bytes.len() >= len)
+    }
+    /// The most recently accepted frame, read back out of the stitched image. Its
+    /// page window always lies inside the covered range, so the rows are there.
+    fn last_frame(&self) -> Frame<'_> {
+        let start = (self.last_top - self.origin) as usize * self.stride;
+        let end = start + self.last_height as usize * self.stride;
+        Frame {
+            width: self.width,
+            height: self.last_height,
+            stride: self.stride,
+            bytes: &self.bytes[start..end],
+        }
     }
     /// Best overlap for `frame` assuming the content moved `direction`, with its
-    /// score.
+    /// score. Only the last accepted frame is searched, which is what makes
+    /// adjacent motion reliable: a constant wheel delta also scrolls by a nearly
+    /// constant number of rows.
     fn candidate(&self, frame: &Frame<'_>, direction: Direction) -> Option<(f32, u32)> {
-        let previous = Frame {
-            width: self.width,
-            height: self.height,
-            stride: self.stride,
-            bytes: &self.bytes,
-        };
-        let added = |overlap| frame.height - overlap;
+        let last = self.last_frame();
         match direction {
-            Direction::Down => search_overlap(previous, *frame, self.last_rows, added),
-            Direction::Up => search_overlap(*frame, previous, self.last_rows, added),
+            Direction::Down => search_overlap(last, *frame, self.last_rows, |overlap| {
+                self.last_height - overlap
+            }),
+            Direction::Up => search_overlap(*frame, last, self.last_rows, |overlap| {
+                frame.height - overlap
+            }),
         }
     }
-    /// Applies an overlap found by [`Self::candidate`] to the stitched image.
-    fn stitch(&mut self, frame: &Frame<'_>, direction: Direction, overlap: u32) -> Step {
-        if overlap >= frame.height {
-            return Step::Unchanged;
-        }
-        let rows = frame.height - overlap;
-        if self.height + rows > MAX_HEIGHT {
+    /// Moves an overlap found by [`Self::candidate`] onto the page and extends the
+    /// image only where it does not cover rows yet. A frame that fits inside the
+    /// covered range leaves the pixels alone but still becomes the last accepted
+    /// frame, so the next scroll is located from where the user really is.
+    fn apply(&mut self, frame: &Frame<'_>, direction: Direction, overlap: u32) -> Step {
+        // Rows the content moved, which is also the offset from the last accepted
+        // frame. `overlap` never exceeds either height, so this cannot wrap.
+        let moved = match direction {
+            Direction::Down => self.last_height - overlap,
+            Direction::Up => frame.height - overlap,
+        };
+        let top = match direction {
+            Direction::Down => self.last_top + i64::from(moved),
+            Direction::Up => self.last_top - i64::from(moved),
+        };
+        let end = self.origin + i64::from(self.height);
+        // Down starts the frame at or below the last frame's top, up ends it at or
+        // above the last frame's end, so at most one side has uncovered rows.
+        let prepend = (self.origin - top).max(0) as u32;
+        let append = (top + i64::from(frame.height) - end).max(0) as u32;
+        debug_assert!(direction == Direction::Up || prepend == 0);
+        debug_assert!(direction == Direction::Down || append == 0);
+        let rows = self.height as usize + prepend as usize + append as usize;
+        if rows > MAX_HEIGHT as usize {
             return Step::Budget("已达最大高度");
         }
-        if (self.height + rows) as usize * self.stride > self.budget {
+        if rows
+            .checked_mul(self.stride)
+            .is_none_or(|bytes| bytes > self.budget)
+        {
             return Step::Budget("已达内存预算");
         }
+        if prepend > 0 {
+            let mut head = Vec::with_capacity(prepend as usize * self.stride);
+            for row in 0..prepend as usize {
+                head.extend_from_slice(&frame.bytes[row * frame.stride..][..self.stride]);
+            }
+            opaque(&mut head);
+            self.bytes.splice(0..0, head);
+            self.origin -= i64::from(prepend);
+            self.height += prepend;
+        }
+        if append > 0 {
+            let mut tail = Vec::with_capacity(append as usize * self.stride);
+            for row in (frame.height - append) as usize..frame.height as usize {
+                tail.extend_from_slice(&frame.bytes[row * frame.stride..][..self.stride]);
+            }
+            opaque(&mut tail);
+            self.bytes.extend_from_slice(&tail);
+            self.height += append;
+        }
+        self.last_top = top;
+        self.last_height = frame.height;
+        self.last_rows = Some(moved);
+        debug_assert_eq!(self.bytes.len(), self.height as usize * self.stride);
         match direction {
             Direction::Down => {
-                let start = self.height as usize * self.stride;
-                let mut appended = Vec::with_capacity(rows as usize * self.stride);
-                for row in 0..rows as usize {
-                    appended.extend_from_slice(
-                        &frame.bytes[(overlap as usize + row) * frame.stride..][..self.stride],
-                    );
+                if append == 0 {
+                    Step::Unchanged
+                } else {
+                    Step::Scrolled {
+                        overlap: frame.height - append,
+                        rows: append,
+                    }
                 }
-                opaque(&mut appended);
-                self.bytes.extend_from_slice(&appended);
-                debug_assert_eq!(self.bytes.len(), start + appended.len());
-                self.height += rows;
-                self.last_rows = Some(rows);
-                Step::Scrolled { overlap, rows }
             }
             Direction::Up => {
-                let mut prepended = Vec::with_capacity(rows as usize * self.stride);
-                for row in 0..rows as usize {
-                    prepended.extend_from_slice(&frame.bytes[row * frame.stride..][..self.stride]);
+                if prepend == 0 {
+                    Step::Unchanged
+                } else {
+                    Step::Prepended {
+                        overlap: frame.height - prepend,
+                        rows: prepend,
+                    }
                 }
-                opaque(&mut prepended);
-                self.bytes.splice(0..0, prepended);
-                self.height += rows;
-                self.last_rows = Some(rows);
-                Step::Prepended { overlap, rows }
             }
         }
     }
@@ -378,6 +472,11 @@ impl LongCapture {
             bytes,
         )
     }
+}
+
+/// Dense BGRA8 stride of `width` pixels, or `None` when it does not fit `usize`.
+fn row_stride(width: u32) -> Option<usize> {
+    (width as usize).checked_mul(4)
 }
 
 /// Forces the alpha channel opaque: GDI screen captures leave it zeroed, and the
@@ -631,5 +730,244 @@ mod tests {
         let (image, bytes) = capture.cropped(10_000, 10_000, ImageId(8));
         assert_eq!(image.height, 1);
         assert_eq!(bytes.len(), stride());
+    }
+
+    #[test]
+    fn scrolling_back_into_the_stitch_adds_no_rows() {
+        let source = page(1000);
+        let mut capture =
+            LongCapture::new(frame(&crop(&source, 0, FRAME_HEIGHT)), MAX_BYTES).unwrap();
+        for offset in [120u32, 240] {
+            assert_eq!(
+                capture.push(&frame(&crop(&source, offset, FRAME_HEIGHT))),
+                Step::Scrolled {
+                    overlap: 180,
+                    rows: 120
+                }
+            );
+        }
+        let covered = capture.bytes().to_vec();
+        // Scroll back up into rows the stitch already holds. The frame is located
+        // from the last accepted one, so nothing is appended.
+        assert_eq!(
+            capture.advance(
+                &frame(&crop(&source, 120, FRAME_HEIGHT)),
+                Some(Direction::Up)
+            ),
+            Step::Unchanged
+        );
+        assert_eq!(capture.height(), 540);
+        assert_eq!(capture.bytes(), &covered[..]);
+        // Down again over the same rows: still no duplicate content.
+        assert_eq!(
+            capture.push(&frame(&crop(&source, 240, FRAME_HEIGHT))),
+            Step::Unchanged
+        );
+        assert_eq!(capture.height(), 540);
+        assert_eq!(capture.bytes(), &covered[..]);
+        // Crossing the bottom end again adds exactly the rows it did not have.
+        assert_eq!(
+            capture.push(&frame(&crop(&source, 360, FRAME_HEIGHT))),
+            Step::Scrolled {
+                overlap: 180,
+                rows: 120
+            }
+        );
+        assert_eq!(capture.height(), 660);
+        assert_eq!(capture.bytes(), &source[..660 * stride()]);
+    }
+
+    #[test]
+    fn scrolling_up_back_through_the_start_adds_only_new_rows() {
+        let source = page(1000);
+        let mut capture =
+            LongCapture::new(frame(&crop(&source, 300, FRAME_HEIGHT)), MAX_BYTES).unwrap();
+        // Up past the first captured row: the new rows go before the image.
+        assert_eq!(
+            capture.advance(
+                &frame(&crop(&source, 180, FRAME_HEIGHT)),
+                Some(Direction::Up)
+            ),
+            Step::Prepended {
+                overlap: 180,
+                rows: 120
+            }
+        );
+        // Back down into the covered rows: no duplicate content.
+        assert_eq!(
+            capture.advance(
+                &frame(&crop(&source, 240, FRAME_HEIGHT)),
+                Some(Direction::Down)
+            ),
+            Step::Unchanged
+        );
+        assert_eq!(capture.height(), 420);
+        assert_eq!(capture.bytes(), &source[180 * stride()..600 * stride()]);
+        // Up again: only the 60 rows above the covered top are new.
+        assert_eq!(
+            capture.advance(
+                &frame(&crop(&source, 120, FRAME_HEIGHT)),
+                Some(Direction::Up)
+            ),
+            Step::Prepended {
+                overlap: 240,
+                rows: 60
+            }
+        );
+        assert_eq!(capture.height(), 480);
+        assert_eq!(capture.bytes(), &source[120 * stride()..600 * stride()]);
+    }
+
+    #[test]
+    fn the_stitch_grows_past_both_ends() {
+        let source = page(1000);
+        let mut capture =
+            LongCapture::new(frame(&crop(&source, 300, FRAME_HEIGHT)), MAX_BYTES).unwrap();
+        assert_eq!(
+            capture.advance(
+                &frame(&crop(&source, 180, FRAME_HEIGHT)),
+                Some(Direction::Up)
+            ),
+            Step::Prepended {
+                overlap: 180,
+                rows: 120
+            }
+        );
+        // Down through rows the stitch already holds...
+        assert_eq!(
+            capture.push(&frame(&crop(&source, 300, FRAME_HEIGHT))),
+            Step::Unchanged
+        );
+        // ...and out the bottom, where each further screen adds its own rows.
+        for offset in [420u32, 540] {
+            assert_eq!(
+                capture.push(&frame(&crop(&source, offset, FRAME_HEIGHT))),
+                Step::Scrolled {
+                    overlap: 180,
+                    rows: 120
+                }
+            );
+        }
+        assert_eq!(capture.height(), 660);
+        assert_eq!(capture.bytes(), &source[180 * stride()..840 * stride()]);
+    }
+
+    #[test]
+    fn a_jump_leaves_the_last_frame_in_place() {
+        let source = page(1000);
+        let other = page(1000)
+            .iter()
+            .map(|v| v.wrapping_mul(3))
+            .collect::<Vec<u8>>();
+        let mut capture =
+            LongCapture::new(frame(&crop(&source, 0, FRAME_HEIGHT)), MAX_BYTES).unwrap();
+        assert_eq!(
+            capture.push(&frame(&crop(&other, 500, FRAME_HEIGHT))),
+            Step::Jumped
+        );
+        assert_eq!(capture.height(), FRAME_HEIGHT);
+        assert_eq!(capture.bytes(), &source[..FRAME_HEIGHT as usize * stride()]);
+        // The rejected frame did not move the anchor: the next screen of the same
+        // page still stitches from the first one.
+        assert_eq!(
+            capture.push(&frame(&crop(&source, 120, FRAME_HEIGHT))),
+            Step::Scrolled {
+                overlap: 180,
+                rows: 120
+            }
+        );
+        assert_eq!(capture.height(), 420);
+        assert_eq!(capture.bytes(), &source[..420 * stride()]);
+    }
+
+    #[test]
+    fn a_budget_stop_keeps_the_stitch_usable() {
+        let source = page(1000);
+        let budget = stride() * (FRAME_HEIGHT as usize + 200);
+        let mut capture = LongCapture::new(frame(&crop(&source, 0, FRAME_HEIGHT)), budget).unwrap();
+        assert_eq!(
+            capture.push(&frame(&crop(&source, 120, FRAME_HEIGHT))),
+            Step::Scrolled {
+                overlap: 180,
+                rows: 120
+            }
+        );
+        assert_eq!(
+            capture.push(&frame(&crop(&source, 240, FRAME_HEIGHT))),
+            Step::Budget("已达内存预算")
+        );
+        // The refused screen was not partly appended.
+        assert_eq!(capture.height(), 420);
+        assert_eq!(capture.bytes(), &source[..420 * stride()]);
+        // A rollback into covered rows still works and costs nothing.
+        assert_eq!(
+            capture.advance(&frame(&crop(&source, 0, FRAME_HEIGHT)), Some(Direction::Up)),
+            Step::Unchanged
+        );
+        assert_eq!(capture.height(), 420);
+        // Crossing the end again reports the same budget and changes nothing.
+        assert_eq!(
+            capture.push(&frame(&crop(&source, 240, FRAME_HEIGHT))),
+            Step::Budget("已达内存预算")
+        );
+        assert_eq!(capture.height(), 420);
+        assert_eq!(capture.bytes(), &source[..420 * stride()]);
+    }
+
+    #[test]
+    fn malformed_frames_are_jumps_and_keep_the_stitch() {
+        let source = page(1000);
+        let mut capture =
+            LongCapture::new(frame(&crop(&source, 0, FRAME_HEIGHT)), MAX_BYTES).unwrap();
+        let next = crop(&source, 120, FRAME_HEIGHT);
+        let short = &next[..next.len() - stride()];
+        let cases = [
+            Frame {
+                width: 0,
+                ..frame(&next)
+            },
+            Frame {
+                width: WIDTH - 1,
+                ..frame(&next)
+            },
+            Frame {
+                height: 0,
+                ..frame(&next)
+            },
+            // A row of padding would shift every row after the first.
+            Frame {
+                stride: stride() + 4,
+                ..frame(&next)
+            },
+            // One row short of the declared height.
+            Frame {
+                bytes: short,
+                ..frame(&next)
+            },
+        ];
+        for case in cases {
+            assert_eq!(capture.push(&case), Step::Jumped);
+        }
+        assert_eq!(capture.height(), FRAME_HEIGHT);
+        assert_eq!(capture.bytes(), &source[..FRAME_HEIGHT as usize * stride()]);
+        // The anchor survived every rejected frame.
+        assert_eq!(
+            capture.push(&frame(&next)),
+            Step::Scrolled {
+                overlap: 180,
+                rows: 120
+            }
+        );
+    }
+
+    #[test]
+    fn the_first_frame_is_capped_at_the_maximum_height() {
+        let source = page(MAX_HEIGHT + 1);
+        assert!(matches!(
+            LongCapture::new(frame(&crop(&source, 0, MAX_HEIGHT + 1)), MAX_BYTES),
+            Err("已达最大高度")
+        ));
+        let full = LongCapture::new(frame(&crop(&source, 0, MAX_HEIGHT)), MAX_BYTES).unwrap();
+        assert_eq!(full.height(), MAX_HEIGHT);
     }
 }

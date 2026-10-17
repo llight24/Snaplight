@@ -61,9 +61,10 @@ mod pin_item {
 /// itself stays a plain label so the card never has to explain the held key.
 /// Destroying the pin discards the image the user pinned, so it is drawn in red.
 ///
-/// Restoring the original size lives here instead of on a double-click: the
-/// double-click now closes the pin (the "close" gesture the user asked for), so
-/// the size reset needs a home that says what it does.
+/// Restoring the original size is one of the things a middle click on the pin
+/// does too, so it is not only a menu entry. It deliberately does not live on a
+/// double-click: that now closes the pin (the "close" gesture the user asked
+/// for), so the entry and the middle click both say what the reset does.
 ///
 /// The shadow entry names what it does instead of naming a state: the card has
 /// no checkmark to show one, and the shadow being on or off is visible on the
@@ -1131,6 +1132,24 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                     close_pin(pin)?;
                     return Ok(Some(LRESULT(0)));
                 }
+                // A middle click restores the original size, the same command as
+                // the context menu's reset entry, run through `zoom` so both
+                // paths stay one implementation. The whole window hit-tests as
+                // the caption, so a real middle click arrives in the
+                // non-client form; the client form is answered as well so the
+                // message cannot fall through to a default gesture. The two
+                // button-down forms are swallowed: the reset is drawn on the
+                // release only, so one click redraws the pin once, and a click
+                // where it already has its original size redraws nothing.
+                WM_NCMBUTTONDOWN | WM_MBUTTONDOWN | WM_NCMBUTTONDBLCLK | WM_MBUTTONDBLCLK => {
+                    return Ok(Some(LRESULT(0)));
+                }
+                WM_NCMBUTTONUP | WM_MBUTTONUP => {
+                    if pin.scale != 1.0 {
+                        pin.zoom(1.0)?;
+                    }
+                    return Ok(Some(LRESULT(0)));
+                }
                 WM_MOUSEWHEEL => {
                     let delta = ((w.0 >> 16) as u16 as i16) as f32 / 120.0;
                     if GetKeyState(VK_CONTROL.0 as i32) < 0 {
@@ -1983,6 +2002,82 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 )
                 .into());
             }
+            // A middle click restores the original size — the same command as
+            // the context menu's reset entry — and the smoke sends the real
+            // button messages instead of calling `zoom`, so the handler is what
+            // is under test. The whole window hit-tests as the caption, so the
+            // system delivers the non-client form to a real click; the client
+            // form has to be answered too.
+            host.pins[0].opacity = 0.6;
+            for (index, message) in [WM_NCMBUTTONUP, WM_MBUTTONUP].into_iter().enumerate() {
+                // Start away from the original size, magnified once and shrunk
+                // once, so each click really has a size to undo.
+                host.pins[0].zoom(if index == 0 { 1.6 } else { 0.5 })?;
+                SendMessageW(host.pins[0].hwnd, message, WPARAM(0), LPARAM(0));
+                let mut reset = RECT::default();
+                GetWindowRect(host.pins[0].hwnd, &mut reset)?;
+                let reset_margin = host.pins[0].margin();
+                let reset_size = (reset.right - reset.left, reset.bottom - reset.top);
+                let want_size = (
+                    image.width as i32 + 2 * reset_margin,
+                    image.height as i32 + 2 * reset_margin,
+                );
+                if host.pins[0].scale != 1.0
+                    || (reset.left + reset_margin, reset.top + reset_margin)
+                        != (requested.x, requested.y)
+                    || reset_size != want_size
+                    || host.pins[0].opacity != 0.6
+                {
+                    return Err(format!(
+                        "a middle click (message {message:#x}) left the pin at scale {} origin ({}, {}) size {reset_size:?} opacity {}, not the capture plus margin {want_size:?} at ({}, {})",
+                        host.pins[0].scale,
+                        reset.left + reset_margin,
+                        reset.top + reset_margin,
+                        host.pins[0].opacity,
+                        requested.x,
+                        requested.y
+                    )
+                    .into());
+                }
+            }
+            // The reset is drawn on the release only: pressing the middle button
+            // has to leave the size alone, so a click redraws the pin once.
+            host.pins[0].zoom(2.0)?;
+            SendMessageW(host.pins[0].hwnd, WM_NCMBUTTONDOWN, WPARAM(0), LPARAM(0));
+            SendMessageW(host.pins[0].hwnd, WM_MBUTTONDOWN, WPARAM(0), LPARAM(0));
+            if host.pins[0].scale != 2.0 {
+                return Err(format!(
+                    "pressing the middle button already resized the pin to {}",
+                    host.pins[0].scale
+                )
+                .into());
+            }
+            // Clicking again where it already has its original size changes
+            // nothing, and the capture stays where it is.
+            SendMessageW(host.pins[0].hwnd, WM_NCMBUTTONUP, WPARAM(0), LPARAM(0));
+            SendMessageW(host.pins[0].hwnd, WM_MBUTTONUP, WPARAM(0), LPARAM(0));
+            let mut again = RECT::default();
+            GetWindowRect(host.pins[0].hwnd, &mut again)?;
+            let again_margin = host.pins[0].margin();
+            let again_size = (again.right - again.left, again.bottom - again.top);
+            if host.pins[0].scale != 1.0
+                || (again.left + again_margin, again.top + again_margin)
+                    != (requested.x, requested.y)
+                || again_size
+                    != (
+                        image.width as i32 + 2 * again_margin,
+                        image.height as i32 + 2 * again_margin,
+                    )
+            {
+                return Err(format!(
+                    "clicking the middle button again left the pin at scale {} origin ({}, {}) size {again_size:?}",
+                    host.pins[0].scale,
+                    again.left + again_margin,
+                    again.top + again_margin
+                )
+                .into());
+            }
+            host.pins[0].opacity = 1.0;
             host.pins[0].toggle()?;
             host.pins[0].toggle()?;
             // Click-through is the state the held shortcut lifts, so drive that
@@ -2343,7 +2438,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     "pin-smoke-low-memory-result.json"
                 }),
                 &serde_json::to_vec(
-                    &serde_json::json!({"composition":use_gpu,"layered_transition":true,"scale":true,"opacity":true,"menu_destroy":true,"menu_reset":true,"close_confirm":true,"held_interaction":true,"pin_shadow":true,"shadow_geometry":true,"shadow_pixels":true,"shadow_menu":true,"shadow_toggle":true,"shadow_reload":true,"shadow_default":true,"position":[placed.left,placed.top],"capture":[placed.left+margin,placed.top+margin],"shadow_margin":margin,"size":[placed.right-placed.left,placed.bottom-placed.top]}),
+                    &serde_json::json!({"composition":use_gpu,"layered_transition":true,"scale":true,"opacity":true,"middle_reset":true,"menu_destroy":true,"menu_reset":true,"close_confirm":true,"held_interaction":true,"pin_shadow":true,"shadow_geometry":true,"shadow_pixels":true,"shadow_menu":true,"shadow_toggle":true,"shadow_reload":true,"shadow_default":true,"position":[placed.left,placed.top],"capture":[placed.left+margin,placed.top+margin],"shadow_margin":margin,"size":[placed.right-placed.left,placed.bottom-placed.top]}),
                 )?,
             )?;
         } else {
