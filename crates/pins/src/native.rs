@@ -18,7 +18,9 @@ use windows::{
             HiDpi::GetDpiForWindow,
             Input::{
                 GetRawInputData, KeyboardAndMouse::*, RegisterRawInputDevices, HRAWINPUT, RAWINPUT,
-                RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEKEYBOARD,
+                RAWINPUTDEVICE, RAWINPUTHEADER, RAWINPUT_0, RAWKEYBOARD, RAWMOUSE, RAWMOUSE_0,
+                RAWMOUSE_0_0, RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT, RIM_TYPEKEYBOARD,
+                RIM_TYPEMOUSE,
             },
             WindowsAndMessaging::*,
         },
@@ -44,9 +46,19 @@ const HELD_POLL_MS: u32 = 16;
 /// Posted by the thread that waits for an annotation session's editor process,
 /// so the pin can pick up the picture the session wrote back.
 const EDIT_DONE: u32 = WM_APP + 54;
-/// Thickness of the frame that marks the pin the pointer last clicked, in
-/// physical pixels on screen.
+/// Posted by a pin the pointer clicked, so the host can make it the only selected
+/// pin. The address of that pin arrives in the wparam: clearing every other pin
+/// needs all of them, so the host owns the selection, and posting is what keeps
+/// the host from being re-entered while its own frame is on the stack. The
+/// lparam carries the click's `GetMessageTime`, so a signal that arrives after a
+/// newer selection cannot move the selection back.
+const SELECTED: u32 = WM_APP + 55;
+/// Thickness of the frame that marks the selected pin, in physical pixels on
+/// screen.
 const OUTLINE_PX: f32 = 2.0;
+/// Colour of that frame: a fixed blue, deliberately not the configured theme's
+/// accent, so the selected pin reads the same whatever theme is in use.
+const SELECTION_COLOR: [f32; 4] = [0x33 as f32 / 255.0, 0x88 as f32 / 255.0, 1.0, 1.0];
 /// Entry indices of the pin context menu, in display order.
 mod pin_item {
     pub const EDIT: usize = 0;
@@ -128,18 +140,19 @@ struct Pin {
     /// True while the held shortcut is temporarily restoring interaction, so the
     /// release restores click-through without waiting for the next poll.
     temporary: bool,
-    /// True while the pointer has clicked this pin and not left it again: the pin
-    /// is outlined, and pressing the annotation shortcut here opens its session,
-    /// so a key the rest of the desktop also uses is only ever read when the user
-    /// has just put the pointer on a pin on purpose.
-    armed: bool,
+    /// True while this pin is the selected one: its frame is drawn, and pressing
+    /// the annotation shortcut opens its session. The selection is exclusive and
+    /// deliberately outlives the pointer leaving the pin — the user picks a pin
+    /// with a click, not by keeping the pointer on it — and the host clears it
+    /// when another pin is clicked, when a press lands elsewhere, on Escape, and
+    /// as soon as this pin stops being a valid target (click-through, closed, or
+    /// editing).
+    selected: bool,
     /// True while an annotation session is running for this pin, so the shortcut
     /// and the context menu cannot start a second one.
     editing: bool,
     scale: f32,
     opacity: f32,
-    /// Colour of the frame that marks an armed pin, from the configured theme.
-    accent: [f32; 4],
     /// Drop shadow drawn behind the capture. The window reserves its margin, so
     /// the pin is larger than the image whenever it is on.
     shadow: Shadow,
@@ -203,17 +216,17 @@ impl Pin {
         }
         scaled_image(&image, &bytes, scale)
     }
-    /// The bitmap this pin presents, framed while it is armed so the pointer's
-    /// target is visible before the annotation session opens. `zoom` is the scale
-    /// the bitmap itself is drawn at: the layered path composes at the pin's
-    /// zoom, the surface path composes at 100% and zooms with a transform, so the
-    /// frame is `OUTLINE_PX` physical pixels in both.
+    /// The bitmap this pin presents, framed while it is selected so the target of
+    /// the annotation shortcut is visible. `zoom` is the scale the bitmap itself
+    /// is drawn at: the layered path composes at the pin's zoom, the surface path
+    /// composes at 100% and zooms with a transform, so the frame is `OUTLINE_PX`
+    /// physical pixels in both.
     fn bitmap(
         &self,
         zoom: f32,
     ) -> std::result::Result<(ImageDescriptor, Vec<u8>), Box<dyn std::error::Error>> {
         let (image, mut bytes) = self.composed_at(zoom)?;
-        if self.armed {
+        if self.selected {
             let margin = shadow::scaled_margin(self.shadow.margin(), zoom) as i32;
             let thickness = (OUTLINE_PX / zoom).round().max(1.0) as i32;
             draw_outline(
@@ -226,7 +239,7 @@ impl Pin {
                     image.height as i32 - margin,
                 ),
                 thickness,
-                self.accent,
+                SELECTION_COLOR,
             );
         }
         Ok((image, bytes))
@@ -403,7 +416,7 @@ impl Pin {
         // A click-through pin is no longer the pointer's target, so it cannot be
         // waiting for the annotation shortcut either.
         if self.is_click_through() {
-            self.armed = false;
+            self.selected = false;
         }
         self.apply_through()
     }
@@ -475,14 +488,18 @@ impl Pin {
         self.place(previous_margin, SWP_NOACTIVATE)?;
         self.restore()
     }
-    /// Marks this pin as the pointer's target — or takes that back — and shows
-    /// the frame that says so. The frame lives in the presented bitmap, so the
-    /// pin is re-presented at once.
-    unsafe fn arm(&mut self, armed: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        if self.armed == armed {
+    /// Marks this pin as selected — or takes that back — and repaints it with the
+    /// frame that says so. The frame lives in the presented bitmap, so the pin is
+    /// re-presented at once. Exclusivity is not this method's job: it only ever
+    /// changes this pin, and the host clears the others.
+    unsafe fn set_selected(
+        &mut self,
+        selected: bool,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        if self.selected == selected {
             return Ok(());
         }
-        self.armed = armed;
+        self.selected = selected;
         self.refresh()
     }
     /// Presents the pin again: reloads the picture (an annotation session
@@ -594,8 +611,9 @@ unsafe fn open_annotation(
     }
     let mut child = spawn_pin_editor(pin, demo)?;
     pin.editing = true;
-    // The session's own window is the feedback from here on.
-    pin.arm(false)?;
+    // The session's own window is the feedback from here on, and a pin whose
+    // session is running is not a target the shortcut may pick again.
+    pin.set_selected(false)?;
     // The window handle is carried as an integer: window handles are not `Send`,
     // and the waiter only has to post one message to it.
     let control = pin.control.0 as isize;
@@ -612,6 +630,31 @@ unsafe fn open_annotation(
         }
     });
     Ok(())
+}
+/// Identity of a pin in the messages its window and the host exchange: the
+/// address of the boxed `Pin`. Pins are never moved or dropped while their window
+/// lives — closed pins stay allocated on purpose — so this stays a valid identity
+/// for the pin's whole lifetime.
+fn pin_address(pin: &Pin) -> usize {
+    pin as *const Pin as usize
+}
+/// Asks the host to make `pin` the only selected pin, for the click whose
+/// message time is `time`.
+///
+/// Posted, not sent: clearing every other pin needs the whole host, and posting
+/// keeps the host from being re-entered while one of its own frames is on the
+/// stack — the same reason the close and click-through signals are posted. The
+/// pin's address is carried as an integer because that is what identifies it to
+/// the host, and pins are boxed so the address is stable for their lifetime.
+/// The click's message time travels in the lparam so the host can tell a late
+/// signal from a click that is older than the selection already in force.
+unsafe fn post_selected(pin: &Pin, time: u32) -> Result<()> {
+    PostMessageW(
+        pin.control,
+        SELECTED,
+        WPARAM(pin_address(pin)),
+        LPARAM(time as isize),
+    )
 }
 /// Scale of the display a pin window sits on (1.0 = 96 DPI). The pin's content
 /// is physical pixels, so the shadow metrics are scaled by this to keep the same
@@ -808,6 +851,48 @@ unsafe fn send_key(
         return Err("could not inject the shortcut key".into());
     }
     Ok(())
+}
+/// A synthetic raw keyboard event, for the smoke. `WM_INPUT` carries a handle to
+/// hardware input that cannot be produced without pressing a key, so a check that
+/// must not press one hands the decoded event to the very handler the message
+/// reaches. Writing a union field is safe; only reading one needs `unsafe`.
+fn keyboard_event(virtual_key: u16) -> RAWINPUT {
+    RAWINPUT {
+        header: RAWINPUTHEADER {
+            dwType: RIM_TYPEKEYBOARD.0,
+            ..Default::default()
+        },
+        data: RAWINPUT_0 {
+            keyboard: RAWKEYBOARD {
+                VKey: virtual_key,
+                ..Default::default()
+            },
+        },
+    }
+}
+/// A synthetic raw left-button press, for the smoke. Like [`keyboard_event`], it
+/// hands the decoded event to the handler the message reaches: a press that
+/// another window consumed cannot be produced without clicking on the user's
+/// desktop, and the position and time the handler judges it by are passed
+/// alongside. Writing a union field is safe; only reading one needs `unsafe`.
+fn mouse_event() -> RAWINPUT {
+    RAWINPUT {
+        header: RAWINPUTHEADER {
+            dwType: RIM_TYPEMOUSE.0,
+            ..Default::default()
+        },
+        data: RAWINPUT_0 {
+            mouse: RAWMOUSE {
+                Anonymous: RAWMOUSE_0 {
+                    Anonymous: RAWMOUSE_0_0 {
+                        usButtonFlags: RI_MOUSE_LEFT_BUTTON_DOWN as u16,
+                        ..Default::default()
+                    },
+                },
+                ..Default::default()
+            },
+        },
+    }
 }
 /// Answers the close prompt from another thread while the pin's window
 /// procedure is blocked inside it. A modal prompt cannot be clicked by the
@@ -1104,29 +1189,15 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 WM_ERASEBKGND => return Ok(Some(LRESULT(1))),
                 WM_MOUSEACTIVATE => return Ok(Some(LRESULT(MA_NOACTIVATE as isize))),
                 WM_NCHITTEST => return Ok(Some(LRESULT(HTCAPTION as isize))),
-                // Clicking a pin makes it the pointer's target: it is framed, and
-                // the annotation shortcut opens its session while the pointer
-                // stays on it. The window never takes focus, so this click cannot
-                // be the same gesture as typing into another application.
+                // Clicking a pin makes it the selected one: the host clears every
+                // other pin, so exactly one frame is on screen and the annotation
+                // shortcut knows which pin it opens. The click is reported to the
+                // host rather than applied here because clearing the other pins
+                // needs all of them. The window never takes focus, so this click
+                // cannot be the same gesture as typing into another application.
                 WM_NCLBUTTONDOWN => {
-                    pin.arm(true)?;
+                    post_selected(pin, GetMessageTime() as u32)?;
                     return Ok(None);
-                }
-                // The frame is dropped as soon as the pointer leaves, so a pin does
-                // not stay selected behind the pointer's back.
-                WM_NCMOUSEMOVE => {
-                    let mut track = TRACKMOUSEEVENT {
-                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE | TME_NONCLIENT,
-                        hwndTrack: hwnd,
-                        dwHoverTime: 0,
-                    };
-                    let _ = TrackMouseEvent(&mut track);
-                    return Ok(None);
-                }
-                WM_NCMOUSELEAVE => {
-                    pin.arm(false)?;
-                    return Ok(Some(LRESULT(0)));
                 }
                 WM_NCLBUTTONDBLCLK => {
                     close_pin(pin)?;
@@ -1184,6 +1255,7 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 WM_CLOSE => {
                     pin.surface = None;
                     pin.closed = true;
+                    pin.selected = false;
                     let control = pin.control;
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                     DestroyWindow(hwnd)?;
@@ -1193,6 +1265,7 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 WM_DESTROY => {
                     pin.surface = None;
                     pin.closed = true;
+                    pin.selected = false;
                     PostMessageW(pin.control, CLOSED, WPARAM(0), LPARAM(0))?;
                     return Ok(Some(LRESULT(0)));
                 }
@@ -1232,9 +1305,25 @@ struct Host {
     shadow: shadow::Settings,
     /// Whether a new pin draws a shadow by default.
     shadow_default: bool,
-    /// Colour of the frame that marks the pin the pointer clicked, from the
-    /// configured theme.
-    accent: [f32; 4],
+    /// Whether the raw mouse sink is registered. It is only needed while a pin is
+    /// selected — that sink is what sees a press another window consumed — so it
+    /// is registered and dropped together with the selection, which keeps an idle
+    /// pin process out of the raw input path.
+    mouse_sink: bool,
+    /// Message time (`GetMessageTime`) of the selection input that is in force.
+    /// Raw mouse presses, the annotation shortcut, the keyboard cancel and
+    /// selection signals all carry the time of the event they belong to, and a
+    /// later one of them replaces it; anything older than this describes an
+    /// event that happened before the current selection: it must neither drop
+    /// the selection nor put an earlier pin back. Win32 message times wrap, so
+    /// they are compared with [`predates_selection`] (and [`later_than`]), never
+    /// with `<`.
+    ///
+    /// `None` until the first selectable input records a time. A bare `0` would
+    /// read as a real time, so the first click of a machine that has been up
+    /// longer than half the counter's range (`GetMessageTime` counts from boot)
+    /// would be judged older than it and rejected.
+    selected_time: Option<u32>,
     /// Smoke only: run the editor's scripted annotation session instead of an
     /// interactive one, so the shortcut's own path can be checked without a user.
     edit_demo: bool,
@@ -1290,11 +1379,10 @@ impl Host {
             closed: false,
             through: false,
             temporary: false,
-            armed: false,
+            selected: false,
             editing: false,
             scale,
             opacity: 1.0,
-            accent: self.accent,
             shadow: Shadow {
                 settings: self.shadow,
                 // The shadow follows the display the pin opens on, so it reads
@@ -1361,10 +1449,168 @@ impl Host {
             if !pin.closed {
                 pin.surface = None;
                 pin.closed = true;
+                pin.selected = false;
                 SetWindowLongPtrW(pin.hwnd, GWLP_USERDATA, 0);
                 let _ = DestroyWindow(pin.hwnd);
             }
         }
+    }
+    /// Makes one pin the only selected pin, or clears the selection when
+    /// `address` is `None`.
+    ///
+    /// The host owns this because exclusivity spans every pin: the frame has to
+    /// mark exactly one of them, and only the pin the user clicked last may answer
+    /// the annotation shortcut. `address` is the address of a boxed pin, which is
+    /// stable for the pin's whole lifetime, so a pin that was closed in the
+    /// meantime simply matches nothing.
+    unsafe fn set_selection(&mut self, control: HWND, address: Option<usize>) {
+        for pin in &mut self.pins {
+            if pin.closed {
+                continue;
+            }
+            // Somebody the pointer cannot click must never hold the selection:
+            // a click-through pin passes the press on, a pin whose annotation
+            // session is running is not a target the shortcut may pick again,
+            // and a closed one is gone. An `address` matching none of these —
+            // including a stale signal from a pin that closed or became
+            // click-through in the meantime — therefore selects nothing, rather
+            // than a pin that could not be clicked away in the first place.
+            let wanted = address.is_some_and(|address| pin_address(pin) == address)
+                && !pin.editing
+                && !pin.is_click_through();
+            if let Err(error) = pin.set_selected(wanted) {
+                snaplight_platform::native::show_error(&error.to_string());
+            }
+        }
+        self.update_mouse_sink(control);
+    }
+    /// True while some pin is selected, which is exactly when the raw mouse sink
+    /// is needed.
+    fn any_pin_selected(&self) -> bool {
+        self.pins.iter().any(|pin| pin.selected && !pin.closed)
+    }
+    /// Registers the raw mouse sink while a pin is selected and drops it again
+    /// otherwise.
+    ///
+    /// The sink is what lets a press that another window consumed be seen here at
+    /// all, and a pin process with nothing selected has no use for those presses,
+    /// so it stays out of the raw input path entirely. The sink never swallows
+    /// anything: it is registered for background delivery, not for capture, so the
+    /// application the click belongs to still receives it.
+    unsafe fn update_mouse_sink(&mut self, control: HWND) {
+        let wanted = self.any_pin_selected();
+        if wanted == self.mouse_sink {
+            return;
+        }
+        match register_mouse_sink(control, wanted) {
+            Ok(()) => self.mouse_sink = wanted,
+            // Without the sink a press elsewhere is invisible, so a selection
+            // made now could never be dropped by clicking. Keeping it would
+            // leave a frame the user cannot clear, so the selection is given up
+            // and the reason reported; the next selection tries to register
+            // again.
+            Err(error) if wanted => {
+                self.mouse_sink = false;
+                for pin in &mut self.pins {
+                    if pin.selected && !pin.closed {
+                        let _ = pin.set_selected(false);
+                    }
+                }
+                snaplight_platform::native::show_error(&format!(
+                    "选中贴图需要鼠标原始输入，但注册失败（{error}）；这次选中已取消"
+                ));
+            }
+            // Dropping the sink failed with nothing selected: the stale
+            // registration is harmless, and a press elsewhere stays unseen until
+            // the next selection tries to register again.
+            Err(error) => eprintln!("pin selection mouse sink unavailable ({error})"),
+        }
+    }
+    /// Drops the selection when a left press landed somewhere that is not a pin
+    /// the pointer can click: the desktop, another application, or a click-through
+    /// pin, whose press is passed on to what is beneath it.
+    ///
+    /// The press is judged from the position the system recorded for that
+    /// message (`GetMessagePos`), not from where the pointer happens to be when
+    /// this runs: a queued press has to be read where it was posted, or the
+    /// pointer having moved onto a pin in the meantime would keep a selection
+    /// that click never made. The caller drops presses older than the selection
+    /// before they reach here, which is what keeps the raw event of the very
+    /// click that selected a pin from undoing it.
+    unsafe fn press_outside(&mut self, control: HWND, point: POINT) {
+        if self.point_over_pin(point) {
+            return;
+        }
+        self.set_selection(control, None);
+    }
+    /// True when `point` is inside the window of a pin the pointer can click. A
+    /// click-through pin deliberately does not count: its press goes to the window
+    /// beneath, so it behaves exactly like a press outside every pin.
+    ///
+    /// The window under the point is asked for with `WindowFromPoint` and
+    /// compared against the pins' own handles; the pins' rectangles are
+    /// deliberately not used. Another window covering a pin is the window the
+    /// press lands on, so clicking there must drop the selection exactly as a
+    /// click on the desktop does — a rectangle test would keep it and read the
+    /// click as if it had hit the pin.
+    unsafe fn point_over_pin(&self, point: POINT) -> bool {
+        let window = WindowFromPoint(point);
+        if window.0.is_null() {
+            return false;
+        }
+        self.pins
+            .iter()
+            .any(|pin| !pin.closed && !pin.is_click_through() && pin.hwnd == window)
+    }
+    /// Applies one raw input event: the annotation shortcut, the keyboard cancel,
+    /// and the press that drops a selection made somewhere else.
+    ///
+    /// Split from the window procedure so the mapping from an event to what it
+    /// does lives in one place and can be driven directly. The sinks carry input
+    /// meant for the whole desktop, so everything that is not one of those three
+    /// events — including every mouse move, which is the bulk of them — is dropped
+    /// here without touching a pin.
+    unsafe fn raw_event(&mut self, control: HWND, point: POINT, time: u32, input: &RAWINPUT) {
+        if input.header.dwType == RIM_TYPEKEYBOARD.0 {
+            let keyboard = input.data.keyboard;
+            if key_pressed(keyboard.VKey, keyboard.Flags, VK_SPACE.0) {
+                if self.predates(time) {
+                    return;
+                }
+                self.selected_time = Some(time);
+                if let Err(error) = self.open_selected(control) {
+                    snaplight_platform::native::show_error(&error.to_string());
+                }
+            } else if key_pressed(keyboard.VKey, keyboard.Flags, VK_ESCAPE.0) {
+                if self.predates(time) {
+                    return;
+                }
+                self.selected_time = Some(time);
+                self.set_selection(control, None);
+            }
+        } else if input.header.dwType == RIM_TYPEMOUSE.0
+            && left_button_down(input.data.mouse.Anonymous.Anonymous.usButtonFlags)
+        {
+            // A press older than the selection in force belongs to a click that
+            // happened before it — the pin's own click posts its raw event before
+            // the selection signal, and `SELECTED` is applied later — so it must
+            // not drop that selection. Equal times are the same click and are
+            // judged on their position, which is where the press lands.
+            if self.predates(time) {
+                return;
+            }
+            // The press records its time even when it clears nothing, so a
+            // selection signal posted behind it cannot revive what it dropped.
+            self.selected_time = Some(time);
+            self.press_outside(control, point);
+        }
+    }
+    /// True when `time` predates the selection time in force. Every raw key or
+    /// press the host acts on goes through this before it changes anything, so a
+    /// late event that belongs to a click the selection already moved past
+    /// neither drops the selection nor opens the wrong pin.
+    fn predates(&self, time: u32) -> bool {
+        predates_selection(self.selected_time, time)
     }
     /// True while the configured held shortcut is down.
     fn through_held(&self) -> bool {
@@ -1460,23 +1706,28 @@ impl Host {
         }
         self.update_held_poll(control);
     }
-    /// Opens the annotation session of the armed pin under the pointer, which is
-    /// what the annotation shortcut does. Returns whether a session started: the
-    /// key is only read where the pointer has clicked a pin and not left it, so
-    /// pressing it while typing into another application cannot open a window
-    /// here.
-    unsafe fn open_armed(&mut self) -> std::result::Result<bool, Box<dyn std::error::Error>> {
-        let mut point = POINT::default();
-        GetCursorPos(&mut point)?;
-        let under = WindowFromPoint(point);
+    /// Opens the annotation session of the selected pin, which is what the
+    /// annotation shortcut does. Returns whether a session started.
+    ///
+    /// The selection deliberately outlives the pointer leaving the pin, so this
+    /// does not look at where the pointer is: the user picked the pin with a
+    /// click, and the only ways back are picking another pin, pressing elsewhere,
+    /// Escape, or the pin becoming unusable.
+    unsafe fn open_selected(
+        &mut self,
+        control: HWND,
+    ) -> std::result::Result<bool, Box<dyn std::error::Error>> {
         let Some(index) = self
             .pins
             .iter()
-            .position(|pin| pin.armed && !pin.closed && !pin.editing && pin.hwnd == under)
+            .position(|pin| pin.selected && !pin.closed && !pin.editing && !pin.is_click_through())
         else {
             return Ok(false);
         };
         open_annotation(&mut self.pins[index], self.edit_demo)?;
+        // A pin whose session just started is no longer a valid selection, so the
+        // sink that watches for a press elsewhere follows the selection here too.
+        self.update_mouse_sink(control);
         Ok(true)
     }
     /// Reloads the picture of the pin whose annotation session just ended.
@@ -1484,11 +1735,7 @@ impl Host {
         &mut self,
         address: usize,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let Some(index) = self
-            .pins
-            .iter()
-            .position(|pin| (&**pin as *const Pin) as usize == address)
-        else {
+        let Some(index) = self.pins.iter().position(|pin| pin_address(pin) == address) else {
             // The pin was closed while the session ran; the annotated picture it
             // wrote back stays on disk.
             return Ok(());
@@ -1501,15 +1748,14 @@ impl Host {
         pin.refresh()
     }
 }
-/// True when this `WM_INPUT` message is the annotation shortcut being pressed:
-/// Space, which is what the pin's context menu promises.
+/// The raw event behind one `WM_INPUT` message, or `None` when it cannot be read.
 ///
-/// The device type comes from the `RAWINPUTHEADER` that `GetRawInputData`
-/// fills in, never from the message's wparam: `WM_INPUT`'s wparam only says
-/// whether the message was delivered in the foreground or through the input
-/// sink, and those two values overlap the device types. The handle to hand to
-/// `GetRawInputData` is the lparam.
-unsafe fn annotation_shortcut(l: LPARAM) -> bool {
+/// The device type comes from the `RAWINPUTHEADER` this fills in, never from the
+/// message's wparam: `WM_INPUT`'s wparam only says whether the message was
+/// delivered in the foreground or through the input sink, and those two values
+/// overlap the device types. The handle to hand to `GetRawInputData` is the
+/// message's lparam.
+unsafe fn raw_input(l: LPARAM) -> Option<RAWINPUT> {
     let mut input = RAWINPUT::default();
     let mut size = std::mem::size_of::<RAWINPUT>() as u32;
     let read = GetRawInputData(
@@ -1519,16 +1765,44 @@ unsafe fn annotation_shortcut(l: LPARAM) -> bool {
         &mut size,
         std::mem::size_of::<RAWINPUTHEADER>() as u32,
     );
-    if read == u32::MAX || input.header.dwType != RIM_TYPEKEYBOARD.0 {
-        return false;
-    }
-    space_key_down(input.data.keyboard.VKey, input.data.keyboard.Flags)
+    (read != u32::MAX).then_some(input)
 }
-/// True when this keyboard event is Space being pressed rather than released:
-/// the press opens the session, and the release that follows must not open a
-/// second one.
-fn space_key_down(virtual_key: u16, flags: u16) -> bool {
-    virtual_key == VK_SPACE.0 && flags & RI_KEY_BREAK as u16 == 0
+/// True when this raw keyboard event is `wanted` being pressed rather than
+/// released. The two keys the pin reads are both one-shot on the press: the
+/// annotation shortcut opens one session, and the cancel drops the selection
+/// once, so the release that follows must do nothing.
+fn key_pressed(virtual_key: u16, flags: u16, wanted: u16) -> bool {
+    virtual_key == wanted && flags & RI_KEY_BREAK as u16 == 0
+}
+/// True when this raw mouse event is the left button going down: the press that
+/// decides whether a selection survives. Moves and releases carry no such flag,
+/// and they are the bulk of what the sink delivers, so they are dropped by this
+/// test before anything else looks at them.
+fn left_button_down(flags: u16) -> bool {
+    flags & RI_MOUSE_LEFT_BUTTON_DOWN as u16 != 0
+}
+/// True when Win32 message time `a` is later than `b`.
+///
+/// `GetMessageTime` counts milliseconds in a 32-bit counter that wraps about
+/// every 49.7 days, so a plain `<` would read a wrapped value as ancient and
+/// treat a current event as stale (or the other way round right after the wrap).
+/// Comparing the wrapping difference as a signed value reads the shorter way
+/// round the circle, which is what "later" means for a counter like this. Equal
+/// times are not later in either direction, which is how the raw event and the
+/// selection signal of one click compare.
+fn later_than(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
+}
+/// True when message time `time` predates the last time the host acted on a
+/// selection, so the input it describes happened before the selection in force
+/// and must neither drop it nor put an earlier pin back.
+///
+/// Nothing is recorded before the first selectable input, so that input is never
+/// stale — which is what keeps a machine already up past half the counter's
+/// range from rejecting the first click. The counter wraps, so the comparison is
+/// [`later_than`], never `<`.
+fn predates_selection(recorded: Option<u32>, time: u32) -> bool {
+    recorded.is_some_and(|recorded| later_than(recorded, time))
 }
 /// Registers the raw keyboard sink that makes the annotation shortcut possible
 /// without focus: only this process's control window receives the keys, and an
@@ -1540,6 +1814,27 @@ unsafe fn register_input_sink(hwnd: HWND) -> Result<()> {
         usUsage: 0x06,
         dwFlags: RIDEV_INPUTSINK,
         hwndTarget: hwnd,
+    }];
+    RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32)
+}
+/// Registers or drops the raw mouse sink, which is what sees a press that another
+/// window consumed.
+///
+/// It is registered for background delivery (`RIDEV_INPUTSINK`), never for
+/// capture, so it does not take the click away from the application it belongs to
+/// — it only tells this process about it. Dropping it needs no target window: the
+/// system removes the registration for the null one.
+unsafe fn register_mouse_sink(hwnd: HWND, listen: bool) -> Result<()> {
+    let devices = [RAWINPUTDEVICE {
+        usUsagePage: 0x01,
+        // Generic desktop controls / mouse.
+        usUsage: 0x02,
+        dwFlags: if listen {
+            RIDEV_INPUTSINK
+        } else {
+            RIDEV_REMOVE
+        },
+        hwndTarget: if listen { hwnd } else { HWND::default() },
     }];
     RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32)
 }
@@ -1583,19 +1878,45 @@ unsafe extern "system" fn control_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                     PostQuitMessage(0);
                 } else {
                     host.update_held_poll(hwnd);
+                    // The closed pin may have been the selected one.
+                    host.update_mouse_sink(hwnd);
+                }
+                return LRESULT(0);
+            }
+            SELECTED => {
+                // A pin was clicked; the selection moves to it and nothing else
+                // stays selected. The signal carries the pin's address in the
+                // wparam because the pin cannot clear its siblings itself, and the
+                // click's message time in the lparam so a signal that arrives
+                // after a newer selection cannot put the older pin back.
+                let time = l.0 as u32;
+                // Equal times are the same click — the press that started it and
+                // this signal — so only a genuinely older signal is dropped.
+                if !predates_selection(host.selected_time, time) {
+                    host.selected_time = Some(time);
+                    host.set_selection(hwnd, Some(w.0));
                 }
                 return LRESULT(0);
             }
             WM_INPUT => {
-                // Pins never take focus, so the annotation shortcut arrives as raw
-                // input rather than a key message: a key message would be delivered
-                // to whatever application is in front instead.
-                if annotation_shortcut(l) {
-                    match host.open_armed() {
-                        Ok(true) => {}
-                        Ok(false) => {}
-                        Err(e) => snaplight_platform::native::show_error(&e.to_string()),
-                    }
+                // Pins never take focus, so the annotation shortcut, the keyboard
+                // cancel and the press that lands elsewhere all arrive as raw
+                // input: a key or mouse message would be delivered to whatever
+                // application is in front instead. The click's own screen
+                // position and time come from the message, not from the pointer
+                // now: a queued press has to be read where it was posted, and the
+                // time orders it against the selection it might otherwise drop.
+                // `GetMessagePos` packs the two signed 16-bit screen coordinates
+                // into one word, so each half is sign-extended again — a monitor
+                // left of or above the primary one has negative coordinates.
+                let position = GetMessagePos();
+                let point = POINT {
+                    x: (position as u16 as i16) as i32,
+                    y: ((position >> 16) as u16 as i16) as i32,
+                };
+                let time = GetMessageTime() as u32;
+                if let Some(input) = raw_input(l) {
+                    host.raw_event(hwnd, point, time, &input);
                 }
                 return LRESULT(0);
             }
@@ -1616,8 +1937,10 @@ unsafe extern "system" fn control_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
             }
             HELD_SYNC => {
                 // A pin changed its click-through state from its own window
-                // procedure; the poll follows the pins, not the caller.
+                // procedure; the poll follows the pins, not the caller. A pin that
+                // went click-through is no longer a valid selection either.
                 host.update_held_poll(hwnd);
+                host.update_mouse_sink(hwnd);
                 return LRESULT(0);
             }
             WM_HOTKEY => {
@@ -1757,9 +2080,9 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             held_timer: None,
             shadow: shadow::Settings::from_config(&config),
             shadow_default: config.pin_shadow,
-            // Same accent the editor's selection chrome uses, so the frame that
-            // marks a clicked pin reads as the same idea.
-            accent: parse_hex_color(&config.theme.accent).unwrap_or([0.2, 0.53, 1.0, 1.0]),
+            // Nothing is selected yet, so the raw mouse sink is not registered.
+            mouse_sink: false,
+            selected_time: None,
             edit_demo: false,
         });
         SetWindowLongPtrW(control, GWLP_USERDATA, (&mut *host as *mut Host) as isize);
@@ -1883,10 +2206,15 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             // presses the row while this thread sits inside the menu's modal
             // loop.
             let entries = menu_entries(&host.pins[0].restore_hotkey, true);
-            let pin_address = host.pins[0].hwnd.0 as usize;
+            let pin_window_address = host.pins[0].hwnd.0 as usize;
             let control_address = control.0 as usize;
             let worker = std::thread::spawn(move || {
-                click_pin_menu(pin_address, control_address, pin_item::SHADOW, entries)
+                click_pin_menu(
+                    pin_window_address,
+                    control_address,
+                    pin_item::SHADOW,
+                    entries,
+                )
             });
             SendMessageW(host.pins[0].hwnd, WM_NCRBUTTONUP, WPARAM(0), LPARAM(0));
             worker
@@ -2251,9 +2579,11 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             // the pin's files, writes the annotated picture back, and the pin
             // picks that up when that process exits. The demo flag makes the
             // session annotate one rectangle and exit, so the handoff is checked
-            // here without a user. The pin is armed the way clicking it arms it.
-            host.pins[0].arm(true)?;
-            host.pins[0].arm(false)?;
+            // here without a user. The pin is selected the way clicking it selects
+            // it, and the session has to drop that selection: it is no longer a
+            // pin the shortcut may pick.
+            let selected = pin_address(&host.pins[0]);
+            host.set_selection(control, Some(selected));
             let picture = host.pins[0].picture_rect();
             if (picture.left, picture.top) != (requested.x, requested.y) {
                 return Err(format!(
@@ -2263,8 +2593,10 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
             open_annotation(&mut host.pins[0], true)?;
-            if !host.pins[0].editing || host.pins[0].armed {
-                return Err("starting a session did not mark the pin as busy and unarmed".into());
+            if !host.pins[0].editing || host.pins[0].selected {
+                return Err(
+                    "starting a session did not mark the pin as busy and unselected".into(),
+                );
             }
             let mut waited = 0;
             while host.pins[0].editing && waited < 30_000 {
@@ -2291,21 +2623,30 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
             // The other way into a session is the annotation shortcut, which runs
             // through raw keyboard input: nothing that passes values around can
-            // cover it, so the key is pressed for real over an armed pin and the
-            // session has to start on its own. Opt-in, like the held shortcut,
-            // because it presses a key and moves the pointer while the user may be
-            // working somewhere else.
+            // cover it, so the key is pressed for real after a pin was selected
+            // and the pointer has left it — and that press must still open this
+            // pin's session. Opt-in, like the held shortcut, because it presses a
+            // key and moves the pointer while the user may be working somewhere
+            // else.
             if std::env::var_os("SNAPLIGHT_SMOKE_PIN_KEY").is_some() {
                 // The shortcut's own path is what is under test, so it runs the
                 // editor's scripted session: an interactive one would wait here
                 // for a user who is not there.
                 host.edit_demo = true;
-                host.pins[0].arm(true)?;
-                let mut rect = RECT::default();
-                GetWindowRect(host.pins[0].hwnd, &mut rect)?;
                 let mut previous = POINT::default();
                 GetCursorPos(&mut previous)?;
-                SetCursorPos((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)?;
+                post_selected(&host.pins[0], 1_000)?;
+                pump_messages(20);
+                if !host.pins[0].selected {
+                    return Err("the pin was not selected before the shortcut was pressed".into());
+                }
+                // Away from every pin: the selection has to outlive that, and the
+                // key is what opens the session from there.
+                let away = POINT { x: 10, y: 10 };
+                SetCursorPos(away.x, away.y)?;
+                if host.point_over_pin(away) {
+                    return Err("the shortcut check cannot move the pointer off every pin".into());
+                }
                 send_key(VK_SPACE, true)?;
                 send_key(VK_SPACE, false)?;
                 let mut started = false;
@@ -2388,8 +2729,15 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
             // With the switch off the pin closes at once. A prompt that appeared
             // anyway is cancelled by the answering thread, so the check below
-            // fails instead of hanging on a prompt nobody answers.
-            host.open(control, path, doc, ScreenPoint { x: 400, y: 90 })?;
+            // fails instead of hanging on a prompt nobody answers. The files are
+            // passed as copies: the selection checks further down open two more
+            // pins on the same pinned picture.
+            host.open(
+                control,
+                path.clone(),
+                doc.clone(),
+                ScreenPoint { x: 400, y: 90 },
+            )?;
             // A new pin follows the configured default, which the shadow check
             // switched off: it must have no margin, and its window is then the
             // capture itself again.
@@ -2423,6 +2771,263 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
             join_answer(worker)?;
 
+            // Selection: clicking a pin makes it the only selected one, the frame
+            // is a fixed blue whatever the theme is, the pointer leaving does not
+            // drop it, and the annotation shortcut opens the selected pin from
+            // there. The click is delivered as the posted signal the pin's window
+            // procedure sends — that is the path a real click takes, from the
+            // window procedure to the host — and the press of a click that landed
+            // elsewhere is handed in as a position, because moving the user's
+            // cursor belongs to the opt-in checks.
+            //
+            // A previous opt-in check (SNAPLIGHT_SMOKE_PIN_KEY) may have moved the
+            // real cursor, whose WM_INPUT set selected_time to the system clock.
+            // The posted signals below carry timestamps from their own synthetic
+            // timeline, so that stale stamp would reject them as older events.
+            // Start the timeline clean here; the product's own time logic is
+            // untouched.
+            host.selected_time = None;
+            let upper = host.pins.len();
+            host.open(
+                control,
+                path.clone(),
+                doc.clone(),
+                ScreenPoint { x: 60, y: 60 },
+            )?;
+            let lower = host.pins.len();
+            host.open(
+                control,
+                path.clone(),
+                doc.clone(),
+                ScreenPoint { x: 60, y: 320 },
+            )?;
+            for index in [upper, lower] {
+                if host.pins[index].margin() != 0 {
+                    return Err(
+                        "a selection pin has a shadow margin; the frame check reads the picture edge"
+                            .into(),
+                    );
+                }
+            }
+            let frame_blue = |pixel: (u8, u8, u8)| pixel.2 > 200 && pixel.1 > 100 && pixel.0 < 90;
+            let mut upper_rect = RECT::default();
+            GetWindowRect(host.pins[upper].hwnd, &mut upper_rect)?;
+            let upper_frame = (
+                upper_rect.left + 1,
+                upper_rect.top + (upper_rect.bottom - upper_rect.top) / 2,
+            );
+            let mut lower_rect = RECT::default();
+            GetWindowRect(host.pins[lower].hwnd, &mut lower_rect)?;
+            let lower_frame = (
+                lower_rect.left + 1,
+                lower_rect.top + (lower_rect.bottom - lower_rect.top) / 2,
+            );
+            let t_upper = 2_000u32;
+            let t_lower = 3_000u32;
+            post_selected(&host.pins[upper], t_upper)?;
+            pump_messages(20);
+            if !host.pins[upper].selected || host.pins[lower].selected {
+                return Err("clicking a pin did not select exactly that pin".into());
+            }
+            if !host.mouse_sink {
+                return Err("the raw mouse sink is not registered while a pin is selected".into());
+            }
+            // `point_over_pin` asks the system which window is under the point,
+            // so the pin has to be that window at its own centre, and a point on
+            // the desktop must not count.
+            let upper_center = POINT {
+                x: upper_rect.left + (upper_rect.right - upper_rect.left) / 2,
+                y: upper_rect.top + (upper_rect.bottom - upper_rect.top) / 2,
+            };
+            if !host.point_over_pin(upper_center) {
+                return Err("the pin is not the window at its own centre".into());
+            }
+            if host.point_over_pin(POINT { x: 2, y: 2 }) {
+                return Err("an empty point counted as being over a pin".into());
+            }
+            // A raw press older than the selection describes a click that landed
+            // before it; it must not drop the selection the pointer just made.
+            host.raw_event(control, POINT { x: 2, y: 2 }, t_upper - 1, &mouse_event());
+            if !host.pins[upper].selected {
+                return Err("a raw press older than the selection dropped it".into());
+            }
+            require_pixel(
+                upper_frame.0,
+                upper_frame.1,
+                "the selected pin is not framed in the fixed blue",
+                frame_blue,
+            )?;
+            require_pixel(
+                lower_frame.0,
+                lower_frame.1,
+                "a pin that was not clicked drew the selection frame",
+                |pixel| !frame_blue(pixel),
+            )?;
+            // The pointer leaving the pin — the message Windows sends when it
+            // does — must not drop the selection or its frame.
+            SendMessageW(host.pins[upper].hwnd, WM_NCMOUSELEAVE, WPARAM(0), LPARAM(0));
+            if !host.pins[upper].selected {
+                return Err("leaving the pin dropped the selection".into());
+            }
+            require_pixel(
+                upper_frame.0,
+                upper_frame.1,
+                "the frame went away although the pin is still selected",
+                frame_blue,
+            )?;
+            // Selecting another pin takes the selection away from the first one,
+            // frame included.
+            post_selected(&host.pins[lower], t_lower)?;
+            pump_messages(20);
+            if host.pins[upper].selected || !host.pins[lower].selected {
+                return Err(
+                    "selecting a second pin did not take the selection away from the first".into(),
+                );
+            }
+            require_pixel(
+                lower_frame.0,
+                lower_frame.1,
+                "the newly selected pin is not framed",
+                frame_blue,
+            )?;
+            require_pixel(
+                upper_frame.0,
+                upper_frame.1,
+                "the pin that lost the selection kept its frame",
+                |pixel| !frame_blue(pixel),
+            )?;
+            // A selection signal older than the current one — a click queued
+            // behind the newer one, or one that arrived late — must not put the
+            // earlier pin back.
+            post_selected(&host.pins[upper], t_upper)?;
+            pump_messages(20);
+            if host.pins[upper].selected || !host.pins[lower].selected {
+                return Err("a stale selection signal moved the selection back".into());
+            }
+            // Escape drops the selection through the same raw input path the
+            // keyboard sink delivers keys on.
+            host.raw_event(
+                control,
+                POINT { x: 2, y: 2 },
+                t_lower + 1,
+                &keyboard_event(VK_ESCAPE.0),
+            );
+            if host.pins.iter().any(|pin| pin.selected) {
+                return Err("Escape did not drop the selection".into());
+            }
+            if host.mouse_sink {
+                return Err("the raw mouse sink stayed registered with nothing selected".into());
+            }
+            // A press where no pin is clears it as well, through the raw path a
+            // real click takes: its recorded position is on the desktop.
+            post_selected(&host.pins[upper], 4_000)?;
+            pump_messages(20);
+            host.raw_event(control, POINT { x: 2, y: 2 }, 4_100, &mouse_event());
+            if host.pins.iter().any(|pin| pin.selected) {
+                return Err("a press outside every pin kept the selection".into());
+            }
+            // Invalid selections select nothing: an address matching no pin, and
+            // a pin the pointer can no longer click.
+            host.set_selection(control, Some(usize::MAX));
+            if host.pins.iter().any(|pin| pin.selected) {
+                return Err("an address matching no pin selected one".into());
+            }
+            host.pins[upper].through = true;
+            host.set_selection(control, Some(pin_address(&host.pins[upper])));
+            if host.pins.iter().any(|pin| pin.selected) {
+                return Err("a click-through pin was selected".into());
+            }
+            if host.mouse_sink {
+                return Err("the raw mouse sink stayed registered with nothing selected".into());
+            }
+            host.pins[upper].through = false;
+            host.raw_event(
+                control,
+                POINT { x: 2, y: 2 },
+                4_200,
+                &keyboard_event(VK_SPACE.0),
+            );
+            if host.pins.iter().any(|pin| pin.editing) {
+                return Err(
+                    "the annotation shortcut started a session with nothing selected".into(),
+                );
+            }
+            // With a selection the shortcut opens that pin's session even though
+            // the pointer left it, which is what the 空格 hint on the 编辑 entry
+            // promises. The session runs the editor's scripted mode, so no window
+            // waits for a user.
+            host.edit_demo = true;
+            post_selected(&host.pins[lower], 6_000)?;
+            pump_messages(20);
+            SendMessageW(host.pins[lower].hwnd, WM_NCMOUSELEAVE, WPARAM(0), LPARAM(0));
+            if !host.pins[lower].selected {
+                return Err("leaving the pin dropped the selection before the shortcut ran".into());
+            }
+            host.raw_event(
+                control,
+                POINT { x: 2, y: 2 },
+                6_100,
+                &keyboard_event(VK_SPACE.0),
+            );
+            if !host.pins[lower].editing {
+                return Err(
+                    "the annotation shortcut did not open the selected pin's session".into(),
+                );
+            }
+            if host.pins.iter().any(|pin| pin.selected) {
+                return Err("a pin whose annotation session started stayed selected".into());
+            }
+            let mut waited = 0;
+            while host.pins[lower].editing && waited < 30_000 {
+                pump_messages(20);
+                waited += 20;
+            }
+            if host.pins[lower].editing {
+                return Err("the selected pin's annotation session did not finish".into());
+            }
+            // Escape and a press elsewhere record their own time, so a selection
+            // signal posted behind them — one that was queued before the event
+            // that dropped the selection — must not revive the pin.
+            post_selected(&host.pins[upper], 7_000)?;
+            pump_messages(20);
+            if !host.pins[upper].selected {
+                return Err("the selection for the stale-Escape check did not take".into());
+            }
+            host.raw_event(
+                control,
+                POINT { x: 2, y: 2 },
+                7_100,
+                &keyboard_event(VK_ESCAPE.0),
+            );
+            if host.pins.iter().any(|pin| pin.selected) {
+                return Err("Escape did not drop the selection before the stale signal".into());
+            }
+            post_selected(&host.pins[upper], 7_050)?;
+            pump_messages(20);
+            if host.pins[upper].selected {
+                return Err(
+                    "a selection signal older than the Escape revived the selection".into(),
+                );
+            }
+            post_selected(&host.pins[upper], 8_000)?;
+            pump_messages(20);
+            if !host.pins[upper].selected {
+                return Err("the selection for the stale-press check did not take".into());
+            }
+            host.raw_event(control, POINT { x: 2, y: 2 }, 8_100, &mouse_event());
+            if host.pins.iter().any(|pin| pin.selected) {
+                return Err("a press outside every pin kept the selection".into());
+            }
+            post_selected(&host.pins[upper], 8_050)?;
+            pump_messages(20);
+            if host.pins[upper].selected {
+                return Err("a selection signal older than a press revived the selection".into());
+            }
+            println!(
+                "pin selection: one blue frame on the {} backend, kept while the pointer left and against a stale press, dropped by a press elsewhere, Escape and a stale address",
+                if use_gpu { "composition" } else { "layered" }
+            );
+
             match config_snapshot {
                 Some(bytes) => snaplight_platform::atomic_write(&config_path, &bytes)?,
                 None => {
@@ -2438,7 +3043,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     "pin-smoke-low-memory-result.json"
                 }),
                 &serde_json::to_vec(
-                    &serde_json::json!({"composition":use_gpu,"layered_transition":true,"scale":true,"opacity":true,"middle_reset":true,"menu_destroy":true,"menu_reset":true,"close_confirm":true,"held_interaction":true,"pin_shadow":true,"shadow_geometry":true,"shadow_pixels":true,"shadow_menu":true,"shadow_toggle":true,"shadow_reload":true,"shadow_default":true,"position":[placed.left,placed.top],"capture":[placed.left+margin,placed.top+margin],"shadow_margin":margin,"size":[placed.right-placed.left,placed.bottom-placed.top]}),
+                    &serde_json::json!({"composition":use_gpu,"layered_transition":true,"scale":true,"opacity":true,"middle_reset":true,"menu_destroy":true,"menu_reset":true,"close_confirm":true,"held_interaction":true,"pin_shadow":true,"shadow_geometry":true,"shadow_pixels":true,"shadow_menu":true,"shadow_toggle":true,"shadow_reload":true,"shadow_default":true,"selection_single":true,"selection_frame":true,"selection_leave":true,"selection_clear":true,"selection_shortcut":true,"selection_timing":true,"selection_invalid":true,"position":[placed.left,placed.top],"capture":[placed.left+margin,placed.top+margin],"shadow_margin":margin,"size":[placed.right-placed.left,placed.bottom-placed.top]}),
                 )?,
             )?;
         } else {
@@ -2547,11 +3152,42 @@ mod tests {
     /// open a session, and the release that follows must not open a second one.
     #[test]
     fn the_annotation_shortcut_is_the_spacebar_press() {
-        assert!(space_key_down(VK_SPACE.0, 0));
-        assert!(!space_key_down(VK_SPACE.0, RI_KEY_BREAK as u16));
+        assert!(key_pressed(VK_SPACE.0, 0, VK_SPACE.0));
+        assert!(!key_pressed(VK_SPACE.0, RI_KEY_BREAK as u16, VK_SPACE.0));
         // Any other key is ignored, pressed or released.
-        assert!(!space_key_down(VK_RETURN.0, 0));
-        assert!(!space_key_down(VK_RETURN.0, RI_KEY_BREAK as u16));
+        assert!(!key_pressed(VK_RETURN.0, 0, VK_SPACE.0));
+        assert!(!key_pressed(VK_RETURN.0, RI_KEY_BREAK as u16, VK_SPACE.0));
+    }
+    /// Message times order a raw press against the selection it might drop, and
+    /// `GetMessageTime`'s counter wraps, so "later" has to read the shorter way
+    /// round the circle rather than a plain `<`.
+    #[test]
+    fn the_message_time_comparison_survives_the_counter_wrapping() {
+        assert!(later_than(10, 5));
+        assert!(!later_than(5, 10));
+        // Equal times are the same click: neither is later.
+        assert!(!later_than(5, 5));
+        // Just after the wrap is later than just before it.
+        assert!(later_than(1, u32::MAX));
+        assert!(!later_than(u32::MAX, 1));
+    }
+    /// Nothing is recorded before the first selectable input, so that input can
+    /// never be stale: `GetMessageTime` counts from boot, so a machine up for
+    /// longer than half the counter's range hands out a first time past
+    /// `0x8000_0000`, which a default of `0` would have read as ancient. Once a
+    /// time is recorded, only a genuinely older one — wrapped counter or not —
+    /// is stale, and an equal one is the same click.
+    #[test]
+    fn the_first_selection_time_is_never_stale() {
+        assert!(!predates_selection(None, 0x8000_0001));
+        // Which is what a default of `0` would have wrongly rejected.
+        assert!(predates_selection(Some(0), 0x8000_0001));
+        assert!(predates_selection(Some(0x8000_0001), 0x8000_0000));
+        assert!(!predates_selection(Some(0x8000_0001), 0x8000_0002));
+        assert!(predates_selection(Some(1), u32::MAX));
+        assert!(!predates_selection(Some(u32::MAX), 1));
+        // Equal times are the same click: a press and its selection signal.
+        assert!(!predates_selection(Some(5), 5));
     }
     /// The shadow entry has to read as the action it performs, so a pin without
     /// a shadow offers to turn one on.
