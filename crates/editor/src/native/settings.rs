@@ -6,16 +6,18 @@
 //! `super::tool_windows` 的公开接口协作。
 
 use snaplight_domain::{
-    format_hex_color, parse_held_shortcut, parse_hex_color, parse_hotkey, Config, Envelope,
-    PinCommand, Theme, Tool, MAX_FONT_SIZE, MAX_PIN_SHADOW_BLUR, MAX_PIN_SHADOW_OFFSET,
-    MIN_FONT_SIZE,
+    format_hex_color, parse_held_shortcut, parse_hex_color, parse_hotkey, Config, Theme, Tool,
+    MAX_FONT_SIZE, MAX_PIN_SHADOW_BLUR, MAX_PIN_SHADOW_OFFSET, MIN_FONT_SIZE,
 };
 use snaplight_platform::{capture_dir, data_dir, load_window_state, save_config};
 use snaplight_ui::{ComponentHandle, ModelRc, VecModel};
-use std::{io::Write, path::PathBuf};
+use std::path::PathBuf;
 use windows::{
-    core::{w, Error, HSTRING},
-    Win32::{Foundation::HWND, UI::WindowsAndMessaging::SW_SHOWNORMAL},
+    core::{w, Error, HSTRING, PCWSTR},
+    Win32::{
+        Foundation::{CloseHandle, HWND},
+        UI::WindowsAndMessaging::{FindWindowW, SW_SHOWNORMAL},
+    },
 };
 
 use super::tool_windows::{apply_icon_when_ready, remember_position, restore_position};
@@ -112,30 +114,159 @@ fn clamp_shadow_metric(value: i32, max: u32) -> u32 {
     value.clamp(0, max as i32) as u32
 }
 
-/// Tells the pin process that the configuration changed.
-///
-/// Pins live in their own process and only read the configuration file, so
-/// nothing would reach a pin that is already on screen without a word from
-/// here. A settings window is launched by the core exactly like a capture
-/// editor is, which makes its standard output the channel the core forwards
-/// `PinCommand`s over.
-fn tell_pins_to_reload() {
-    let line = match serde_json::to_string(&Envelope::new(PinCommand::Reload)) {
-        Ok(line) => line,
-        Err(error) => {
-            eprintln!("could not encode the pin reload: {error}");
+/// Colour labels are bold when the text differs from the loaded value, even if
+/// it is only a different spelling of the same colour.
+fn same_color(a: &str, b: &str) -> bool {
+    match (parse_hex_color(a), parse_hex_color(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => a.trim().eq_ignore_ascii_case(b.trim()),
+    }
+}
+
+/// Shortcut labels use the stored spelling, so `ctrl+shift+a` and
+/// `Ctrl+Shift+A` are the same value.
+fn same_hotkey(a: &str, b: &str) -> bool {
+    let canonical = |text: &str| parse_hotkey(text.trim()).map(|key| key.canonical()).ok();
+    match (canonical(a), canonical(b)) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(&b),
+        _ => a.trim().eq_ignore_ascii_case(b.trim()),
+    }
+}
+
+fn same_held_shortcut(a: &str, b: &str) -> bool {
+    let canonical = |text: &str| {
+        parse_held_shortcut(text.trim())
+            .ok()
+            .flatten()
+            .map(|key| key.canonical())
+    };
+    match (canonical(a), canonical(b)) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(&b),
+        _ => a.trim().eq_ignore_ascii_case(b.trim()),
+    }
+}
+
+/// Membership only: the paint toggles cannot reorder the lists.
+fn tool_membership(tools: &[Tool]) -> Vec<i32> {
+    let mut ids: Vec<i32> = tools.iter().map(|tool| tool.id()).collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// Refreshes the bold markers. The baseline is the built-in default
+/// configuration, so a customised value stays emphasised across sessions until
+/// it is reset to its default; the markers are computed on open as well as
+/// after every save.
+fn refresh_changed_markers(ui: &snaplight_ui::Settings, defaults: &Config) {
+    ui.set_changed_gpu_pins(ui.get_gpu_pins() != defaults.gpu_pins);
+    ui.set_changed_pin_close_confirm(ui.get_pin_close_confirm() != defaults.pin_close_confirm);
+    ui.set_changed_tool_order(
+        snaplight_ui::tool_order(&ui.get_tools())
+            != defaults
+                .tools
+                .iter()
+                .map(|tool| tool.id())
+                .collect::<Vec<_>>(),
+    );
+    ui.set_changed_background(same_color(
+        &ui.get_background_value(),
+        &defaults.theme.background,
+    ));
+    ui.set_changed_foreground(same_color(
+        &ui.get_foreground_value(),
+        &defaults.theme.foreground,
+    ));
+    ui.set_changed_accent(same_color(&ui.get_accent_value(), &defaults.theme.accent));
+    ui.set_changed_pin_shadow(ui.get_pin_shadow() != defaults.pin_shadow);
+    ui.set_changed_shadow_blur(
+        ui.get_pin_shadow_blur() != defaults.pin_shadow_blur.min(MAX_PIN_SHADOW_BLUR) as i32,
+    );
+    ui.set_changed_shadow_offset(
+        ui.get_pin_shadow_offset() != defaults.pin_shadow_offset.min(MAX_PIN_SHADOW_OFFSET) as i32,
+    );
+    ui.set_changed_shadow_opacity(
+        ui.get_pin_shadow_opacity() != defaults.pin_shadow_opacity.min(100) as i32,
+    );
+    ui.set_changed_capture_hotkey(!same_hotkey(
+        &ui.get_capture_hotkey_value(),
+        &defaults.capture_hotkey,
+    ));
+    ui.set_changed_restore_hotkey(!same_hotkey(
+        &ui.get_restore_hotkey_value(),
+        &defaults.restore_hotkey,
+    ));
+    ui.set_changed_through_hotkey(!same_held_shortcut(
+        &ui.get_through_hotkey_value(),
+        &defaults.through_hotkey,
+    ));
+    ui.set_changed_stroke(ui.get_stroke() != defaults.stroke_width as i32);
+    ui.set_changed_block(ui.get_block() != defaults.mosaic_block as i32);
+    ui.set_changed_stroke_color(same_color(
+        &ui.get_stroke_color_value(),
+        &defaults.stroke_color,
+    ));
+    ui.set_changed_fill_color(same_color(&ui.get_fill_color_value(), &defaults.fill_color));
+    ui.set_changed_fill_opacity(ui.get_fill_opacity() != defaults.fill_opacity as i32);
+    ui.set_changed_font_size(ui.get_font_size() != defaults.font_size as i32);
+    let (stroke, fill) = snaplight_ui::paint_tools(&ui.get_paint_tools());
+    ui.set_changed_paint_tools(
+        tool_membership(&stroke) != tool_membership(&defaults.stroke_tools)
+            || tool_membership(&fill) != tool_membership(&defaults.fill_tools),
+    );
+    ui.set_changed_detect_mode(
+        snaplight_ui::window_detect_from_index(ui.get_detect_mode()) != defaults.window_detect,
+    );
+    ui.set_changed_capture_dir(
+        capture_dir_from_field(&ui.get_capture_dir_value()) != capture_dir(defaults),
+    );
+}
+
+/// Points at the settings page that is already open: the page is brought to the
+/// front and shaken for a moment. The open instance does not publish its window
+/// handle, so the page is found by the title that `SETTINGS_TITLE` keeps in step
+/// with the Slint layout. The short retry covers the moment before the first
+/// window has been created.
+fn alert_open_settings() {
+    let title: Vec<u16> = snaplight_ui::SETTINGS_TITLE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        for _ in 0..40 {
+            let hwnd = match FindWindowW(None, PCWSTR(title.as_ptr())) {
+                Ok(hwnd) if !hwnd.0.is_null() => hwnd,
+                _ => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+            };
+            snaplight_platform::native::alert_window(
+                hwnd,
+                snaplight_platform::native::ALERT_DURATION,
+            );
             return;
         }
-    };
-    let printed = writeln!(std::io::stdout(), "{line}").and_then(|()| std::io::stdout().flush());
-    if let Err(error) = printed {
-        // The settings are saved either way: pins that are already open keep
-        // the shadow they have, and the next pin gets the new one.
-        eprintln!("could not tell the pin process about the new settings: {error}");
     }
 }
 
 pub(super) fn run(config: Config) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // Only one settings page may exist. The core already refuses to spawn a
+    // second one, but scripts and manual runs start the editor directly; those
+    // bring the open page forward and shake it instead of stacking another copy
+    // of the fixed layout.
+    let Some(instance) = snaplight_platform::native::singleton("Local\\Snaplight.Settings.v1")?
+    else {
+        // Two overlapping shakes would restore different origins, so only one
+        // alert may run at a time; the name is shared with the core's tray path.
+        let Some(guard) =
+            snaplight_platform::native::singleton("Local\\Snaplight.Settings.Alert.v1")?
+        else {
+            return Ok(());
+        };
+        alert_open_settings();
+        let _ = unsafe { CloseHandle(guard) };
+        return Ok(());
+    };
     let ui = snaplight_ui::settings(&config)?;
     restore_position(ui.window(), load_window_state().settings);
     ui.set_capture_dir_value(capture_dir(&config).to_string_lossy().into_owned().into());
@@ -155,6 +286,9 @@ pub(super) fn run(config: Config) -> std::result::Result<(), Box<dyn std::error:
     ui.set_captures(ModelRc::new(VecModel::from(capture_items(
         &capture_dir_from_field(&ui.get_capture_dir_value()),
     ))));
+    // Customised values are bold from the moment the page opens, not only
+    // after the first edit in this window.
+    refresh_changed_markers(&ui, &Config::default());
     let weak = ui.as_weak();
     ui.on_open_data_dir(move || {
         let Some(ui) = weak.upgrade() else {
@@ -263,6 +397,9 @@ pub(super) fn run(config: Config) -> std::result::Result<(), Box<dyn std::error:
         let Some(ui) = weak.upgrade() else {
             return;
         };
+        // Bold marks values that differ from the built-in defaults, including
+        // edits that fail validation below; the status line explains a failure.
+        refresh_changed_markers(&ui, &Config::default());
         let mut c = config.clone();
         c.stroke_width = ui.get_stroke() as f32;
         c.mosaic_block = ui.get_block() as u32;
@@ -343,13 +480,11 @@ pub(super) fn run(config: Config) -> std::result::Result<(), Box<dyn std::error:
                 ui.set_captures(ModelRc::new(VecModel::from(capture_items(
                     &capture_dir_from_field(&ui.get_capture_dir_value()),
                 ))));
-                // Pins run in their own process, which reads the configuration
-                // file. The shadow is presentation, so a change there has to
-                // reach pins that are already on screen instead of waiting for
-                // the next one; this channel is how core forwards commands to
-                // that process.
-                tell_pins_to_reload();
-                ui.set_status("已保存".into());
+                // The core re-registers the capture shortcut and forwards a
+                // reload to the pin process, so neither process has to be
+                // restarted for a shortcut or shadow change to apply.
+                snaplight_platform::native::notify_config_reload();
+                ui.set_status("已自动保存".into());
             }
             Err(e) => ui.set_status(e.to_string().into()),
         }
@@ -358,5 +493,8 @@ pub(super) fn run(config: Config) -> std::result::Result<(), Box<dyn std::error:
     apply_icon_when_ready(snaplight_ui::SETTINGS_TITLE);
     ui.run()?;
     remember_position(true, ui.window());
+    // The name only has to live as long as the page does; releasing it here
+    // makes the next launch open a window immediately.
+    let _ = unsafe { CloseHandle(instance) };
     Ok(())
 }

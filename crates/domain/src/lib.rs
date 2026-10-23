@@ -882,9 +882,10 @@ pub enum PinCommand {
         screen: ScreenPoint,
     },
     CloseAll,
-    /// Re-reads the configuration and reapplies the settings that are read live
-    /// (the pin shadow and its metrics). The settings window sends this after a
-    /// save so a change reaches pins that are already on screen.
+    /// Re-reads the configuration and reapplies the settings that are read live:
+    /// the restore and held shortcuts, and the pin shadow and its metrics. The
+    /// core sends this after the settings window saves, so a change reaches
+    /// pins that are already on screen without restarting the process.
     Reload,
     Shutdown,
 }

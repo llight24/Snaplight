@@ -1,9 +1,11 @@
 //! Long capture (plan B09): the user scrolls the selected region by hand while
-//! the editor stitches every new row into one tall image, then trims the last
-//! screen and turns the result into a document of its own.
+//! a worker thread stitches every new row into one tall image, then trims the
+//! last screen and turns the result into a document of its own.
 //!
-//! The session is driven by a timer on the overlay window instead of a blocking
-//! loop: the overlay is hidden, so the wheel keeps reaching the content
+//! The pixels are handled on a worker thread: a `RegionGrabber` blocks on
+//! Desktop Duplication when the desktop is idle, and the UI thread only polls
+//! key state, copies the cached thumbnail into the bird's-eye panel and sends
+//! commands. The overlay is hidden, so the wheel keeps reaching the content
 //! underneath, and Esc and Enter are polled from the keyboard state because no
 //! Snaplight window holds the focus while the user scrolls. The region is framed
 //! by a window whose middle is a hole, so the frame can be dragged without
@@ -15,12 +17,21 @@
 //! controls (see `Canvas::action`).
 
 use super::*;
-use snaplight_domain::long_capture::{Direction, Frame, LongCapture, Step};
+use snaplight_domain::long_capture::{
+    Bands, Direction, Frame, LongCapture, Step, MAX_BYTES, MAX_HEIGHT, MIN_OVERLAP,
+};
+use snaplight_render_win::{GrabBackend, RegionGrabber};
+use std::sync::atomic::{AtomicU8, Ordering};
 
-/// How often the region is sampled, in milliseconds.
+/// How often the compatible path samples the region, in milliseconds. The
+/// duplication path uses it as the wait timeout instead: a desktop update wakes
+/// the worker immediately.
 const TICK_MS: u32 = 120;
 /// Identical samples in a row that count as "the content came to rest".
 const STILLS: u32 = 2;
+/// Shortest fixed band worth reporting. Fewer rows are more likely to be a
+/// coincidence than a sticky bar.
+const MIN_BAND: u32 = 4;
 /// Thickness of the frame drawn around the region, in physical pixels. Wide
 /// enough to grab, narrow enough not to hide what sits next to the region.
 const BAND: i32 = 22;
@@ -32,6 +43,10 @@ const PANEL_MIN_HEIGHT: i32 = 220;
 /// Window classes of the two helper windows.
 const RING_CLASS: PCWSTR = w!("Snaplight.LongCaptureRing");
 const PANEL_CLASS: PCWSTR = w!("Snaplight.LongCapturePanel");
+/// Commands from the UI thread to the worker.
+const RUN: u8 = 0;
+const FINISH: u8 = 1;
+const CANCEL: u8 = 2;
 /// Palette, in `COLORREF` order (`0x00BBGGRR`).
 const ACCENT: COLORREF = COLORREF(0x00ff8833);
 const BAND_BACK: COLORREF = COLORREF(0x00241c18);
@@ -41,6 +56,21 @@ const PANEL_HINT: COLORREF = COLORREF(0x00a8a8a8);
 const PANEL_WARN: COLORREF = COLORREF(0x0070b0ff);
 const BUTTON_TEXT: COLORREF = COLORREF(0x00ffffff);
 
+/// State shared between the worker and the UI thread. The engine belongs to the
+/// worker; the UI only reads it for the thumbnail, copying and finishing, and
+/// never touches pixels on a paint path.
+#[derive(Default)]
+struct Shared {
+    engine: Option<LongCapture>,
+    screens: u32,
+    direction: Option<Direction>,
+    settled: bool,
+    note: Option<String>,
+    backend: Option<GrabBackend>,
+    /// Bumped on every visible change, so the UI only repaints when needed.
+    generation: u64,
+}
+
 /// One running long capture.
 pub(super) struct LongCaptureSession {
     /// The region the user selected, in screen pixels: what is stitched.
@@ -49,18 +79,15 @@ pub(super) struct LongCaptureSession {
     /// sit over the region (the bird's eye panel and the toolbar), because a
     /// Snaplight window must never end up inside the stitched image.
     source: RECT,
-    /// `None` until the first frame has been read.
-    engine: Option<LongCapture>,
-    /// Direction of the last scroll; the matching edge trims the last screen.
-    direction: Option<Direction>,
-    /// Screens stitched so far, the first one included.
-    screens: u32,
-    /// Previous sample, so two identical reads mean the content came to rest.
-    last: Option<Vec<u8>>,
-    stills: u32,
-    /// True while the content is at rest.
-    settled: bool,
-    /// Rows cut from the top and the bottom of the stitch.
+    shared: Arc<Mutex<Shared>>,
+    command: Arc<AtomicU8>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    /// Bird's-eye preview at thumbnail scale, rebuilt only when the stitch or the
+    /// trim changed. Holding it here keeps paint independent of the full image.
+    preview: Option<(u32, u32, Vec<u8>)>,
+    /// Last generation copied into `preview`.
+    generation: u64,
+    /// Rows cut from the top and the bottom of the body.
     trim_start: u32,
     trim_end: u32,
     /// Edge being dragged (`0` top, `1` bottom) and the screen row it started at.
@@ -68,8 +95,6 @@ pub(super) struct LongCaptureSession {
     /// Key states, so a held key fires once.
     escape: bool,
     enter: bool,
-    /// Why the stitch stopped growing on its own.
-    note: Option<String>,
     /// Whether the overlay was on screen when the session started, so it is only
     /// restored when it was.
     overlay_was_visible: bool,
@@ -120,8 +145,8 @@ struct Stitch {
 
 impl Canvas {
     /// Starts a long capture on the current selection: the overlay is hidden, the
-    /// region gets a draggable frame and a bird's eye panel, and a timer samples
-    /// the region while the user scrolls the content underneath it.
+    /// region gets a draggable frame and a bird's eye panel, and a worker thread
+    /// samples the region while the user scrolls the content underneath it.
     ///
     /// The toolbar stays on screen and carries the buttons that end the session,
     /// so the session is driven by the same controls as a normal capture.
@@ -134,7 +159,14 @@ impl Canvas {
         let Some(selection) = self.doc.selection else {
             return Err("长截图需要先框选区域：滚动与拼接都以该选区为准。".into());
         };
-        let region = region_of(self.screen, selection);
+        // A selection that reaches past the captured screen would be silently
+        // narrowed by a clamp, and the result would be missing a strip the user
+        // asked for. Long capture is single-screen until mixed-DPI stitching is
+        // handled separately, so refuse instead of lying.
+        let region = selection_region(self.screen, selection);
+        if !screen_contains(self.screen, region) {
+            return Err("选区跨越了显示器边界：长截图目前只能在单块屏幕内进行。".into());
+        }
         if region.right - region.left < 8 || region.bottom - region.top < 8 {
             return Err("长截图区域太小：请至少框选 8 × 8 像素。".into());
         }
@@ -172,24 +204,44 @@ impl Canvas {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let command = Arc::new(AtomicU8::new(RUN));
+        let worker_shared = Arc::clone(&shared);
+        let worker_command = Arc::clone(&command);
+        let worker = match std::thread::Builder::new()
+            .name("snaplight-long-capture".to_string())
+            .spawn(move || run(worker_shared, worker_command, source))
+        {
+            Ok(worker) => worker,
+            Err(error) => {
+                unsafe {
+                    let _ = DestroyWindow(ring);
+                    let _ = DestroyWindow(panel_window);
+                }
+                if overlay_was_visible {
+                    unsafe {
+                        let _ = ShowWindow(self.hwnd, SW_SHOW);
+                    }
+                }
+                return Err(format!("无法启动长截图线程：{error}").into());
+            }
+        };
         if let Some(weak) = self.ui_slots.toolbar() {
             snaplight_ui::set_toolbar_long_capture(weak, true);
         }
         self.long_capture = Some(LongCaptureSession {
             region,
             source,
-            engine: None,
-            direction: None,
-            screens: 0,
-            last: None,
-            stills: 0,
-            settled: false,
+            shared,
+            command,
+            worker: Some(worker),
+            preview: None,
+            generation: u64::MAX,
             trim_start: 0,
             trim_end: 0,
             drag: None,
             escape: false,
             enter: false,
-            note: None,
             overlay_was_visible,
             ring,
             panel_window,
@@ -201,8 +253,8 @@ impl Canvas {
         Ok(())
     }
 
-    /// One timer tick: read the region, stitch it when it moved, and poll the two
-    /// keys that finish or cancel the session.
+    /// One timer tick: poll the two keys that finish or cancel the session, and
+    /// pick up the worker's latest progress. No pixels are read or copied here.
     pub(super) fn long_capture_tick(&mut self) {
         let Some(session) = self.long_capture.as_mut() else {
             return;
@@ -223,60 +275,11 @@ impl Canvas {
             self.finish_long_capture();
             return;
         }
-        let Some(source) = self.long_capture.as_ref().map(|s| s.source) else {
-            return;
-        };
-        let (width, height, bytes) = match screen_pixels(source) {
-            Ok(sample) => sample,
-            Err(error) => {
-                if let Some(session) = self.long_capture.as_mut() {
-                    session.note = Some(error.to_string());
-                }
-                self.cancel_long_capture();
-                return;
-            }
-        };
-        let (moved, settled_changed) = {
-            let Some(session) = self.long_capture.as_mut() else {
-                return;
-            };
-            let moved = session.last.as_deref() != Some(bytes.as_slice());
-            session.last = Some(bytes.clone());
-            let was_settled = session.settled;
-            if moved {
-                session.stills = 0;
-                session.settled = false;
-            } else {
-                session.stills += 1;
-                if session.stills >= STILLS {
-                    session.settled = true;
-                }
-            }
-            (moved, was_settled != session.settled)
-        };
-        if moved {
-            if settled_changed {
-                self.repaint_long_capture();
-            }
+        let generation = session.shared.lock().generation;
+        if generation == session.generation {
             return;
         }
-        if !settled_changed {
-            return;
-        }
-        // The content came to rest, so this sample is a whole scroll position and
-        // only now is it worth stitching: a scrolling window paints in place, and
-        // a frame caught mid-repaint still holds rows from the older position, so
-        // stitching it would splice content that runs backwards.
-        let demo = self.demo;
-        if let Some(session) = self.long_capture.as_mut() {
-            let step = stitch_sample(session, width, height, &bytes);
-            if demo {
-                eprintln!(
-                    "long capture: step {step:?} screens {} settled {}",
-                    session.screens, session.settled
-                );
-            }
-        }
+        session.refresh_preview();
         self.repaint_long_capture();
     }
 
@@ -350,7 +353,8 @@ impl Canvas {
         let Some(session) = self.long_capture.as_ref() else {
             return Ok(());
         };
-        let Some(engine) = &session.engine else {
+        let shared = session.shared.lock();
+        let Some(engine) = &shared.engine else {
             return Err("还没有拼出任何画面：先滚动内容，停下后再复制。".into());
         };
         let (image, bytes) = engine.cropped(session.trim_start, session.trim_end, ImageId(0));
@@ -381,26 +385,40 @@ impl Canvas {
                 },
             );
         };
+        // The helper windows must go before the worker's final read: duplication
+        // captures them, unlike the GDI source rectangle that excluded them.
         session.teardown(self);
-        // Finishing before the last screen came to rest must not drop that
-        // scroll, so the newest sample is stitched here. The helper windows are
-        // already gone, and `source` never covered them anyway.
-        if !session.settled {
-            if let Some(bytes) = session.last.clone() {
-                let width = (session.source.right - session.source.left).max(1) as u32;
-                let height = (session.source.bottom - session.source.top).max(1) as u32;
-                let step = stitch_sample(&mut session, width, height, &bytes);
-                if self.demo {
-                    eprintln!(
-                        "long capture: finish step {step:?} screens {}",
-                        session.screens
-                    );
-                }
-            }
-        }
-        let Some(engine) = &session.engine else {
+        session.stop_worker(FINISH);
+        let (stitch, screens, note) = {
+            let shared = session.shared.lock();
+            let stitch = shared.engine.as_ref().map(|engine| {
+                let key = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or(0);
+                let (image, bytes) =
+                    engine.cropped(session.trim_start, session.trim_end, ImageId(key as u64));
+                Stitch { image, bytes, key }
+            });
+            (stitch, shared.screens, shared.note.clone())
+        };
+        if restore {
             session.restore_overlay(self);
-            return (
+        }
+        match stitch {
+            Some(stitch) => {
+                let report = Report {
+                    region: session.region,
+                    screens,
+                    width: stitch.image.width,
+                    height: stitch.image.height,
+                    image: None,
+                    note,
+                    cancelled: false,
+                };
+                (Some(stitch), report)
+            }
+            None => (
                 None,
                 Report {
                     region: session.region,
@@ -408,48 +426,34 @@ impl Canvas {
                     width: 0,
                     height: 0,
                     image: None,
-                    note: Some("没有读到任何画面".to_string()),
+                    note: Some(note.unwrap_or_else(|| "没有读到任何画面".to_string())),
                     cancelled: true,
                 },
-            );
-        };
-        let key = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0);
-        let (image, bytes) =
-            engine.cropped(session.trim_start, session.trim_end, ImageId(key as u64));
-        let report = Report {
-            region: session.region,
-            screens: session.screens,
-            width: image.width,
-            height: image.height,
-            image: None,
-            note: session.note.clone(),
-            cancelled: false,
-        };
-        if restore {
-            session.restore_overlay(self);
+            ),
         }
-        (Some(Stitch { image, bytes, key }), report)
     }
 
     /// Drops the session without saving anything. This is the toolbar's close
     /// button and Esc.
     pub(super) fn cancel_long_capture(&mut self) {
-        let Some(session) = self.long_capture.take() else {
+        let Some(mut session) = self.long_capture.take() else {
             return;
         };
         session.teardown(self);
+        session.stop_worker(CANCEL);
+        let (screens, note) = {
+            let shared = session.shared.lock();
+            (shared.screens, shared.note.clone())
+        };
         session.restore_overlay(self);
         self.restore_after_long_capture();
         self.report_long_capture(Report {
             region: session.region,
-            screens: session.screens,
+            screens,
             width: 0,
             height: 0,
             image: None,
-            note: session.note.clone(),
+            note,
             cancelled: true,
         });
     }
@@ -464,28 +468,33 @@ impl Canvas {
         let Some((edge, start)) = session.drag else {
             return false;
         };
-        let height = session
-            .engine
-            .as_ref()
-            .map(LongCapture::height)
-            .unwrap_or(0);
+        let (height, bands) = {
+            let shared = session.shared.lock();
+            shared
+                .engine
+                .as_ref()
+                .map(|engine| (engine.height(), engine.bands()))
+                .unwrap_or((0, Bands::NONE))
+        };
         if height == 0 {
             return true;
         }
         // The source is a vertical crop of the region, so one screen row is one
         // stitched row and one screen's worth of new rows is the source height.
-        let screen_height = (session.source.bottom - session.source.top).max(1) as u32;
+        let screen_height = body_screen_height(session.source, bands);
+        let body_height = height;
         let (trim_start, trim_end) = trim_after_drag(
             edge,
             start,
             screen_y,
-            height,
+            body_height,
             screen_height,
             session.trim_start,
             session.trim_end,
         );
         session.trim_start = trim_start;
         session.trim_end = trim_end;
+        session.refresh_preview();
         self.repaint_long_capture();
         true
     }
@@ -593,6 +602,20 @@ impl Canvas {
 }
 
 impl LongCaptureSession {
+    /// Copies the worker's latest thumbnail into the session, so paint only ever
+    /// reads a small cached buffer.
+    fn refresh_preview(&mut self) {
+        let (generation, preview) = {
+            let shared = self.shared.lock();
+            let preview = shared
+                .engine
+                .as_ref()
+                .map(|engine| engine.preview(self.trim_start, self.trim_end));
+            (shared.generation, preview)
+        };
+        self.generation = generation;
+        self.preview = preview;
+    }
     /// Removes the helper windows and the sampling timer.
     fn teardown(&self, canvas: &Canvas) {
         unsafe {
@@ -601,7 +624,14 @@ impl LongCaptureSession {
             let _ = DestroyWindow(self.panel_window);
         }
     }
-
+    /// Asks the worker to stop and waits for it. The longest wait is one sampling
+    /// interval, because both backends use it as their blocking timeout.
+    fn stop_worker(&mut self, command: u8) {
+        self.command.store(command, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
     /// Puts the overlay back on screen when the session took it off.
     fn restore_overlay(&self, canvas: &Canvas) {
         if self.overlay_was_visible {
@@ -612,60 +642,564 @@ impl LongCaptureSession {
     }
 }
 
-/// Adds one sample to the stitch, starting it when this is the first frame.
-/// Returns the step the engine reported and whether the stitch was just started.
-fn advance_stitch(
-    engine: &mut Option<LongCapture>,
-    direction: Option<Direction>,
+/// Worker entry point: open the best grabber, announce the backend and run the
+/// loop that belongs to it.
+fn run(shared: Arc<Mutex<Shared>>, command: Arc<AtomicU8>, source: RECT) {
+    let grabber = match RegionGrabber::open(source) {
+        Ok(grabber) => grabber,
+        Err(error) => {
+            let mut shared = shared.lock();
+            shared.note = Some(format!("无法读取选区：{error}"));
+            shared.generation += 1;
+            return;
+        }
+    };
+    let backend = grabber.backend();
+    let width = grabber.width();
+    let height = grabber.height();
+    {
+        let mut shared = shared.lock();
+        shared.backend = Some(backend);
+        shared.generation += 1;
+    }
+    let interval = Duration::from_millis(u64::from(TICK_MS));
+    match backend {
+        GrabBackend::Direct => {
+            run_direct(grabber, shared, command, interval, source, width, height)
+        }
+        GrabBackend::Compatible => {
+            run_compatible(grabber, shared, command, interval, width, height)
+        }
+    }
+}
+
+/// Duplication loop: every desktop update is a consistent frame, so it is
+/// stitched immediately instead of waiting for the content to stop. That is what
+/// keeps an animated page (a spinner, a blinking caret, a video) from starving
+/// the stitch.
+fn run_direct(
+    mut grabber: RegionGrabber,
+    shared: Arc<Mutex<Shared>>,
+    command: Arc<AtomicU8>,
+    interval: Duration,
+    source: RECT,
     width: u32,
     height: u32,
-    bytes: &[u8],
-) -> (Step, bool) {
-    let frame = Frame {
+) {
+    let mut current = Vec::new();
+    // An idle desktop produces no duplication frame at all, so the first screen
+    // is taken once through GDI. It becomes the first anchor as soon as a real
+    // duplication frame arrives, which is also when the fixed bands can be
+    // detected; without any update it is still the whole capture.
+    let mut previous: Option<Vec<u8>> = None;
+    let mut seed = Vec::new();
+    if screen_pixels_into(source, &mut seed).is_ok() {
+        previous = Some(seed);
+    }
+    let mut previous_hash: Option<u64> = None;
+    loop {
+        let requested = command.load(Ordering::Relaxed);
+        if requested == CANCEL {
+            break;
+        }
+        let finishing = requested == FINISH;
+        let read = grabber.read(
+            &mut current,
+            if finishing { Duration::ZERO } else { interval },
+        );
+        let got = match read {
+            Ok(got) => got,
+            Err(error) => {
+                let mut shared = shared.lock();
+                shared.note = Some(format!("抓取中断：{error}；已拼部分仍可用"));
+                shared.generation += 1;
+                break;
+            }
+        };
+        if got {
+            let hash = sampled_hash(&current, width, height);
+            let changed = previous_hash != Some(hash);
+            if changed {
+                previous_hash = Some(hash);
+                let mut state = shared.lock();
+                let frame = frame_of(&current, width, height);
+                if state.engine.is_none() {
+                    let Some(seed) = previous.as_deref() else {
+                        // The GDI seed failed too: start from this frame alone.
+                        let stop = !start_engine(&mut state, &current, Bands::NONE, width, height);
+                        state.settled = false;
+                        state.generation += 1;
+                        drop(state);
+                        swap_previous(&mut previous, &mut current);
+                        if stop || finishing {
+                            break;
+                        }
+                        continue;
+                    };
+                    let bands = detect_bands(seed, &current, width, height);
+                    match LongCapture::new_banded(frame_of(seed, width, height), bands, MAX_BYTES) {
+                        Ok(mut engine) => {
+                            let step = engine.advance(&frame, None);
+                            // A frame that matches the seed is a real scroll (or
+                            // a still page with known bands). A stale window or
+                            // a jump is dropped and the seed stays the anchor, so
+                            // the next frame is compared against the initial
+                            // screen again instead of a wrong anchor.
+                            let acceptable =
+                                matches!(step, Step::Scrolled { .. } | Step::Prepended { .. })
+                                    || (matches!(step, Step::Unchanged) && !bands.is_empty());
+                            if !acceptable {
+                                // Keep the rejection visible if the user ends the
+                                // session here; a later valid frame clears it.
+                                if !matches!(step, Step::Unchanged) {
+                                    state.note = Some(
+                                        "滚动跳变：新一屏与起始画面没有足够重叠，已跳过这一屏"
+                                            .to_string(),
+                                    );
+                                    state.generation += 1;
+                                }
+                                drop(state);
+                                continue;
+                            }
+                            state.engine = Some(engine);
+                            state.screens = 1;
+                            let stop = apply_step(&mut state, step);
+                            state.settled = matches!(step, Step::Unchanged);
+                            state.generation += 1;
+                            drop(state);
+                            swap_previous(&mut previous, &mut current);
+                            if stop || finishing {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(why) => {
+                            state.note = Some(why.to_string());
+                            state.generation += 1;
+                            drop(state);
+                            break;
+                        }
+                    }
+                }
+                let direction = state.direction;
+                let step = state
+                    .engine
+                    .as_mut()
+                    .expect("engine checked above")
+                    .advance(&frame, direction);
+                let stop = apply_step(&mut state, step);
+                let was_settled = state.settled;
+                state.settled = matches!(step, Step::Unchanged);
+                if state.settled != was_settled {
+                    state.generation += 1;
+                }
+                drop(state);
+                swap_previous(&mut previous, &mut current);
+                if stop {
+                    break;
+                }
+            }
+        } else {
+            let mut state = shared.lock();
+            if state.engine.is_some() && !state.settled {
+                state.settled = true;
+                state.generation += 1;
+            }
+        }
+        if finishing {
+            finish_direct(&shared, previous.as_deref(), width, height);
+            break;
+        }
+    }
+}
+
+/// Starts from the initial GDI seed when the session ends before duplication
+/// delivered any frame.
+fn finish_direct(shared: &Arc<Mutex<Shared>>, latest: Option<&[u8]>, width: u32, height: u32) {
+    let Some(latest) = latest else {
+        return;
+    };
+    let mut state = shared.lock();
+    if state.engine.is_none() {
+        start_engine(&mut state, latest, Bands::NONE, width, height);
+        state.settled = true;
+        state.generation += 1;
+    }
+}
+
+/// Compatible loop: GDI can hand back a frame in the middle of a repaint, so a
+/// frame is stitched only after the scrolling body has been identical for
+/// [`STILLS`] samples. The comparison is limited to the body between the fixed
+/// bands, so a blinking caret in a sticky bar no longer prevents settling.
+fn run_compatible(
+    mut grabber: RegionGrabber,
+    shared: Arc<Mutex<Shared>>,
+    command: Arc<AtomicU8>,
+    interval: Duration,
+    width: u32,
+    height: u32,
+) {
+    let mut current = Vec::new();
+    let mut previous: Option<Vec<u8>> = None;
+    let mut previous_hash: Option<u64> = None;
+    // The first frame is the screen the user started from. It is kept until the
+    // stitch starts so the result never begins in the middle of a scroll.
+    let mut seed: Option<Vec<u8>> = None;
+    let mut stills = 0u32;
+    let mut settled = false;
+    let mut bands = Bands::NONE;
+    loop {
+        let requested = command.load(Ordering::Relaxed);
+        if requested == CANCEL {
+            break;
+        }
+        let finishing = requested == FINISH;
+        let got = match grabber.read(
+            &mut current,
+            if finishing { Duration::ZERO } else { interval },
+        ) {
+            Ok(got) => got,
+            Err(error) => {
+                let mut shared = shared.lock();
+                shared.note = Some(format!("抓取中断：{error}；已拼部分仍可用"));
+                shared.generation += 1;
+                break;
+            }
+        };
+        if got {
+            let hash = sampled_hash(&current, width, height);
+            let changed = previous_hash != Some(hash);
+            if changed {
+                previous_hash = Some(hash);
+                let Some(older) = previous.as_deref() else {
+                    previous = Some(std::mem::take(&mut current));
+                    seed = previous.clone();
+                    stills = 1;
+                    settled = false;
+                    continue;
+                };
+                let body_same = {
+                    let state = shared.lock();
+                    match &state.engine {
+                        Some(engine) => rows_equal(older, &current, width, height, engine.bands()),
+                        None => rows_equal(older, &current, width, height, bands),
+                    }
+                };
+                if body_same {
+                    stills += 1;
+                } else {
+                    stills = 1;
+                    settled = false;
+                    if shared.lock().engine.is_none() && bands.is_empty() {
+                        bands = detect_bands(older, &current, width, height);
+                    }
+                }
+                swap_previous(&mut previous, &mut current);
+            } else {
+                stills = stills.saturating_add(1);
+            }
+            let mut state = shared.lock();
+            if stills >= STILLS && !settled {
+                let frame = previous.as_deref().unwrap_or(&current);
+                if state.engine.is_none() {
+                    let Some(first) = seed.as_deref() else {
+                        drop(state);
+                        continue;
+                    };
+                    match LongCapture::new_banded(frame_of(first, width, height), bands, MAX_BYTES)
+                    {
+                        Ok(mut engine) => {
+                            let step = engine.advance(&frame_of(frame, width, height), None);
+                            let acceptable =
+                                matches!(step, Step::Scrolled { .. } | Step::Prepended { .. })
+                                    || (matches!(step, Step::Unchanged) && !bands.is_empty());
+                            if acceptable {
+                                state.engine = Some(engine);
+                                state.screens = 1;
+                                let stop = apply_step(&mut state, step);
+                                state.settled = true;
+                                state.generation += 1;
+                                settled = true;
+                                if stop {
+                                    drop(state);
+                                    break;
+                                }
+                            } else {
+                                // Nothing to stitch yet: the start screen only
+                                // repeats itself, or the frame is not a valid
+                                // scroll. Wait for the next motion instead of
+                                // rebuilding a candidate every tick.
+                                if !matches!(step, Step::Unchanged) {
+                                    state.note = Some(
+                                        "滚动跳变：新一屏与起始画面没有足够重叠，已跳过这一屏"
+                                            .to_string(),
+                                    );
+                                }
+                                state.generation += 1;
+                                state.settled = true;
+                                settled = true;
+                            }
+                        }
+                        Err(why) => {
+                            state.note = Some(why.to_string());
+                            state.generation += 1;
+                            drop(state);
+                            break;
+                        }
+                    }
+                } else {
+                    let direction = state.direction;
+                    let step = state
+                        .engine
+                        .as_mut()
+                        .expect("engine checked above")
+                        .advance(&frame_of(frame, width, height), direction);
+                    let stop = apply_step(&mut state, step);
+                    if !state.settled {
+                        state.generation += 1;
+                    }
+                    state.settled = true;
+                    settled = true;
+                    if stop {
+                        drop(state);
+                        break;
+                    }
+                }
+            }
+            drop(state);
+        }
+        if finishing {
+            finish_compatible(
+                &shared,
+                seed.as_deref(),
+                previous.as_deref(),
+                width,
+                height,
+                bands,
+            );
+            break;
+        }
+    }
+}
+
+/// Stitches the newest sample one last time when the user ends the session
+/// before the content settled, so the final scroll is not dropped.
+fn finish_compatible(
+    shared: &Arc<Mutex<Shared>>,
+    seed: Option<&[u8]>,
+    latest: Option<&[u8]>,
+    width: u32,
+    height: u32,
+    bands: Bands,
+) {
+    let Some(latest) = latest else {
+        return;
+    };
+    let mut state = shared.lock();
+    if state.engine.is_none() {
+        start_engine(&mut state, seed.unwrap_or(latest), bands, width, height);
+        return;
+    }
+    let direction = state.direction;
+    let step = state
+        .engine
+        .as_mut()
+        .expect("engine checked above")
+        .advance(&frame_of(latest, width, height), direction);
+    apply_step(&mut state, step);
+    state.settled = true;
+    state.generation += 1;
+}
+
+/// Starts the stitch from `bytes` with the detected bands.
+fn start_engine(shared: &mut Shared, bytes: &[u8], bands: Bands, width: u32, height: u32) -> bool {
+    match LongCapture::new_banded(frame_of(bytes, width, height), bands, MAX_BYTES) {
+        Ok(engine) => {
+            shared.engine = Some(engine);
+            shared.screens = 1;
+            shared.generation += 1;
+            true
+        }
+        Err(why) => {
+            shared.note = Some(why.to_string());
+            shared.generation += 1;
+            false
+        }
+    }
+}
+
+/// Folds one engine step into the session counters. Returns true when the worker
+/// should stop growing the stitch.
+fn apply_step(shared: &mut Shared, step: Step) -> bool {
+    let mut changed = false;
+    let stop = match step {
+        Step::Scrolled { .. } => {
+            shared.screens += 1;
+            shared.direction = Some(Direction::Down);
+            shared.note = None;
+            changed = true;
+            false
+        }
+        Step::Prepended { .. } => {
+            shared.screens += 1;
+            shared.direction = Some(Direction::Up);
+            shared.note = None;
+            changed = true;
+            false
+        }
+        Step::Unchanged => {
+            if shared.note.take().is_some() {
+                changed = true;
+            }
+            false
+        }
+        Step::Jumped => {
+            let note = "滚动跳变：新一屏与最近几屏没有足够重叠，已跳过这一屏";
+            if shared.note.as_deref() != Some(note) {
+                shared.note = Some(note.to_string());
+                changed = true;
+            }
+            false
+        }
+        Step::LowConfidence { best } => {
+            let note = format!(
+                "匹配置信度不足（最佳重合 {:.0}%），已跳过这一屏；继续滚动或停下结束",
+                best * 100.0
+            );
+            if shared.note.as_deref() != Some(note.as_str()) {
+                shared.note = Some(note);
+                changed = true;
+            }
+            false
+        }
+        Step::Budget(why) => {
+            let note = why.to_string();
+            if shared.note.as_deref() != Some(note.as_str()) {
+                shared.note = Some(note);
+                changed = true;
+            }
+            true
+        }
+    };
+    if changed {
+        shared.generation += 1;
+    }
+    stop
+}
+
+fn frame_of(bytes: &[u8], width: u32, height: u32) -> Frame<'_> {
+    Frame {
         width,
         height,
         stride: width as usize * 4,
         bytes,
-    };
-    match engine.as_mut() {
-        Some(stitch) => (stitch.advance(&frame, direction), false),
-        None => match LongCapture::new(frame, snaplight_domain::long_capture::MAX_BYTES) {
-            Ok(stitch) => {
-                *engine = Some(stitch);
-                (Step::Unchanged, true)
-            }
-            Err(why) => (Step::Budget(why), false),
-        },
     }
 }
 
-/// Adds one settled sample to the stitch and folds the reported step into the
-/// session counters. A jump or a full budget is recorded but does not end the
-/// session: the stitch so far stays usable, so the user can still trim it and
-/// finish.
-fn stitch_sample(session: &mut LongCaptureSession, width: u32, height: u32, bytes: &[u8]) -> Step {
-    let (step, started) =
-        advance_stitch(&mut session.engine, session.direction, width, height, bytes);
-    if started {
-        session.screens = 1;
+/// Puts `current` into `previous` and keeps the old buffer for the next read.
+fn swap_previous(previous: &mut Option<Vec<u8>>, current: &mut Vec<u8>) {
+    match previous {
+        Some(previous) => std::mem::swap(previous, current),
+        None => *previous = Some(std::mem::take(current)),
     }
-    match &step {
-        Step::Scrolled { .. } => {
-            session.screens += 1;
-            session.direction = Some(Direction::Down);
-        }
-        Step::Prepended { .. } => {
-            session.screens += 1;
-            session.direction = Some(Direction::Up);
-        }
-        Step::Unchanged => {}
-        Step::Jumped => {
-            session.note =
-                Some("滚动跳变：新一屏与上一屏没有足够重叠，为避免漏行已停止".to_string())
-        }
-        Step::Budget(why) => session.note = Some(why.to_string()),
+}
+
+/// A cheap content signature over a fixed grid. Equal hashes skip the frame; a
+/// collision is harmless because the next stage compares the actual body rows.
+fn sampled_hash(bytes: &[u8], width: u32, height: u32) -> u64 {
+    const COLUMNS: u32 = 64;
+    const ROWS: u32 = 32;
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    if width == 0 || height == 0 {
+        return hash;
     }
-    step
+    for row in 0..ROWS {
+        let y = (u64::from(row) * u64::from(height - 1) / u64::from(ROWS - 1)) as u32;
+        for column in 0..COLUMNS {
+            let x = (u64::from(column) * u64::from(width - 1) / u64::from(COLUMNS - 1)) as u32;
+            let at = (y as usize * width as usize + x as usize) * 4;
+            for channel in 0..4 {
+                hash ^= u64::from(bytes[at + channel]);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    }
+    hash
+}
+
+/// Whether the scrolling body is identical in both frames. Rows under the fixed
+/// bands are compared too, so the caller can settle while they animate.
+fn rows_equal(a: &[u8], b: &[u8], width: u32, height: u32, bands: Bands) -> bool {
+    let stride = width as usize * 4;
+    let start = bands.top as usize * stride;
+    let end = (height.saturating_sub(bands.bottom)) as usize * stride;
+    if end <= start || a.len() < end || b.len() < end {
+        return a == b;
+    }
+    a[start..end] == b[start..end]
+}
+
+/// Whether two rows of the same frame row are effectively the same. Sampled
+/// columns and a small tolerance keep a blinking caret or a clock from breaking
+/// an otherwise fixed bar, while a row that scrolled away differs in almost
+/// every sample.
+fn row_similar(a: &[u8], b: &[u8], width: u32) -> bool {
+    const COLUMNS: u32 = 48;
+    const TOLERANCE: u8 = 12;
+    const RATIO: u32 = 9; // nine tenths
+    if width == 0 {
+        return true;
+    }
+    let mut same = 0u32;
+    for column in 0..COLUMNS {
+        let x = (u64::from(column) * u64::from(width - 1) / u64::from(COLUMNS - 1)) as usize;
+        let at = x * 4;
+        if (0..3).all(|channel| a[at + channel].abs_diff(b[at + channel]) <= TOLERANCE) {
+            same += 1;
+        }
+    }
+    same * 10 >= COLUMNS * RATIO
+}
+
+/// Fixed rows at the top and bottom: the longest identical prefix and suffix of
+/// two frames at different scroll positions. Rows a sticky bar keeps on screen
+/// are the only ones that do not move with the page.
+fn detect_bands(a: &[u8], b: &[u8], width: u32, height: u32) -> Bands {
+    let stride = width as usize * 4;
+    if width == 0 || height == 0 || a.len() < height as usize * stride || b.len() < a.len() {
+        return Bands::NONE;
+    }
+    let equal = |row: u32| {
+        let at = row as usize * stride;
+        row_similar(&a[at..at + stride], &b[at..at + stride], width)
+    };
+    let mut top = 0u32;
+    while top < height && equal(top) {
+        top += 1;
+    }
+    let mut bottom = 0u32;
+    while bottom < height - top && equal(height - 1 - bottom) {
+        bottom += 1;
+    }
+    if top < MIN_BAND {
+        top = 0;
+    }
+    if bottom < MIN_BAND {
+        bottom = 0;
+    }
+    // A pair that shares nearly every row is not a scroll at all, and a band that
+    // leaves less than the minimum overlap is not something the engine can
+    // stitch. Both are better reported as "no fixed rows" than fabricated.
+    if top + bottom > height.saturating_sub(MIN_OVERLAP) {
+        return Bands::NONE;
+    }
+    Bands { top, bottom }
+}
+
+/// Body rows one screen contributes: the source height minus the fixed bands.
+fn body_screen_height(source: RECT, bands: Bands) -> u32 {
+    let height = (source.bottom - source.top).max(1) as u32;
+    height.saturating_sub(bands.top + bands.bottom).max(1)
 }
 
 /// Applies an edge drag: dragging an edge inwards cuts rows off that end. `edge`
@@ -699,16 +1233,23 @@ fn trim_after_drag(
 }
 
 /// The region the session stitches, in screen pixels: the selection mapped into
-/// screen space and clamped to the captured screen.
-fn region_of(screen: RECT, selection: ImageRect) -> RECT {
+/// screen space, without clamping. Callers must reject a region that leaves the
+/// screen instead of silently narrowing it.
+fn selection_region(screen: RECT, selection: ImageRect) -> RECT {
     RECT {
-        left: (screen.left + selection.x as i32).clamp(screen.left, screen.right),
-        top: (screen.top + selection.y as i32).clamp(screen.top, screen.bottom),
-        right: (screen.left + (selection.x + selection.width) as i32)
-            .clamp(screen.left, screen.right),
-        bottom: (screen.top + (selection.y + selection.height) as i32)
-            .clamp(screen.top, screen.bottom),
+        left: screen.left + selection.x as i32,
+        top: screen.top + selection.y as i32,
+        right: screen.left + (selection.x + selection.width) as i32,
+        bottom: screen.top + (selection.y + selection.height) as i32,
     }
+}
+
+/// Whether `rect` lies entirely inside `screen`.
+fn screen_contains(screen: RECT, rect: RECT) -> bool {
+    rect.left >= screen.left
+        && rect.top >= screen.top
+        && rect.right <= screen.right
+        && rect.bottom <= screen.bottom
 }
 
 /// Screen rectangle of the bird's eye panel: beside the region when there is
@@ -948,6 +1489,7 @@ unsafe fn paint_ring(hdc: HDC, canvas: &Canvas, hwnd: HWND) {
     if GetClientRect(hwnd, &mut client).is_err() {
         return;
     }
+    let direction = session.shared.lock().direction;
     let back = CreateSolidBrush(BAND_BACK);
     FillRect(hdc, &client, back);
     let _ = DeleteObject(back);
@@ -955,7 +1497,7 @@ unsafe fn paint_ring(hdc: HDC, canvas: &Canvas, hwnd: HWND) {
     let old = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
     // The last screen is at the bottom when the content scrolled down and at the
     // top when it scrolled up, so that is the edge that trims it.
-    let (top_edge, hint) = match session.direction {
+    let (top_edge, hint) = match direction {
         Some(Direction::Up) => (true, "向上滚动 · 拖动此边裁掉最后一段"),
         _ => (false, "向下滚动 · 拖动此边裁掉最后一段"),
     };
@@ -989,9 +1531,9 @@ unsafe fn paint_ring(hdc: HDC, canvas: &Canvas, hwnd: HWND) {
     SelectObject(hdc, old);
 }
 
-/// Paints the bird's eye: how much has been stitched, the stitch itself with the
-/// trim applied, and what to do next. Everything the user can press lives on the
-/// toolbar, so the panel carries no buttons.
+/// Paints the bird's eye: how much has been stitched, the cached thumbnail with
+/// the trim applied, and what to do next. Everything the user can press lives on
+/// the toolbar, so the panel carries no buttons.
 unsafe fn paint_panel(hdc: HDC, canvas: &Canvas, hwnd: HWND) {
     let Some(session) = canvas.long_capture.as_ref() else {
         return;
@@ -1000,28 +1542,42 @@ unsafe fn paint_panel(hdc: HDC, canvas: &Canvas, hwnd: HWND) {
     if GetClientRect(hwnd, &mut client).is_err() {
         return;
     }
+    let (screens, width, total_height, note, settled, backend) = {
+        let shared = session.shared.lock();
+        let (width, total_height) = shared
+            .engine
+            .as_ref()
+            .map(|engine| (engine.width(), engine.total_height()))
+            .unwrap_or((0, 0));
+        (
+            shared.screens,
+            width,
+            total_height,
+            shared.note.clone(),
+            shared.settled,
+            shared.backend,
+        )
+    };
     let back = CreateSolidBrush(PANEL_BACK);
     FillRect(hdc, &client, back);
     let _ = DeleteObject(back);
     SetBkMode(hdc, TRANSPARENT);
     let old = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
-    let title = match &session.engine {
-        None => "长截图 · 正在读取选区…".to_string(),
-        Some(engine) => format!(
-            "长截图 · 已拼 {} 屏 · {} × {}",
-            session.screens,
-            engine.width(),
-            engine
-                .height()
-                .saturating_sub(session.trim_start + session.trim_end)
-        ),
+    let shown_height = total_height.saturating_sub(session.trim_start + session.trim_end);
+    let title = if total_height == 0 {
+        "正在读取选区…".to_string()
+    } else {
+        format!("已拼 {screens} 屏 · {width} × {shown_height}")
     };
-    // A note from the engine (a jump, a full budget) outranks the usual hint: it
-    // explains why the stitch stopped growing.
-    let (hint, hint_colour) = match (&session.note, session.settled) {
-        (Some(note), _) => (note.as_str(), PANEL_WARN),
-        (None, true) => ("画面已停下：拖边线微调，用工具条保存或贴图", PANEL_HINT),
-        (None, false) => ("把鼠标放进选区滚动，画面停下后自动拼接", PANEL_HINT),
+    // A note from the engine (a jump, a low-confidence frame, a full budget)
+    // outranks the usual hint: it explains why the stitch stopped growing.
+    let (hint, hint_colour): (String, COLORREF) = match &note {
+        Some(note) => (note.clone(), PANEL_WARN),
+        None if settled => (format!("已停下 · 上限 {MAX_HEIGHT} 行"), PANEL_HINT),
+        None if backend == Some(GrabBackend::Compatible) => {
+            ("兼容采集 · 画面停下后拼接".to_string(), PANEL_HINT)
+        }
+        None => ("把鼠标放进选区滚动 · 停下后拼接".to_string(), PANEL_HINT),
     };
     let mut title_area = RECT {
         left: 8,
@@ -1057,22 +1613,21 @@ unsafe fn paint_panel(hdc: HDC, canvas: &Canvas, hwnd: HWND) {
         right: client.right,
         bottom: client.bottom,
     };
-    if let Some(engine) = &session.engine {
-        let (image, bytes) = engine.cropped(session.trim_start, session.trim_end, ImageId(0));
-        if image.width > 0 && image.height > 0 && !bytes.is_empty() {
+    if let Some((image_width, image_height, bytes)) = &session.preview {
+        if *image_width > 0 && *image_height > 0 && !bytes.is_empty() {
             let area_width = (area.right - area.left).max(1) as f32;
             let area_height = (area.bottom - area.top).max(1) as f32;
-            let scale = (area_width / image.width as f32).min(area_height / image.height as f32);
-            let width = ((image.width as f32 * scale) as i32).clamp(1, area.right - area.left);
-            let height = ((image.height as f32 * scale) as i32).clamp(1, area.bottom - area.top);
+            let scale = (area_width / *image_width as f32).min(area_height / *image_height as f32);
+            let width = ((*image_width as f32 * scale) as i32).clamp(1, area.right - area.left);
+            let height = ((*image_height as f32 * scale) as i32).clamp(1, area.bottom - area.top);
             let x = area.left + (area.right - area.left - width) / 2;
             let y = area.top + (area.bottom - area.top - height) / 2;
             let info = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: image.width as i32,
+                    biWidth: *image_width as i32,
                     // A negative height keeps the rows top-down.
-                    biHeight: -(image.height as i32),
+                    biHeight: -(*image_height as i32),
                     biPlanes: 1,
                     biBitCount: 32,
                     biCompression: BI_RGB.0,
@@ -1088,8 +1643,8 @@ unsafe fn paint_panel(hdc: HDC, canvas: &Canvas, hwnd: HWND) {
                 height,
                 0,
                 0,
-                image.width as i32,
-                image.height as i32,
+                *image_width as i32,
+                *image_height as i32,
                 Some(bytes.as_ptr() as *const core::ffi::c_void),
                 &info,
                 DIB_RGB_COLORS,
@@ -1260,6 +1815,21 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_outside_the_screen_is_rejected_instead_of_clamped() {
+        let screen = rect(0, 0, 1920, 1080);
+        let selection = ImageRect {
+            x: 1900.0,
+            y: 100.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        let region = selection_region(screen, selection);
+        assert!(!screen_contains(screen, region));
+        // The old path clamped the right edge and silently lost 80 columns.
+        assert_eq!(region.right, 2000);
+    }
+
+    #[test]
     fn the_demo_rectangle_is_parsed_in_screen_pixels() {
         assert_eq!(
             parse_long_capture_demo("--long-capture-demo=10,20,300,400"),
@@ -1318,22 +1888,57 @@ mod tests {
     }
 
     #[test]
-    fn the_stitch_keeps_every_row_of_a_scrolling_page() {
-        let mut engine = None;
-        let mut direction = None;
-        let mut screens = 0;
-        for index in 0..FakePage::FRAMES {
-            let bytes = FakePage::view(index * FakePage::SCROLL);
-            let (step, started) = advance_stitch(
-                &mut engine,
-                direction,
-                FakePage::WIDTH,
-                FakePage::HEIGHT,
-                &bytes,
-            );
-            if started {
-                screens = 1;
+    fn the_sticky_header_is_detected_between_two_scroll_positions() {
+        let bands = detect_bands(
+            &FakePage::view(0),
+            &FakePage::view(FakePage::SCROLL),
+            FakePage::WIDTH,
+            FakePage::HEIGHT,
+        );
+        assert_eq!(
+            bands,
+            Bands {
+                top: FakePage::HEADER,
+                bottom: 0
             }
+        );
+        // A pair with no identical rows at all has no fixed rows either.
+        let mut other = FakePage::view(0);
+        for row in 0..FakePage::HEIGHT {
+            let at = row as usize * FakePage::WIDTH as usize * 4;
+            other[at..at + 4].copy_from_slice(&[9, 8, 7, 255]);
+        }
+        assert_eq!(
+            detect_bands(
+                &FakePage::view(0),
+                &other,
+                FakePage::WIDTH,
+                FakePage::HEIGHT
+            ),
+            Bands::NONE
+        );
+    }
+
+    #[test]
+    fn the_stitch_keeps_every_row_of_a_scrolling_page() {
+        let bands = Bands {
+            top: FakePage::HEADER,
+            bottom: 0,
+        };
+        let mut engine = LongCapture::new_banded(
+            frame_of(&FakePage::view(0), FakePage::WIDTH, FakePage::HEIGHT),
+            bands,
+            MAX_BYTES,
+        )
+        .unwrap();
+        let mut screens = 1;
+        let mut direction = None;
+        for index in 1..FakePage::FRAMES {
+            let bytes = FakePage::view(index * FakePage::SCROLL);
+            let step = engine.advance(
+                &frame_of(&bytes, FakePage::WIDTH, FakePage::HEIGHT),
+                direction,
+            );
             match step {
                 Step::Scrolled { .. } => {
                     screens += 1;
@@ -1344,29 +1949,29 @@ mod tests {
                     direction = Some(Direction::Up);
                 }
                 Step::Unchanged => {}
-                _ => panic!("the synthetic page only scrolls"),
+                other => panic!("the synthetic page only scrolls: {other:?}"),
             }
         }
         // The last screen is read twice, which is how the session sees the end of
         // the content.
         let bytes = FakePage::view((FakePage::FRAMES - 1) * FakePage::SCROLL);
-        let (step, _) = advance_stitch(
-            &mut engine,
-            direction,
-            FakePage::WIDTH,
-            FakePage::HEIGHT,
-            &bytes,
-        );
-        assert!(matches!(step, Step::Unchanged));
+        assert!(matches!(
+            engine.advance(
+                &frame_of(&bytes, FakePage::WIDTH, FakePage::HEIGHT),
+                direction
+            ),
+            Step::Unchanged
+        ));
         assert_eq!(screens, FakePage::FRAMES);
-        let engine = engine.expect("the first frame starts a stitch");
-        let expected = FakePage::HEIGHT + (FakePage::FRAMES - 1) * FakePage::SCROLL;
-        assert_eq!(engine.height(), expected);
+        let expected_body =
+            FakePage::HEIGHT - FakePage::HEADER + (FakePage::FRAMES - 1) * FakePage::SCROLL;
+        assert_eq!(engine.height(), expected_body);
         assert_eq!(engine.width(), FakePage::WIDTH);
         // Every row has to land in its own place: a missing or duplicated row would
         // shift every row below it.
+        let (image, bytes) = engine.cropped(0, 0, ImageId(1));
+        assert_eq!(image.height, FakePage::HEADER + expected_body);
         let stride = engine.stride();
-        let bytes = engine.bytes();
         let colour_at = |y: u32| {
             let at = y as usize * stride + 100 * 4;
             &bytes[at..at + 4]
@@ -1374,13 +1979,104 @@ mod tests {
         for y in 0..FakePage::HEADER {
             assert_eq!(colour_at(y), FakePage::header_colour(y), "header row {y}");
         }
-        for y in FakePage::HEADER..expected {
+        for y in 0..expected_body {
             assert_eq!(
-                colour_at(y),
-                FakePage::content_colour(y - FakePage::HEADER),
+                colour_at(FakePage::HEADER + y),
+                FakePage::content_colour(y),
                 "content row {y}"
             );
         }
+    }
+
+    #[test]
+    fn the_preview_follows_the_stitch_and_the_trim() {
+        let bands = Bands {
+            top: FakePage::HEADER,
+            bottom: 0,
+        };
+        let mut engine = LongCapture::new_banded(
+            frame_of(&FakePage::view(0), FakePage::WIDTH, FakePage::HEIGHT),
+            bands,
+            MAX_BYTES,
+        )
+        .unwrap();
+        for index in 1..FakePage::FRAMES {
+            engine.push(&frame_of(
+                &FakePage::view(index * FakePage::SCROLL),
+                FakePage::WIDTH,
+                FakePage::HEIGHT,
+            ));
+        }
+        let (width, height, bytes) = engine.preview(0, 0);
+        assert_eq!(width, engine.thumbnail().0);
+        assert!(width <= FakePage::WIDTH);
+        assert!(height > 0);
+        assert_eq!(bytes.len(), width as usize * height as usize * 4);
+        let (trimmed_width, trimmed_height, _) = engine.preview(100, 0);
+        assert_eq!(trimmed_width, width);
+        assert!(trimmed_height <= height);
+    }
+
+    #[test]
+    fn sampling_sees_a_body_change_but_not_the_cursor() {
+        let a = FakePage::view(0);
+        let mut b = a.clone();
+        assert_eq!(
+            sampled_hash(&a, FakePage::WIDTH, FakePage::HEIGHT),
+            sampled_hash(&b, FakePage::WIDTH, FakePage::HEIGHT)
+        );
+        // A change inside the body is visible to the sampled hash. Use a pixel
+        // the 64×32 grid actually samples.
+        let y = (4 * (FakePage::HEIGHT - 1) / 31) as usize;
+        let x = ((FakePage::WIDTH - 1) / 63) as usize;
+        let at = (y * FakePage::WIDTH as usize + x) * 4;
+        b[at] ^= 0xff;
+        assert_ne!(
+            sampled_hash(&a, FakePage::WIDTH, FakePage::HEIGHT),
+            sampled_hash(&b, FakePage::WIDTH, FakePage::HEIGHT)
+        );
+        // The body comparison ignores the sticky header, which is where a caret
+        // would blink.
+        let bands = Bands {
+            top: FakePage::HEADER,
+            bottom: 0,
+        };
+        let mut header_b = a.clone();
+        header_b[4] ^= 0xff;
+        assert!(rows_equal(
+            &a,
+            &header_b,
+            FakePage::WIDTH,
+            FakePage::HEIGHT,
+            bands
+        ));
+    }
+
+    #[test]
+    fn a_banded_screen_trims_only_its_body() {
+        let source = rect(200, 200, 700, 800);
+        assert_eq!(
+            body_screen_height(
+                source,
+                Bands {
+                    top: 40,
+                    bottom: 30
+                }
+            ),
+            530
+        );
+        assert_eq!(body_screen_height(source, Bands::NONE), 600);
+        // A pathological band pair still leaves one row to trim from.
+        assert_eq!(
+            body_screen_height(
+                source,
+                Bands {
+                    top: 590,
+                    bottom: 30
+                }
+            ),
+            1
+        );
     }
 
     #[test]

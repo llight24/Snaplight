@@ -13,7 +13,10 @@ mod text_outline;
 #[cfg(windows)]
 mod windows_backend;
 #[cfg(windows)]
-pub use capture::{capture_agreement, screen_pixels, DesktopCapture, FrozenFrame};
+pub use capture::{
+    capture_agreement, screen_pixels, screen_pixels_into, DesktopCapture, FrozenFrame, GrabBackend,
+    RegionGrabber,
+};
 #[cfg(windows)]
 pub use composition::StaticSurface;
 #[cfg(windows)]

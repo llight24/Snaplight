@@ -116,6 +116,7 @@ The settings window is a left navigation pane plus right-hand options, with seve
 | 屏幕录制 (Screen recording) | Placeholder page that states the feature is not implemented yet |
 | 设置 (Settings) | App version, configuration file path, data directory and a button that opens it |
 
+- Only one settings window can exist: clicking 设置 in the tray again (or launching `--settings` a second time) does not open another window; the open window is brought to the front and shakes for about a second, then returns to its original position.
 - The toolbar quick options, tray menu, pin context menu and settings pages are all **Chinese-first**; code identifiers, commands and error codes stay in their original form.
 - Accessibility: Slint exposes an accessibility tree (labels, buttons, edits, check boxes) through the `accessibility` feature, so Windows UI Automation and screen readers can enumerate and drive the settings page and toolbar using the same Chinese labels users see.
 - Toolbar and settings window positions are remembered in `ui-state.json`; a missing, corrupt or version-mismatched file only falls back to default positions.
@@ -160,6 +161,7 @@ Measurement environment: Windows, Intel Core i9-14900KF (32 logical CPUs), NVIDI
 .\scripts\launch.ps1 -SkipBuild # start without rebuilding
 .\scripts\launch.ps1 -Settings  # open the settings window directly
 .\scripts\launch.ps1 -Restart   # stop, rebuild, start again
+.\scripts\runsnap.ps1           # same as -Restart, without tests; type runsnap when the command is installed
 .\scripts\launch.ps1 -Stop      # shut down every Snaplight process gracefully
 ```
 

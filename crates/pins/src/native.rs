@@ -1414,15 +1414,44 @@ impl Host {
     /// The per-pin choice is left alone on purpose: a pin whose shadow the user
     /// turned off must not get it back because the metrics were edited. Only a
     /// pin that still follows the configured default follows it here.
-    unsafe fn reload(&mut self) {
+    unsafe fn reload(&mut self, hwnd: HWND) {
         let config = match snaplight_platform::load_config() {
             Ok(config) => config,
-            // The shadow is presentation only, so an unreadable configuration
-            // leaves the pins exactly as they are instead of guessing.
+            // An unreadable configuration leaves the pins exactly as they are
+            // instead of guessing.
             Err(error) => {
-                eprintln!("pin settings reload failed ({error}); keeping the current shadow");
+                eprintln!("pin settings reload failed ({error}); keeping the current settings");
                 return;
             }
+        };
+        // Re-register the restore shortcut in place. If the new combination is
+        // unavailable, register_restore_hotkey falls back to the default; when
+        // even that fails, put the previous one back.
+        let previous_restore = self.restore_hotkey.clone();
+        let _ = UnregisterHotKey(hwnd, 2);
+        match register_restore_hotkey(hwnd, &config) {
+            Ok(hotkey) => {
+                self.restore_hotkey = hotkey.clone();
+                for pin in &mut self.pins {
+                    pin.restore_hotkey = hotkey.clone();
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "restore hotkey {} unavailable on reload ({error}); restoring {previous_restore}",
+                    config.restore_hotkey
+                );
+                if let Ok(hotkey) = parse_hotkey(&previous_restore) {
+                    let (modifiers, key) = snaplight_platform::native::hotkey_registration(&hotkey);
+                    let _ = RegisterHotKey(hwnd, 2, modifiers, key);
+                }
+            }
+        }
+        // The held shortcut is polled, so storing the new value is enough; an
+        // unusable value disables the poll instead of stranding the process.
+        self.through_hotkey = match parse_held_shortcut(&config.through_hotkey) {
+            Ok(Some(shortcut)) => shortcut.canonical(),
+            Ok(None) | Err(_) => String::new(),
         };
         self.shadow = shadow::Settings::from_config(&config);
         self.shadow_default = config.pin_shadow;
@@ -1856,7 +1885,7 @@ unsafe extern "system" fn control_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                                 snaplight_platform::native::show_error(&e.to_string());
                             }
                         }
-                        PinCommand::Reload => host.reload(),
+                        PinCommand::Reload => host.reload(hwnd),
                         PinCommand::CloseAll | PinCommand::Shutdown => {
                             host.close_all();
                             PostQuitMessage(0);
@@ -2133,7 +2162,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             smoke_config.pin_shadow_offset = DEFAULT_PIN_SHADOW_OFFSET;
             smoke_config.pin_shadow_opacity = DEFAULT_PIN_SHADOW_OPACITY;
             snaplight_platform::save_config(&smoke_config)?;
-            host.reload();
+            host.reload(control);
             let magenta = COLORREF(0x00FF00FF);
             let background = backdrop(
                 RECT {
@@ -2276,7 +2305,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             smoke_config.pin_shadow_offset = 0;
             smoke_config.pin_shadow_opacity = 100;
             snaplight_platform::save_config(&smoke_config)?;
-            host.reload();
+            host.reload(control);
             let wide_margin = host.pins[0].margin();
             let mut wider = RECT::default();
             GetWindowRect(host.pins[0].hwnd, &mut wider)?;
@@ -2305,7 +2334,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             // their own, so switching it off leaves this one alone.
             smoke_config.pin_shadow = false;
             snaplight_platform::save_config(&smoke_config)?;
-            host.reload();
+            host.reload(control);
             if !host.pins[0].shadow.enabled() {
                 return Err("reloading the settings cleared the pin's own shadow choice".into());
             }

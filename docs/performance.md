@@ -107,6 +107,47 @@ and releases this with the session, so it is not part of the resident-process
 numbers above. The CPU copy is created once per session from the normalized SDR
 surface; interactive drawing, mosaics, the magnifier, and export stay on the GPU.
 
+## Long Capture
+
+Long capture has two frame sources behind one worker thread:
+
+| Path | Idle cost | Sampling | Notes |
+| --- | --- | --- | --- |
+| Desktop Duplication | Thread blocks in `AcquireNextFrame`; no timer-driven capture | Each DWM update, ROI rows only | Consistent composed frame, no hardware cursor; used when the output can be duplicated |
+| GDI compatible | One 120 ms `BitBlt` per sample | Persistent DC and DIB section | Fallback for remote desktop, another capture app, or a rotated output; body-only stillness |
+
+The initial screen is taken once through GDI, because an idle desktop may not
+produce a duplication frame at all; it becomes the first anchor as soon as a
+duplication frame arrives, which is also when fixed top/bottom bands can be
+detected. The body is stored as one segment per accepted step, so appending is a
+push and prepending a push-front instead of a full-buffer reallocation or
+memmove. The bird's-eye panel reads a cached thumbnail; a repaint never copies
+the full stitched image. `LongCapture::cropped` still copies the exported image
+once, as export requires a contiguous buffer.
+
+End-to-end check (2026-10-23, Debug and isolated Release builds, SDR 3840×2160
+at 150% DPI, synthetic scroll window): a 500×600 selection scrolled 8 notches ×
+90 pixels with a 250 ms blinking caret in the fixed header produced 500×1320
+(9 screens) on both the Desktop Duplication path and the forced GDI compatible
+path (`SNAPLIGHT_LONG_CAPTURE_GDI=1`); the Release build was repeated three times
+on the duplication path and twice on the compatible path with the same result.
+All 1250 body rows matched the deterministic source rows in order, the header
+and footer appeared exactly once, and the reported note was null. The
+compatible path can differ by a few color levels (observed ≤6 in one channel for
+one run) because `BitBlt` goes through the desktop color path; the engine's
+per-channel matching tolerance is 12. This is a correctness check, not a CPU/GPU or 120 Hz
+measurement; the long-limit CPU and allocation claims are structural (blocked
+duplication, reused buffers, thumbnail-sized preview) and have not been sampled
+with a counting allocator. HDR color agreement for the GDI seed and the
+compatible path, mixed-DPI/rotated displays, and a real device-loss event remain
+unverified.
+
+```powershell
+# Force the compatible path on a machine where duplication works.
+$env:SNAPLIGHT_LONG_CAPTURE_GDI = '1'
+& .\target\debug\snaplight-editor.exe --long-capture-demo=200,200,500,600
+```
+
 ## Reproduce
 
 ```powershell

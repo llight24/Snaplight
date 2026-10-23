@@ -696,13 +696,202 @@ component NavButton inherits Rectangle {
     }
 }
 component SectionTitle inherits Text {
-    color: #111827; font-weight: 600; font-size: 13px;
+    in property <bool> changed: false;
+    color: #111827; font-weight: root.changed ? 700 : 600; font-size: 13px;
 }
 component Hint inherits Text {
     color: #6b7280; font-size: 12px; wrap: word-wrap;
 }
 component Rule inherits Rectangle {
     height: 1px; background: #eef0f3;
+}
+// Compact symbol button for the shortcut recorder: a green check accepts the
+// draft and a red cross drops it. The symbols are vector paths, so they do not
+// depend on the glyph coverage of the UI font. A standard Button takes
+// keyboard focus on press, which would abort the recording before its click
+// lands, so the recorder uses a touch area instead.
+component GlyphButton inherits Rectangle {
+    // Path commands for the symbol, in a 24x24 view box.
+    in property <string> commands: "";
+    in property <color> ink: #16a34a;
+    in property <string> label: "";
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    background: !root.enabled ? transparent : (hit.has-hover ? #eef1f5 : transparent);
+    Path {
+        x: 6px; y: 6px;
+        width: 16px; height: 16px;
+        viewbox-x: 0; viewbox-y: 0;
+        viewbox-width: 24; viewbox-height: 24;
+        commands: root.commands;
+        fill: transparent;
+        stroke: root.enabled ? root.ink : #c3c8d0;
+        stroke-width: 2px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+    }
+    hit := TouchArea {
+        enabled: root.enabled;
+        accessible-role: button;
+        accessible-label: root.label;
+        clicked => { root.clicked(); }
+        accessible-action-default => { root.clicked(); }
+    }
+}
+// One shortcut row. The current combination sits on the right as a command
+// chip; clicking it starts recording the next key combination, and the check
+// and cross actions appear next to it. The recording lives in this component,
+// while `active-slot` in the window keeps at most one recorder open. The
+// combination text itself is built in Rust, so the recorder and the
+// configuration parser accept exactly the same keys.
+component HotkeyRow inherits HorizontalBox {
+    spacing: 8px;
+    in property <string> label: "";
+    in property <int> slot: 0;
+    in property <bool> allow-modifier-only: false;
+    // Set by the page when this row differs from the value it opened with.
+    in property <bool> changed: false;
+    // Raised after the check commits a captured combination.
+    callback edited();
+    in-out property <string> value: "";
+    in-out property <int> active-slot: 0;
+    callback captured-hotkey(string, bool, bool, bool, bool, bool) -> string;
+    // Accepted combination of the current recording. It stays empty until a key
+    // the configuration can store is pressed, which keeps Save disabled.
+    in-out property <string> draft: "";
+    in-out property <bool> recording: false;
+    out property <bool> is-open: root.active-slot == root.slot && (root.recording || root.draft != "");
+    pure function is-modifier-key(text: string) -> bool {
+        return text == Key.Shift || text == Key.ShiftR
+            || text == Key.Control || text == Key.ControlR
+            || text == Key.Alt || text == Key.AltGr
+            || text == Key.Meta || text == Key.MetaR;
+    }
+    function start-recording() {
+        root.active-slot = root.slot;
+        root.draft = "";
+        root.recording = true;
+        fs.focus();
+    }
+    function accept-draft() {
+        // Nothing accepted yet: the check is disabled, so Enter and an
+        // accidental activation leave the recording open.
+        if (root.draft == "") {
+            return;
+        }
+        root.value = root.draft;
+        root.draft = "";
+        root.recording = false;
+        root.active-slot = 0;
+        root.edited();
+    }
+    function cancel-draft() {
+        root.recording = false;
+        root.draft = "";
+        root.active-slot = 0;
+    }
+    Text {
+        text: root.label;
+        vertical-alignment: center;
+        horizontal-stretch: 1;
+        font-weight: root.changed ? 700 : 400;
+    }
+    // The actions sit before the chip so showing them only takes width from
+    // the flexible label; the chip stays anchored to the right edge while
+    // recording starts and stops.
+    if root.is-open: GlyphButton {
+        commands: "M5 12 L10 17 L19 7";
+        ink: #16a34a;
+        label: "保存快捷键";
+        enabled: root.draft != "";
+        clicked => { root.accept-draft(); }
+    }
+    if root.is-open: GlyphButton {
+        commands: "M7 7 L17 17 M17 7 L7 17";
+        ink: #dc2626;
+        label: "取消录制";
+        clicked => { root.cancel-draft(); }
+    }
+    chip := Rectangle {
+        width: 172px;
+        height: 28px;
+        border-radius: 6px;
+        background: root.is-open ? #f0f6ff : #f7f8fa;
+        border-width: 1px;
+        border-color: root.is-open ? #1668dc : (chip-hit.has-hover ? #98a2b3 : #d0d5dd);
+        Text {
+            x: 8px;
+            width: parent.width - 16px;
+            height: 100%;
+            // While no accepted key has been captured, the chip prompts instead
+            // of showing the old combination.
+            text: root.recording
+                ? (root.draft == "" ? "请按下快捷键…" : root.draft)
+                : (root.draft != "" ? root.draft : root.value);
+            color: root.recording && root.draft == "" ? #6b7280 : #111827;
+            font-size: 13px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        fs := FocusScope {
+            key-pressed(event) => {
+                if (!root.is-open) {
+                    return reject;
+                }
+                if (event.text == Key.Escape) {
+                    root.cancel-draft();
+                    return accept;
+                }
+                if (event.text == Key.Return) {
+                    root.accept-draft();
+                    return accept;
+                }
+                // While a captured draft is pending, swallow keys so the page
+                // does not react behind the recorder; repeats never overwrite it.
+                if (!root.recording || event.repeat) {
+                    return accept;
+                }
+                let captured = root.captured-hotkey(
+                    event.text,
+                    event.modifiers.control,
+                    event.modifiers.shift,
+                    event.modifiers.alt,
+                    event.modifiers.meta,
+                    root.allow-modifier-only
+                );
+                if (captured != "") {
+                    root.draft = captured;
+                    // A lone modifier only builds the combination: the user may
+                    // add more before pressing Save. A regular key completes it.
+                    if (!root.is-modifier-key(event.text)) {
+                        root.recording = false;
+                    }
+                }
+                return accept;
+            }
+            // Clicking a focusable widget elsewhere ends the recording. Save and
+            // Cancel do not take focus, so their clicks still land; a captured
+            // draft survives until the user decides.
+            focus-lost(reason) => {
+                if (root.is-open && root.recording) {
+                    root.recording = false;
+                    root.draft = "";
+                    root.active-slot = 0;
+                }
+            }
+        }
+        chip-hit := TouchArea {
+            enabled: !root.recording || !root.is-open;
+            accessible-role: button;
+            accessible-label: root.label + "快捷键，当前 " + root.value;
+            clicked => { root.start-recording(); }
+            accessible-action-default => { root.start-recording(); }
+        }
+    }
 }
 
 export component Settings inherits Window {
@@ -735,8 +924,51 @@ export component Settings inherits Window {
     in-out property <string> capture-hotkey-value:"Ctrl+Shift+A";
     in-out property <string> restore-hotkey-value:"Ctrl+Shift+P";
     in-out property <string> through-hotkey-value:"Ctrl";
+    // Shortcut row that is currently recording: 0 none, 1 capture, 2 restore,
+    // 3 held interaction key. At most one recorder is open at a time.
+    in-out property <int> hotkey-editing:0;
     in-out property <int> detect-mode:1;
     in-out property <string> status:"";
+    // Bold markers for values that differ from the configuration this window
+    // opened with. The editor recomputes every marker after each auto-save.
+    in-out property <bool> changed-gpu-pins:false;
+    in-out property <bool> changed-pin-close-confirm:false;
+    in-out property <bool> changed-tool-order:false;
+    in-out property <bool> changed-background:false;
+    in-out property <bool> changed-foreground:false;
+    in-out property <bool> changed-accent:false;
+    in-out property <bool> changed-pin-shadow:false;
+    in-out property <bool> changed-shadow-blur:false;
+    in-out property <bool> changed-shadow-offset:false;
+    in-out property <bool> changed-shadow-opacity:false;
+    in-out property <bool> changed-capture-hotkey:false;
+    in-out property <bool> changed-restore-hotkey:false;
+    in-out property <bool> changed-through-hotkey:false;
+    in-out property <bool> changed-stroke:false;
+    in-out property <bool> changed-block:false;
+    in-out property <bool> changed-stroke-color:false;
+    in-out property <bool> changed-fill-color:false;
+    in-out property <bool> changed-fill-opacity:false;
+    in-out property <bool> changed-font-size:false;
+    in-out property <bool> changed-paint-tools:false;
+    in-out property <bool> changed-detect-mode:false;
+    in-out property <bool> changed-capture-dir:false;
+    // Every user edit restarts this short timer; the window then saves once
+    // instead of writing the configuration on each keystroke or spinner step.
+    // `running` has to be set too: a Slint Timer that never ran ignores
+    // `restart()`, so the first edit must start it before restarting.
+    function mark-changed() {
+        auto-save.running = true;
+        auto-save.restart();
+    }
+    auto-save := Timer {
+        interval: 500ms;
+        running: false;
+        triggered => {
+            auto-save.running = false;
+            root.save();
+        }
+    }
     in property <string> app-version:"";
     in property <string> config-path:"";
     in property <string> data-dir:"";
@@ -753,6 +985,9 @@ export component Settings inherits Window {
     callback open-capture(string);
     callback delete-capture(string);
     callback open-data-dir();
+    // Formats one captured key and its modifiers as a stored shortcut; an empty
+    // result means the key cannot be stored and the recorder keeps waiting.
+    callback captured-hotkey(string, bool, bool, bool, bool, bool) -> string;
     // Tool id, paint slot (0 stroke / 1 fill) and the requested state.
     callback paint-toggled(int, int, bool);
     VerticalBox {padding:0px; spacing:0px;
@@ -786,66 +1021,93 @@ export component Settings inherits Window {
                         VerticalLayout {alignment:start; spacing:10px;
                             if root.page-index == 0: VerticalLayout {alignment:start; spacing:8px;
                                 SectionTitle {text:"贴图";}
-                                CheckBox {text:"GPU 贴图";checked<=>root.gpu-pins;}
+                                CheckBox {text:"GPU 贴图";font-weight:root.changed-gpu-pins ? 700 : 400;checked<=>root.gpu-pins;toggled=>{root.mark-changed();}}
                                 Hint {text:"用常驻 DirectComposition 表面渲染贴图，仅对新贴图生效；默认的 layered 后端私有内存更低。";}
-                                CheckBox {text:"关闭贴图前确认";checked<=>root.pin-close-confirm;}
+                                CheckBox {text:"关闭贴图前确认";font-weight:root.changed-pin-close-confirm ? 700 : 400;checked<=>root.pin-close-confirm;toggled=>{root.mark-changed();}}
                                 Hint {text:"双击贴图关闭它之前先弹出确认窗口；在窗口里勾选「下次不再提醒」会把这里改成关闭。";}
                                 Rule {}
-                                SectionTitle {text:"工具栏";}
+                                SectionTitle {text:"工具栏";changed:root.changed-tool-order;}
                                 Hint {text:"标注工具，按悬浮条上显示的顺序排列。";}
                                 for tool[index] in root.tools: HorizontalBox {
                                     Text {text:tool.label;vertical-alignment:center;horizontal-stretch:1;}
-                                    Button {text:"上移";accessible-label:tool.label + " 上移";clicked=>{root.move-tool(index,-1);}}
-                                    Button {text:"下移";accessible-label:tool.label + " 下移";clicked=>{root.move-tool(index,1);}}
+                                    Button {text:"上移";accessible-label:tool.label + " 上移";clicked=>{root.move-tool(index,-1);root.mark-changed();}}
+                                    Button {text:"下移";accessible-label:tool.label + " 下移";clicked=>{root.move-tool(index,1);root.mark-changed();}}
                                 }
                             }
                             if root.page-index == 1: VerticalLayout {alignment:start; spacing:8px;
-                                HorizontalBox {Text {text:"背景色";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"主题背景色";text<=>root.background-value;}}
-                                HorizontalBox {Text {text:"前景色";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"主题前景色";text<=>root.foreground-value;}}
-                                HorizontalBox {Text {text:"强调色";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"主题强调色";text<=>root.accent-value;}}
-                                Hint {text:"截图界面的选区、工具栏与贴图的配色；输入的十六进制颜色在保存后生效。";}
+                                HorizontalBox {Text {text:"背景色";font-weight:root.changed-background ? 700 : 400;vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"主题背景色";text<=>root.background-value;edited=>{root.mark-changed();}}}
+                                HorizontalBox {Text {text:"前景色";font-weight:root.changed-foreground ? 700 : 400;vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"主题前景色";text<=>root.foreground-value;edited=>{root.mark-changed();}}}
+                                HorizontalBox {Text {text:"强调色";font-weight:root.changed-accent ? 700 : 400;vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"主题强调色";text<=>root.accent-value;edited=>{root.mark-changed();}}}
+                                Hint {text:"截图界面的选区、工具栏与贴图的配色；输入的十六进制颜色会自动保存并生效。";}
                                 Rule {}
                                 SectionTitle {text:"贴图阴影";}
-                                CheckBox {text:"贴图默认带阴影";checked<=>root.pin-shadow;}
-                                HorizontalBox {Text {text:"模糊";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"阴影模糊";minimum:0;maximum:48;value<=>root.pin-shadow-blur;}}
-                                HorizontalBox {Text {text:"垂直偏移";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"阴影垂直偏移";minimum:0;maximum:24;value<=>root.pin-shadow-offset;}}
-                                HorizontalBox {Text {text:"不透明度";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"阴影不透明度";minimum:0;maximum:100;value<=>root.pin-shadow-opacity;}}
-                                Hint {text:"贴图贴在桌面上时在四周投下阴影，看起来是浮起来的。模糊和垂直偏移是 100% 缩放下的逻辑像素，不透明度是贴图边缘处的浓度；保存后立即生效，对已打开的贴图同样有效。右键某一张贴图可以单独关闭它的阴影。";}
+                                CheckBox {text:"贴图默认带阴影";font-weight:root.changed-pin-shadow ? 700 : 400;checked<=>root.pin-shadow;toggled=>{root.mark-changed();}}
+                                HorizontalBox {Text {text:"模糊";font-weight:root.changed-shadow-blur ? 700 : 400;vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"阴影模糊";minimum:0;maximum:48;value<=>root.pin-shadow-blur;edited=>{root.mark-changed();}}}
+                                HorizontalBox {Text {text:"垂直偏移";font-weight:root.changed-shadow-offset ? 700 : 400;vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"阴影垂直偏移";minimum:0;maximum:24;value<=>root.pin-shadow-offset;edited=>{root.mark-changed();}}}
+                                HorizontalBox {Text {text:"不透明度";font-weight:root.changed-shadow-opacity ? 700 : 400;vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"阴影不透明度";minimum:0;maximum:100;value<=>root.pin-shadow-opacity;edited=>{root.mark-changed();}}}
+                                Hint {text:"贴图贴在桌面上时在四周投下阴影，看起来是浮起来的。模糊和垂直偏移是 100% 缩放下的逻辑像素，不透明度是贴图边缘处的浓度；修改会自动保存并立即生效，对已打开的贴图同样有效。右键某一张贴图可以单独关闭它的阴影。";}
                             }
                             if root.page-index == 2: VerticalLayout {alignment:start; spacing:8px;
                                 SectionTitle {text:"全局快捷键";}
-                                HorizontalBox {Text {text:"截图";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"截图快捷键";text<=>root.capture-hotkey-value;horizontal-stretch:1;placeholder-text:"Ctrl+Shift+A";}}
-                                HorizontalBox {Text {text:"恢复贴图";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"恢复贴图快捷键";text<=>root.restore-hotkey-value;horizontal-stretch:1;placeholder-text:"Ctrl+Shift+P";}}
-                                Hint {text:"格式为修饰键加一个按键，例如 Ctrl+Shift+A。修改后需重启常驻核心或贴图进程才生效；若快捷键已被占用，则回退到默认值。";}
+                                HotkeyRow {
+                                    label:"截图";slot:1;allow-modifier-only:false;
+                                    changed:root.changed-capture-hotkey;
+                                    value<=>root.capture-hotkey-value;
+                                    active-slot<=>root.hotkey-editing;
+                                    edited => { root.mark-changed(); }
+                                    captured-hotkey(key,ctrl,shift,alt,win,allow-modifier-only) => {
+                                        return root.captured-hotkey(key,ctrl,shift,alt,win,allow-modifier-only);
+                                    }
+                                }
+                                HotkeyRow {
+                                    label:"恢复贴图";slot:2;allow-modifier-only:false;
+                                    changed:root.changed-restore-hotkey;
+                                    value<=>root.restore-hotkey-value;
+                                    active-slot<=>root.hotkey-editing;
+                                    edited => { root.mark-changed(); }
+                                    captured-hotkey(key,ctrl,shift,alt,win,allow-modifier-only) => {
+                                        return root.captured-hotkey(key,ctrl,shift,alt,win,allow-modifier-only);
+                                    }
+                                }
+                                Hint {text:"单击右侧的快捷键开始录制，按下组合键后点绿色勾确认；按 Esc 或红色叉放弃本次录制。支持字母、数字和 F1–F24，并且至少要有一个修饰键。确认后自动保存并立即生效；若快捷键已被占用，则回退到默认值。";}
                                 Rule {}
                                 SectionTitle {text:"贴图穿透";}
-                                HorizontalBox {Text {text:"临时交互按键";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"穿透临时交互按键";text<=>root.through-hotkey-value;horizontal-stretch:1;placeholder-text:"Ctrl";}}
-                                Hint {text:"按住这个按键时，穿透中的贴图临时恢复鼠标交互，松开后立即恢复穿透。可以只用一个修饰键（如 Ctrl）、修饰键组合或单个按键。它与「恢复贴图」不同：后者按一次切换，不会自动恢复穿透。修改后同样需要重启贴图进程才生效。";}
+                                HotkeyRow {
+                                    label:"临时交互按键";slot:3;allow-modifier-only:true;
+                                    changed:root.changed-through-hotkey;
+                                    value<=>root.through-hotkey-value;
+                                    active-slot<=>root.hotkey-editing;
+                                    edited => { root.mark-changed(); }
+                                    captured-hotkey(key,ctrl,shift,alt,win,allow-modifier-only) => {
+                                        return root.captured-hotkey(key,ctrl,shift,alt,win,allow-modifier-only);
+                                    }
+                                }
+                                Hint {text:"单击右侧的按键开始录制，按下组合键后点绿色勾确认；按 Esc 或红色叉放弃本次录制。可以只录一个修饰键（如 Ctrl）、修饰键组合或单个按键，支持字母、数字和 F1–F24。确认后自动保存并立即生效。按住这个按键时，穿透中的贴图临时恢复鼠标交互，松开后立即恢复穿透。它与「恢复贴图」不同：后者按一次切换，不会自动恢复穿透。";}
                             }
                             if root.page-index == 3: VerticalLayout {alignment:start; spacing:8px;
                                 SectionTitle {text:"绘制默认值";}
-                                HorizontalBox {Text {text:"线宽";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"线宽";minimum:1;maximum:64;value<=>root.stroke;}}
-                                HorizontalBox {Text {text:"马赛克块";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"马赛克块";minimum:2;maximum:128;value<=>root.block;}}
-                                HorizontalBox {Text {text:"描边颜色";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"描边颜色";text<=>root.stroke-color-value;}}
-                                HorizontalBox {Text {text:"填充颜色";vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"填充颜色";text<=>root.fill-color-value;}}
-                                HorizontalBox {Text {text:"填充不透明度";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"填充不透明度";minimum:0;maximum:100;value<=>root.fill-opacity;}}
-                                HorizontalBox {Text {text:"字号";vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"字号";minimum:12;maximum:200;value<=>root.font-size;}}
-                                SectionTitle {text:"按工具的颜色";}
+                                HorizontalBox {Text {text:"线宽";font-weight:root.changed-stroke ? 700 : 400;vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"线宽";minimum:1;maximum:64;value<=>root.stroke;edited=>{root.mark-changed();}}}
+                                HorizontalBox {Text {text:"马赛克块";font-weight:root.changed-block ? 700 : 400;vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"马赛克块";minimum:2;maximum:128;value<=>root.block;edited=>{root.mark-changed();}}}
+                                HorizontalBox {Text {text:"描边颜色";font-weight:root.changed-stroke-color ? 700 : 400;vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"描边颜色";text<=>root.stroke-color-value;edited=>{root.mark-changed();}}}
+                                HorizontalBox {Text {text:"填充颜色";font-weight:root.changed-fill-color ? 700 : 400;vertical-alignment:center;horizontal-stretch:1;} LineEdit {accessible-label:"填充颜色";text<=>root.fill-color-value;edited=>{root.mark-changed();}}}
+                                HorizontalBox {Text {text:"填充不透明度";font-weight:root.changed-fill-opacity ? 700 : 400;vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"填充不透明度";minimum:0;maximum:100;value<=>root.fill-opacity;edited=>{root.mark-changed();}}}
+                                HorizontalBox {Text {text:"字号";font-weight:root.changed-font-size ? 700 : 400;vertical-alignment:center;horizontal-stretch:1;} SpinBox {accessible-label:"字号";minimum:12;maximum:200;value<=>root.font-size;edited=>{root.mark-changed();}}}
+                                SectionTitle {text:"按工具的颜色";changed:root.changed-paint-tools;}
                                 Hint {text:"选择每种工具默认画描边还是填充；文字默认只画填充（字色），可另行打开描边。";}
                                 for row in root.paint-tools: HorizontalBox {
                                     Text {text:row.label;vertical-alignment:center;horizontal-stretch:1;}
-                                    PaintToggle {label:"描边";on:row.stroke;toggled=>{root.paint-toggled(row.tool, 0, !row.stroke);}}
-                                    PaintToggle {label:"填充";on:row.fill;toggled=>{root.paint-toggled(row.tool, 1, !row.fill);}}
+                                    PaintToggle {label:"描边";on:row.stroke;toggled=>{root.paint-toggled(row.tool, 0, !row.stroke);root.mark-changed();}}
+                                    PaintToggle {label:"填充";on:row.fill;toggled=>{root.paint-toggled(row.tool, 1, !row.fill);root.mark-changed();}}
                                 }
                                 Rule {}
                                 SectionTitle {text:"窗口识别";}
-                                HorizontalBox {Text {text:"模式";vertical-alignment:center;horizontal-stretch:1;} ComboBox {accessible-label:"窗口识别模式";model:["关闭","光标下的界面元素"];current-index<=>root.detect-mode;}}
+                                HorizontalBox {Text {text:"模式";font-weight:root.changed-detect-mode ? 700 : 400;vertical-alignment:center;horizontal-stretch:1;} ComboBox {accessible-label:"窗口识别模式";model:["关闭","光标下的界面元素"];current-index<=>root.detect-mode;selected=>{root.mark-changed();}}}
                                 Hint {text:"高亮光标下的界面元素，单击即截取该元素，不必再拖动框选。";}
                                 Rule {}
-                                SectionTitle {text:"保存位置";}
+                                SectionTitle {text:"保存位置";changed:root.changed-capture-dir;}
                                 HorizontalBox {
-                                    LineEdit {accessible-label:"截图文件夹";text<=>root.capture-dir-value;horizontal-stretch:1;placeholder-text:"默认：Snaplight\\captures";}
-                                    Button {text:"浏览";accessible-label:"选择截图文件夹";clicked=>{root.browse-capture-dir();}}
+                                    LineEdit {accessible-label:"截图文件夹";text<=>root.capture-dir-value;horizontal-stretch:1;placeholder-text:"默认：Snaplight\\captures";edited=>{root.mark-changed();}}
+                                    Button {text:"浏览";accessible-label:"选择截图文件夹";clicked=>{root.browse-capture-dir();root.mark-changed();}}
                                 }
                                 HorizontalBox {
                                     Text {text:"已保存截图";font-weight:600;vertical-alignment:center;horizontal-stretch:1;}
@@ -879,7 +1141,7 @@ export component Settings inherits Window {
                                 }
                                 SectionTitle {text:"数据目录";}
                                 LineEdit {accessible-label:"数据目录";text:root.data-dir;read-only:true;horizontal-stretch:1;}
-                                Hint {text:"配置、窗口状态和已保存的截图都存放在这里，除非用 SNAPLIGHT_DATA_DIR 指向别处。截图文件夹的修改通过下方按钮保存。";}
+                                Hint {text:"配置、窗口状态和已保存的截图都存放在这里，除非用 SNAPLIGHT_DATA_DIR 指向别处。设置修改后会自动保存到 config.json。";}
                             }
                         }
                     }
@@ -889,7 +1151,7 @@ export component Settings inherits Window {
         Rule {}
         HorizontalBox {padding:12px;spacing:8px;
             Text {text:root.status;vertical-alignment:center;horizontal-stretch:1;overflow:elide;}
-            Button {text:"保存";accessible-label:"保存设置";clicked=>{root.save();}}
+            Text {text:"更改自动保存 · 粗体为非默认设置";vertical-alignment:center;color:#6b7280;font-size:11px;overflow:elide;}
         }
     }
 }

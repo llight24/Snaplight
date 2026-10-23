@@ -135,6 +135,90 @@ pub const SETTINGS_PAGES: [&str; 7] = [
 ];
 /// Page shown when the settings window opens: appearance, pins and toolbar.
 pub const SETTINGS_DEFAULT_PAGE: i32 = 0;
+/// Result of classifying one captured key event.
+enum CapturedKey {
+    /// A key the configuration can store (`A`, `7`, `F12`).
+    Key(String),
+    /// One of Slint's private key codes for a modifier key.
+    Modifier,
+    /// Anything the configuration cannot store; the recorder waits for another
+    /// key instead of surfacing a value that saving would reject.
+    Unsupported,
+}
+/// Classifies the `KeyEvent.text` of a settings recording.
+fn captured_key(text: &str) -> CapturedKey {
+    let Some(key) = text.chars().next() else {
+        return CapturedKey::Unsupported;
+    };
+    if text.chars().nth(1).is_some() {
+        return CapturedKey::Unsupported;
+    }
+    // The private characters Slint uses for modifier keys (i-slint-common's key
+    // map): Shift, Control, Alt, AltGr, ShiftR, ControlR, Meta, MetaR.
+    if matches!(
+        key,
+        '\u{0010}'
+            | '\u{0011}'
+            | '\u{0012}'
+            | '\u{0013}'
+            | '\u{0015}'
+            | '\u{0016}'
+            | '\u{0017}'
+            | '\u{0018}'
+    ) {
+        return CapturedKey::Modifier;
+    }
+    if key.is_ascii_alphabetic() {
+        return CapturedKey::Key(key.to_ascii_uppercase().to_string());
+    }
+    if key.is_ascii_digit() {
+        return CapturedKey::Key(key.to_string());
+    }
+    // F1-F24 share the private range starting at U+F704.
+    let code = key as u32;
+    if (0xF704..=0xF71B).contains(&code) {
+        return CapturedKey::Key(format!("F{}", code - 0xF704 + 1));
+    }
+    CapturedKey::Unsupported
+}
+/// Formats a key captured in the settings recorder as a stored shortcut, the
+/// same canonical spelling `parse_hotkey` and `parse_held_shortcut` accept.
+///
+/// An empty result means the recorder must keep waiting: either the key is not
+/// supported, or a registered hotkey has no key/modifier yet. The held
+/// interaction key is the one shortcut that may be a bare modifier or a bare
+/// key, so `allow_modifier_only` enables those shapes there only.
+fn captured_hotkey(
+    key: &str,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    win: bool,
+    allow_modifier_only: bool,
+) -> String {
+    let mut parts = Vec::new();
+    if ctrl {
+        parts.push("Ctrl".to_string());
+    }
+    if shift {
+        parts.push("Shift".to_string());
+    }
+    if alt {
+        parts.push("Alt".to_string());
+    }
+    if win {
+        parts.push("Win".to_string());
+    }
+    match captured_key(key) {
+        CapturedKey::Key(key) => parts.push(key),
+        CapturedKey::Modifier if allow_modifier_only => {}
+        CapturedKey::Modifier | CapturedKey::Unsupported => return String::new(),
+    }
+    if parts.is_empty() || (!allow_modifier_only && parts.len() < 2) {
+        return String::new();
+    }
+    parts.join("+")
+}
 pub fn settings(config: &Config) -> Result<Settings, slint::PlatformError> {
     let ui = Settings::new()?;
     ui.set_page(SETTINGS_DEFAULT_PAGE);
@@ -159,6 +243,9 @@ pub fn settings(config: &Config) -> Result<Settings, slint::PlatformError> {
     ui.set_capture_hotkey_value(config.capture_hotkey.clone().into());
     ui.set_restore_hotkey_value(config.restore_hotkey.clone().into());
     ui.set_through_hotkey_value(config.through_hotkey.clone().into());
+    ui.on_captured_hotkey(|key, ctrl, shift, alt, win, allow_modifier_only| {
+        captured_hotkey(key.as_str(), ctrl, shift, alt, win, allow_modifier_only).into()
+    });
     ui.set_detect_mode(window_detect_index(config.window_detect));
     Ok(ui)
 }
@@ -614,6 +701,46 @@ mod tests {
         );
         assert_eq!(config.tools.len(), 7);
         assert!(config.validate().is_ok());
+    }
+    #[test]
+    fn recorded_hotkeys_match_the_stored_spelling() {
+        // Letters normalize regardless of the shifted text the platform reports.
+        assert_eq!(
+            captured_hotkey("a", true, true, false, false, false),
+            "Ctrl+Shift+A"
+        );
+        assert_eq!(
+            captured_hotkey("7", true, false, false, false, false),
+            "Ctrl+7"
+        );
+        // F12 arrives as the private Slint key code for F12.
+        assert_eq!(
+            captured_hotkey("\u{F70F}", false, false, true, true, false),
+            "Alt+Win+F12"
+        );
+        // A registered hotkey needs a modifier and a key.
+        assert_eq!(captured_hotkey("a", false, false, false, false, false), "");
+        assert_eq!(
+            captured_hotkey("\u{0011}", true, false, false, false, false),
+            ""
+        );
+        // The held interaction key also accepts a bare key or bare modifiers.
+        assert_eq!(captured_hotkey("a", false, false, false, false, true), "A");
+        assert_eq!(
+            captured_hotkey("\u{0011}", true, false, false, false, true),
+            "Ctrl"
+        );
+        assert_eq!(
+            captured_hotkey("\u{0010}", true, true, false, false, true),
+            "Ctrl+Shift"
+        );
+        // Keys the configuration cannot store never become a draft, not even
+        // in the held-key row.
+        assert_eq!(captured_hotkey(" ", true, false, false, false, true), "");
+        assert_eq!(
+            captured_hotkey("\u{001b}", false, false, false, false, true),
+            ""
+        );
     }
     #[test]
     fn slint_colour_round_trips_within_a_byte() {

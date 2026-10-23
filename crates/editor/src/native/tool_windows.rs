@@ -414,6 +414,11 @@ pub(super) fn restore_position(window: &snaplight_ui::Window, saved: Option<Scre
 pub(super) fn remember_position(settings_window: bool, window: &snaplight_ui::Window) {
     let mut state = load_window_state();
     let position = window.position();
+    // A minimized window reports the (-32000, -32000) sentinel; persisting it
+    // would make the next launch restore a window that is off-screen.
+    if position.x <= -30000 && position.y <= -30000 {
+        return;
+    }
     let point = ScreenPoint {
         x: position.x,
         y: position.y,

@@ -270,8 +270,8 @@ unsafe fn acquire_desktop_frame(
         }
     }
 }
-/// Copies the desktop into a top-down BGRA8 buffer through GDI.
-unsafe fn gdi_bits(screen: RECT) -> Result<(u32, u32, Vec<u8>)> {
+/// Copies the desktop into a caller-supplied top-down BGRA8 buffer through GDI.
+unsafe fn gdi_bits_into(screen: RECT, bytes: &mut Vec<u8>) -> Result<(u32, u32)> {
     let w = screen.right - screen.left;
     let h = screen.bottom - screen.top;
     let desktop = GetDC(None);
@@ -313,9 +313,9 @@ unsafe fn gdi_bits(screen: RECT) -> Result<(u32, u32, Vec<u8>)> {
     let result = (|| {
         copied?;
         let len = w as usize * h as usize * 4;
-        let mut bytes = vec![0u8; len];
+        bytes.resize(len, 0);
         std::ptr::copy_nonoverlapping(bits.cast::<u8>(), bytes.as_mut_ptr(), len);
-        Ok((w as u32, h as u32, bytes))
+        Ok((w as u32, h as u32))
     })();
     SelectObject(memory, old);
     let _ = DeleteObject(bitmap);
@@ -323,6 +323,351 @@ unsafe fn gdi_bits(screen: RECT) -> Result<(u32, u32, Vec<u8>)> {
     ReleaseDC(None, desktop);
     result
 }
+/// Copies a desktop rectangle into a top-down BGRA8 buffer through GDI.
+unsafe fn gdi_bits(screen: RECT) -> Result<(u32, u32, Vec<u8>)> {
+    let mut bytes = Vec::new();
+    let (width, height) = gdi_bits_into(screen, &mut bytes)?;
+    Ok((width, height, bytes))
+}
+/// Copies a desktop rectangle into an existing buffer through GDI.
+pub fn screen_pixels_into(screen: RECT, bytes: &mut Vec<u8>) -> Result<(u32, u32)> {
+    unsafe { gdi_bits_into(screen, bytes) }
+}
+/// Which path a [`RegionGrabber`] ended up on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrabBackend {
+    /// Desktop Duplication: a consistent DWM frame, no cursor, event driven.
+    Direct,
+    /// GDI `BitBlt` fallback, used when duplication is unavailable.
+    Compatible,
+}
+/// A long-capture frame source for one screen rectangle.
+///
+/// The direct path keeps one `IDXGIOutputDuplication` for the whole session:
+/// `AcquireNextFrame` blocks until the desktop changes, so an idle screen costs
+/// nothing, and only the selected rectangle is copied out of the frame. The
+/// compatible path keeps one memory DC and DIB section, so a read does not
+/// allocate a new bitmap every tick.
+pub struct RegionGrabber {
+    backend: Backend,
+    width: u32,
+    height: u32,
+}
+enum Backend {
+    Direct(DirectGrabber),
+    Compatible(GdiGrabber),
+}
+impl RegionGrabber {
+    /// Opens a grabber for `region`. Duplication is preferred; when the output
+    /// cannot be duplicated (remote desktop, another capture app, a rotated
+    /// display) the GDI path takes over.
+    pub fn open(region: RECT) -> Result<Self> {
+        if region.right <= region.left || region.bottom <= region.top {
+            return Err(Error::new(E_INVALIDARG, "capture region is empty"));
+        }
+        let width = (region.right - region.left) as u32;
+        let height = (region.bottom - region.top) as u32;
+        // A diagnostic switch for exercising the compatible path on a machine
+        // where duplication works, so both paths can be verified end to end.
+        let force_compatible = std::env::var_os("SNAPLIGHT_LONG_CAPTURE_GDI").is_some();
+        let backend = if force_compatible {
+            Backend::Compatible(GdiGrabber::open(region)?)
+        } else {
+            match DirectGrabber::open(region) {
+                Ok(direct) => Backend::Direct(direct),
+                Err(_) => Backend::Compatible(GdiGrabber::open(region)?),
+            }
+        };
+        Ok(Self {
+            backend,
+            width,
+            height,
+        })
+    }
+    pub fn backend(&self) -> GrabBackend {
+        match self.backend {
+            Backend::Direct(_) => GrabBackend::Direct,
+            Backend::Compatible(_) => GrabBackend::Compatible,
+        }
+    }
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+    /// Waits up to `timeout` for the next frame and writes it into `dst`.
+    /// Returns false when nothing changed. On the compatible path this always
+    /// sleeps for the timeout before returning true, which keeps the session at
+    /// a fixed sampling rate.
+    pub fn read(&mut self, dst: &mut Vec<u8>, timeout: Duration) -> Result<bool> {
+        match &mut self.backend {
+            Backend::Direct(direct) => direct.read(dst, timeout),
+            Backend::Compatible(gdi) => gdi.read(dst, timeout),
+        }
+    }
+}
+/// Duplication-backed grabber. The frame resource is only held between
+/// `AcquireNextFrame` and `ReleaseFrame`, and every path releases it, because a
+/// leaked frame makes the next acquire fail.
+struct DirectGrabber {
+    gpu: Gpu,
+    duplication: IDXGIOutputDuplication,
+    staging: ID3D11Texture2D,
+    offset: (i32, i32),
+    width: u32,
+    height: u32,
+}
+impl DirectGrabber {
+    fn open(region: RECT) -> Result<Self> {
+        unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
+            let mut adapter_index = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(adapter_index) {
+                adapter_index += 1;
+                let mut output_index = 0;
+                while let Ok(output) = adapter.EnumOutputs(output_index) {
+                    output_index += 1;
+                    let desc = output.GetDesc()?;
+                    if !desc.AttachedToDesktop.as_bool() {
+                        continue;
+                    }
+                    let desktop = desc.DesktopCoordinates;
+                    let inside = region.left >= desktop.left
+                        && region.top >= desktop.top
+                        && region.right <= desktop.right
+                        && region.bottom <= desktop.bottom;
+                    if !inside {
+                        continue;
+                    }
+                    let output1: IDXGIOutput1 = match output.cast() {
+                        Ok(output) => output,
+                        Err(_) => continue,
+                    };
+                    let gpu = match Gpu::new(Some(&adapter)) {
+                        Ok(gpu) => gpu,
+                        Err(_) => continue,
+                    };
+                    let duplication = match output1.DuplicateOutput(gpu.device()) {
+                        Ok(duplication) => duplication,
+                        Err(_) => continue,
+                    };
+                    // A rotated output hands back a differently oriented frame;
+                    // the compatible path handles those.
+                    if duplication.GetDesc().Rotation != DXGI_MODE_ROTATION_IDENTITY {
+                        continue;
+                    }
+                    let width = (region.right - region.left) as u32;
+                    let height = (region.bottom - region.top) as u32;
+                    let staging = match create_staging(gpu.device(), width, height) {
+                        Ok(staging) => staging,
+                        Err(_) => continue,
+                    };
+                    return Ok(Self {
+                        gpu,
+                        duplication,
+                        staging,
+                        offset: (region.left - desktop.left, region.top - desktop.top),
+                        width,
+                        height,
+                    });
+                }
+            }
+            Err(Error::new(E_FAIL, "no output can be duplicated"))
+        }
+    }
+    fn read(&mut self, dst: &mut Vec<u8>, timeout: Duration) -> Result<bool> {
+        unsafe {
+            let millis = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource = None;
+            match self
+                .duplication
+                .AcquireNextFrame(millis, &mut info, &mut resource)
+            {
+                Ok(()) => {}
+                Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(false),
+                Err(error) => return Err(error),
+            }
+            let result = (|| -> Result<bool> {
+                // The first frame after the duplication starts can report no
+                // desktop update and hold an uninitialized surface.
+                if info.LastPresentTime == 0 {
+                    return Ok(false);
+                }
+                let resource = resource
+                    .ok_or_else(|| Error::new(E_FAIL, "duplication frame has no resource"))?;
+                let source: ID3D11Texture2D = resource.cast()?;
+                let mut source_desc = D3D11_TEXTURE2D_DESC::default();
+                source.GetDesc(&mut source_desc);
+                if source_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+                    return Err(Error::new(
+                        E_INVALIDARG,
+                        format!(
+                            "duplication returned {:?}; the compatible path handles it",
+                            source_desc.Format
+                        ),
+                    ));
+                }
+                let (left, top) = self.offset;
+                let region = D3D11_BOX {
+                    left: left as u32,
+                    top: top as u32,
+                    front: 0,
+                    right: left as u32 + self.width,
+                    bottom: top as u32 + self.height,
+                    back: 1,
+                };
+                self.gpu.context().CopySubresourceRegion(
+                    &self.staging,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &source,
+                    0,
+                    Some(&region),
+                );
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                self.gpu.context().Map(
+                    &self.staging,
+                    0,
+                    D3D11_MAP_READ,
+                    0,
+                    Some(&mut mapped as *mut _),
+                )?;
+                let len = self.width as usize * self.height as usize * 4;
+                dst.resize(len, 0);
+                for row in 0..self.height as usize {
+                    let source = (mapped.pData as *const u8).add(row * mapped.RowPitch as usize);
+                    let target = dst.as_mut_ptr().add(row * self.width as usize * 4);
+                    std::ptr::copy_nonoverlapping(source, target, self.width as usize * 4);
+                }
+                self.gpu.context().Unmap(&self.staging, 0);
+                Ok(true)
+            })();
+            let released = self.duplication.ReleaseFrame();
+            result.and_then(|frame| {
+                released?;
+                Ok(frame)
+            })
+        }
+    }
+}
+unsafe fn create_staging(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<ID3D11Texture2D> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+    let mut texture = None;
+    device.CreateTexture2D(&desc, None, Some(&mut texture))?;
+    texture.ok_or_else(|| Error::new(E_FAIL, "no staging texture"))
+}
+/// GDI-backed grabber with a persistent memory DC and DIB section.
+struct GdiGrabber {
+    desktop: HDC,
+    memory: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+    bits: *mut core::ffi::c_void,
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+}
+// The DC, bitmap and pointer are owned by this value and only touched from the
+// thread that owns it; nothing here is shared.
+unsafe impl Send for GdiGrabber {}
+impl Drop for GdiGrabber {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.memory, self.previous);
+            let _ = DeleteObject(self.bitmap);
+            let _ = DeleteDC(self.memory);
+            ReleaseDC(None, self.desktop);
+        }
+    }
+}
+impl GdiGrabber {
+    fn open(screen: RECT) -> Result<Self> {
+        unsafe {
+            let width = (screen.right - screen.left).max(1) as u32;
+            let height = (screen.bottom - screen.top).max(1) as u32;
+            let desktop = GetDC(None);
+            let memory = CreateCompatibleDC(desktop);
+            let mut bits = std::ptr::null_mut();
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: 40,
+                    biWidth: width as i32,
+                    biHeight: -(height as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let bitmap = match CreateDIBSection(desktop, &info, DIB_RGB_COLORS, &mut bits, None, 0)
+            {
+                Ok(bitmap) => bitmap,
+                Err(error) => {
+                    let _ = DeleteDC(memory);
+                    ReleaseDC(None, desktop);
+                    return Err(error);
+                }
+            };
+            let previous = SelectObject(memory, bitmap);
+            Ok(Self {
+                desktop,
+                memory,
+                bitmap,
+                previous,
+                bits,
+                left: screen.left,
+                top: screen.top,
+                width,
+                height,
+            })
+        }
+    }
+    fn read(&mut self, dst: &mut Vec<u8>, timeout: Duration) -> Result<bool> {
+        unsafe {
+            BitBlt(
+                self.memory,
+                0,
+                0,
+                self.width as i32,
+                self.height as i32,
+                self.desktop,
+                self.left,
+                self.top,
+                SRCCOPY | CAPTUREBLT,
+            )?;
+            let len = self.width as usize * self.height as usize * 4;
+            dst.resize(len, 0);
+            std::ptr::copy_nonoverlapping(self.bits.cast::<u8>(), dst.as_mut_ptr(), len);
+        }
+        std::thread::sleep(timeout);
+        Ok(true)
+    }
+}
+
 /// Copies a desktop rectangle into a top-down BGRA8 buffer through GDI.
 ///
 /// Long capture re-reads the scrolled region many times per session; GDI is the

@@ -7,10 +7,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::windows::io::{AsHandle, AsRawHandle, OwnedHandle},
     process::{Child, Command, Stdio},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
 };
 use windows::{
     core::*,
@@ -43,15 +40,47 @@ fn tray_menu_entries(capture_hotkey: &str) -> Vec<Entry> {
         Entry::Item(Item::new("退出")),
     ]
 }
+/// Which page the one allowed editor process is showing. The tray uses it to
+/// tell a repeated settings request from a capture that must be left alone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditorKind {
+    Capture,
+    Settings,
+}
 struct State {
     pins: Option<Child>,
     queue: Arc<Mutex<Vec<PinCommand>>>,
-    editing: Arc<AtomicBool>,
+    editor: Arc<Mutex<Option<EditorKind>>>,
     editor_handle: Arc<Mutex<Option<OwnedHandle>>>,
     capture_hotkey: String,
 }
 unsafe fn launch_editor(hwnd: HWND, state: &State, settings: bool) {
-    if state.editing.swap(true, Ordering::AcqRel) {
+    let kind = if settings {
+        EditorKind::Settings
+    } else {
+        EditorKind::Capture
+    };
+    let running = {
+        let mut editor = state.editor.lock().unwrap();
+        match *editor {
+            Some(running) => Some(running),
+            None => {
+                *editor = Some(kind);
+                None
+            }
+        }
+    };
+    if let Some(running) = running {
+        // A capture session is left alone. If the user asks for the settings
+        // page twice, only one page may exist, so the open one flashes as a
+        // reminder instead of stacking a second window.
+        if kind == EditorKind::Settings && running == EditorKind::Settings {
+            if let Some(handle) = state.editor_handle.lock().unwrap().as_ref() {
+                if let Some(hwnd) = editor_settings_window(handle) {
+                    start_settings_alert(hwnd);
+                }
+            }
+        }
         return;
     }
     let result = (|| -> std::result::Result<Child, Box<dyn std::error::Error>> {
@@ -73,14 +102,14 @@ unsafe fn launch_editor(hwnd: HWND, state: &State, settings: bool) {
                 Err(e) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    state.editing.store(false, Ordering::Release);
+                    *state.editor.lock().unwrap() = None;
                     snaplight_platform::native::show_error(&e.to_string());
                     return;
                 }
             };
             *state.editor_handle.lock().unwrap() = Some(handle);
             let queue = state.queue.clone();
-            let editing = state.editing.clone();
+            let editor = state.editor.clone();
             let owned_handle = state.editor_handle.clone();
             let address = hwnd.0 as usize;
             let stdout = child.stdout.take().unwrap();
@@ -106,17 +135,81 @@ unsafe fn launch_editor(hwnd: HWND, state: &State, settings: bool) {
                 let status = child.wait();
                 let message = errors.join().unwrap_or_default();
                 *owned_handle.lock().unwrap() = None;
-                editing.store(false, Ordering::Release);
+                *editor.lock().unwrap() = None;
                 if status.is_ok_and(|s| !s.success()) {
                     snaplight_platform::native::show_error(&format!("Editor failed: {message}"));
                 }
             });
         }
         Err(e) => {
-            state.editing.store(false, Ordering::Release);
+            *state.editor.lock().unwrap() = None;
             snaplight_platform::native::show_error(&e.to_string());
         }
     }
+}
+/// Finds the running editor's settings page. The window belongs to the child
+/// process and the core only holds its process handle, so it is found by
+/// process id. The editor also owns an untitled event-loop window, hence the
+/// non-empty title requirement.
+unsafe fn editor_settings_window(handle: &OwnedHandle) -> Option<HWND> {
+    let pid = GetProcessId(HANDLE(handle.as_raw_handle()));
+    if pid == 0 {
+        return None;
+    }
+    struct Search {
+        pid: u32,
+        found: HWND,
+    }
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: `lparam` carries the `Search` owned by `flash_editor_window`,
+        // which outlives the enumeration.
+        let search = unsafe { &mut *(lparam.0 as *mut Search) };
+        let mut window_pid = 0;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
+        }
+        // The editor process also owns an untitled event-loop window, so only
+        // the captioned page is the settings window worth flashing.
+        let mut title = [0u16; 256];
+        if window_pid == search.pid
+            && unsafe { GetWindowTextW(hwnd, &mut title) } > 0
+            && unsafe { IsWindowVisible(hwnd).as_bool() }
+        {
+            search.found = hwnd;
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+    let mut search = Search {
+        pid,
+        found: HWND::default(),
+    };
+    let _ = EnumWindows(Some(visit), LPARAM((&mut search as *mut Search) as isize));
+    if search.found.0.is_null() {
+        None
+    } else {
+        Some(search.found)
+    }
+}
+/// Brings the open settings page to the front and shakes it for a moment. The
+/// animation runs on its own thread so the tray loop keeps processing messages;
+/// the named mutex makes a second click during the animation do nothing (two
+/// shakes would restore different origins and leave the page displaced).
+fn start_settings_alert(hwnd: HWND) {
+    let Ok(Some(guard)) =
+        snaplight_platform::native::singleton("Local\\Snaplight.Settings.Alert.v1")
+    else {
+        return;
+    };
+    let guard = guard.0 as isize;
+    let hwnd = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        snaplight_platform::native::alert_window(
+            HWND(hwnd as _),
+            snaplight_platform::native::ALERT_DURATION,
+        );
+        let _ = unsafe { CloseHandle(HANDLE(guard as _)) };
+    });
 }
 unsafe fn send_pin(
     state: &mut State,
@@ -175,6 +268,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         match msg {
             WM_HOTKEY => {
                 launch_editor(hwnd, state, false);
+                return LRESULT(0);
+            }
+            msg if msg == snaplight_platform::native::RELOAD_CONFIG => {
+                reload_settings(hwnd, state);
                 return LRESULT(0);
             }
             PIN => {
@@ -282,7 +379,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let mut state = Box::new(State {
             pins: None,
             queue: Arc::new(Mutex::new(vec![])),
-            editing: Arc::new(AtomicBool::new(false)),
+            editor: Arc::new(Mutex::new(None)),
             editor_handle: Arc::new(Mutex::new(None)),
             capture_hotkey,
         });
@@ -329,6 +426,47 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         CloseHandle(mutex)?;
     }
     Ok(())
+}
+/// Re-reads the configuration after the settings window saved a change. The
+/// capture shortcut is re-registered in place and the pin process is asked to
+/// reload its own shortcuts, so neither process has to be restarted.
+unsafe fn reload_settings(hwnd: HWND, state: &mut State) {
+    let config = match load_config() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("settings reload failed ({error}); keeping the current shortcuts");
+            return;
+        }
+    };
+    let capture = parse_hotkey(&config.capture_hotkey)
+        .map(|hotkey| hotkey.canonical())
+        .unwrap_or_else(|_| DEFAULT_CAPTURE_HOTKEY.to_string());
+    if capture != state.capture_hotkey {
+        let previous = state.capture_hotkey.clone();
+        // Registering the new combination needs the old id to be free. If the
+        // new one is taken, put the previous one back rather than leaving the
+        // application without a capture shortcut.
+        let _ = UnregisterHotKey(hwnd, 1);
+        match register_capture_hotkey(hwnd, &config) {
+            Ok(()) => state.capture_hotkey = capture,
+            Err(error) => {
+                eprintln!(
+                    "capture hotkey {} unavailable on reload ({error}); restoring {previous}",
+                    config.capture_hotkey
+                );
+                if let Ok(hotkey) = parse_hotkey(&previous) {
+                    let (modifiers, key) = snaplight_platform::native::hotkey_registration(&hotkey);
+                    let _ = RegisterHotKey(hwnd, 1, modifiers, key);
+                }
+            }
+        }
+    }
+    // Pins re-read the same file for their restore and held shortcuts plus the
+    // shadow metrics. This also covers the case where the settings window was
+    // started without a piped stdout.
+    if let Err(error) = send_pin(state, PinCommand::Reload) {
+        eprintln!("could not tell the pin process to reload: {error}");
+    }
 }
 /// Registers the configured capture shortcut, falling back to the default when
 /// another application already owns the configured combination.

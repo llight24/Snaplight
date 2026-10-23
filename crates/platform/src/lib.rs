@@ -266,6 +266,20 @@ pub mod native {
             Ok(HICON(image.0))
         }
     }
+    /// Posted by the settings window after `config.json` changes. The core
+    /// re-registers the capture shortcut and forwards a reload to the pin
+    /// process, so shortcut changes apply without restarting either process.
+    pub const RELOAD_CONFIG: u32 = WM_APP + 0x51;
+    /// Asks the running core to reload the configuration. A setting window
+    /// launched without a core (or after it exited) finds no window and does
+    /// nothing; the file is still saved and the next start reads it.
+    pub fn notify_config_reload() {
+        unsafe {
+            if let Ok(hwnd) = FindWindowW(w!("Snaplight.Core"), PCWSTR::null()) {
+                let _ = PostMessageW(hwnd, RELOAD_CONFIG, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
     /// Translates a parsed hotkey into Win32 registration flags (including
     /// `MOD_NOREPEAT`) and a virtual-key code.
     pub fn hotkey_registration(hotkey: &Hotkey) -> (HOT_KEY_MODIFIERS, u32) {
@@ -524,6 +538,127 @@ pub mod native {
             } else {
                 Ok(Some(handle))
             }
+        }
+    }
+    /// Makes `hwnd` the foreground window. Windows refuses foreground changes
+    /// requested by a background process, so a plain `SetForegroundWindow` is
+    /// followed by the usual input-queue attachment and, as a last resort, the
+    /// topmost round-trip. The window is never left topmost.
+    unsafe fn raise_now(hwnd: HWND) {
+        if SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd {
+            return;
+        }
+        // AttachThreadInput only works for threads that own an input queue. The
+        // core runs this on a worker thread, so make sure the queue exists.
+        let mut message = MSG::default();
+        let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+        let foreground = GetForegroundWindow();
+        let foreground_thread = if foreground.0.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, None)
+        };
+        let current_thread = GetCurrentThreadId();
+        let attached = foreground_thread != 0
+            && foreground_thread != current_thread
+            && AttachThreadInput(foreground_thread, current_thread, true).as_bool();
+        let _ = SetForegroundWindow(hwnd);
+        if attached {
+            let _ = AttachThreadInput(foreground_thread, current_thread, false);
+        }
+        if GetForegroundWindow() != hwnd {
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+        }
+    }
+    /// How long a repeated settings request shakes the open page.
+    pub const ALERT_DURATION: std::time::Duration = std::time::Duration::from_secs(1);
+    /// Brings a window to the front and shakes it horizontally for `duration`,
+    /// then restores its exact position. This is how the application points at
+    /// the settings page when it is already open. Returns whether the window
+    /// could be moved; a maximized window is only brought forward.
+    pub fn alert_window(hwnd: HWND, duration: std::time::Duration) -> bool {
+        unsafe {
+            if hwnd.0.is_null() || !IsWindow(hwnd).as_bool() {
+                return false;
+            }
+            // A minimized page is restored first, otherwise the shake would be
+            // invisible.
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            raise_now(hwnd);
+            // A maximized window has no room to move; bringing it forward is
+            // the whole reminder.
+            if IsZoomed(hwnd).as_bool() {
+                return true;
+            }
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_err() {
+                return false;
+            }
+            let (x, y) = (rect.left, rect.top);
+            // 8 logical pixels at 7.5 shakes per second reads as a quick nudge
+            // without pulling the page away from where the user left it.
+            let scale = GetDpiForWindow(hwnd) as f32 / 96.0;
+            let amplitude = (8.0 * scale).round().max(4.0) as i32;
+            let start = std::time::Instant::now();
+            let mut offset = 0;
+            while start.elapsed() < duration {
+                if !IsWindow(hwnd).as_bool() {
+                    return false;
+                }
+                let phase = start.elapsed().as_secs_f32() * std::f32::consts::TAU * 7.5;
+                let dx = (phase.sin() * amplitude as f32).round() as i32;
+                if dx != offset {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        HWND_TOP,
+                        x + dx,
+                        y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                    );
+                    offset = dx;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            );
+            true
         }
     }
 }
